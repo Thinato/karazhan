@@ -1,0 +1,3 @@
+2026-06-19T19:12:53.790656Z  INFO karazhan: karazhan starting up
+2026-06-19T19:12:57.084745Z  INFO karazhan::app: quit requested via 'q'
+2026-06-19T19:12:57.085655Z  INFO karazhan: karazhan shutting down
