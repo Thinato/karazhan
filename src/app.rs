@@ -1,13 +1,12 @@
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures::StreamExt;
-use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout},
-    style::{Color, Style},
-    widgets::{Block, BorderType, Borders, Paragraph},
-    Terminal,
-};
+use ratatui::Terminal;
+use std::path::PathBuf;
 use tokio::sync::mpsc;
+
+use crate::prompts::PromptStore;
+use crate::ui::library::{LibraryMode, LibraryView};
 
 // TODO Phase 4: add agent status events (AgentStarted, AgentDone, AgentError)
 // TODO Phase 5: add github events (PRMerged, CIFailed)
@@ -20,16 +19,29 @@ pub enum AppEvent {
     // TODO Phase 4+: agent/watcher events go here
 }
 
+/// Top-level view the application is currently showing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum View {
+    Library,
+    // TODO Phase 3: Grid, Detail
+}
+
 pub struct App {
     pub running: bool,
+    pub view: View,
     event_rx: mpsc::Receiver<AppEvent>,
+    library: LibraryView,
 }
 
 impl App {
-    pub fn new(event_rx: mpsc::Receiver<AppEvent>) -> Self {
+    pub fn new(event_rx: mpsc::Receiver<AppEvent>, prompt_dir: PathBuf) -> Self {
+        let store = PromptStore::new(prompt_dir);
+        let library = LibraryView::new(store);
         Self {
             running: true,
+            view: View::Library,
             event_rx,
+            library,
         }
     }
 
@@ -43,25 +55,8 @@ impl App {
         let mut crossterm_events = EventStream::new();
 
         while self.running {
-            terminal.draw(|frame| {
-                let area = frame.area();
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(0)])
-                    .split(area);
-
-                let block = Block::default()
-                    .title(" karazhan ")
-                    .title_alignment(Alignment::Center)
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Cyan));
-
-                let text = Paragraph::new("press q to quit")
-                    .block(block)
-                    .alignment(Alignment::Center);
-
-                frame.render_widget(text, chunks[0]);
+            terminal.draw(|frame| match self.view {
+                View::Library => self.library.render(frame),
             })?;
 
             tokio::select! {
@@ -99,17 +94,54 @@ impl App {
             code, modifiers, ..
         }) = event
         {
-            match (code, modifiers) {
-                (KeyCode::Char('q'), _) => {
+            // Ctrl-C always quits regardless of mode.
+            if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+                tracing::info!("quit requested via Ctrl-C");
+                self.running = false;
+                return;
+            }
+
+            match self.view {
+                View::Library => self.handle_library_key(code, modifiers),
+            }
+        }
+    }
+
+    fn handle_library_key(&mut self, code: KeyCode, _modifiers: KeyModifiers) {
+        // Clear one-shot status on any keypress.
+        self.library.status = None;
+
+        match self.library.mode {
+            LibraryMode::Normal => match code {
+                KeyCode::Char('q') => {
                     tracing::info!("quit requested via 'q'");
                     self.running = false;
                 }
-                (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                    tracing::info!("quit requested via Ctrl-C");
-                    self.running = false;
-                }
+                KeyCode::Char('j') | KeyCode::Down => self.library.move_down(),
+                KeyCode::Char('k') | KeyCode::Up => self.library.move_up(),
+                KeyCode::Char('/') => self.library.enter_filter(),
+                KeyCode::Char('n') | KeyCode::Char('a') => self.library.enter_new_prompt(),
                 _ => {}
-            }
+            },
+            LibraryMode::Filter => match code {
+                KeyCode::Esc => self.library.clear_filter(),
+                KeyCode::Backspace => self.library.filter_pop(),
+                KeyCode::Char(ch) => self.library.filter_push(ch),
+                _ => {}
+            },
+            LibraryMode::NewPrompt => match code {
+                KeyCode::Esc => self.library.cancel_input(),
+                KeyCode::Enter => {
+                    if let Err(e) = self.library.confirm_new_prompt() {
+                        tracing::warn!("new prompt error: {e}");
+                        self.library.status = Some(format!("error: {e}"));
+                        self.library.cancel_input();
+                    }
+                }
+                KeyCode::Backspace => self.library.new_prompt_pop(),
+                KeyCode::Char(ch) => self.library.new_prompt_push(ch),
+                _ => {}
+            },
         }
     }
 

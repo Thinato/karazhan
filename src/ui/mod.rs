@@ -1,5 +1,5 @@
-// TODO Phase 3: ratatui rendering modules
-// pub mod grid;
-// pub mod library;
-// pub mod detail;
-// pub mod keymap;
+pub mod library;
+
+// TODO Phase 3: pub mod grid;
+// TODO Phase 3: pub mod detail;
+// TODO Phase 3: pub mod keymap;

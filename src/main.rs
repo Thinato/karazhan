@@ -119,7 +119,12 @@ async fn main() -> Result<()> {
         }
     });
 
-    let app = App::new(event_rx);
+    // Resolve the prompt directory: default to `<cwd>/prompts`.
+    let prompt_dir = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("prompts");
+
+    let app = App::new(event_rx, prompt_dir);
     let result = app.run(&mut terminal).await;
 
     tracing::info!("karazhan shutting down");
