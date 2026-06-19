@@ -5,3 +5,14 @@
 2026-06-19T19:23:43.742265Z  WARN karazhan::ui::library: library: could not load prompts: cannot read prompt dir "/Users/paulolisecki/repos/thinato/karazhan/prompts"
 2026-06-19T19:23:47.891452Z  INFO karazhan::app: quit requested via 'q'
 2026-06-19T19:23:47.891589Z  INFO karazhan: karazhan shutting down
+2026-06-19T19:25:06.742715Z  INFO karazhan: karazhan starting up
+2026-06-19T19:25:06.743655Z  WARN karazhan::ui::library: library: could not load prompts: cannot read prompt dir "/Users/paulolisecki/repos/thinato/karazhan/prompts"
+2026-06-19T19:25:07.292568Z  INFO karazhan::app: quit requested via 'q'
+2026-06-19T19:25:07.292660Z  INFO karazhan: karazhan shutting down
+2026-06-19T19:27:25.001113Z  INFO karazhan: karazhan starting up
+2026-06-19T19:27:25.002402Z  WARN karazhan::ui::library: library: could not load prompts: cannot read prompt dir "/Users/paulolisecki/repos/thinato/karazhan/prompts"
+2026-06-19T19:27:37.301573Z  INFO karazhan::app: quit requested via 'q'
+2026-06-19T19:27:37.302279Z  INFO karazhan: karazhan shutting down
+2026-06-19T19:27:52.846816Z  INFO karazhan: karazhan starting up
+2026-06-19T19:27:55.768480Z  INFO karazhan::app: quit requested via 'q'
+2026-06-19T19:27:55.768637Z  INFO karazhan: karazhan shutting down

@@ -1,0 +1,182 @@
+use ratatui::{
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Paragraph},
+    Frame,
+};
+
+use crate::worktree::{Worktree, WorktreeStatus};
+
+// ---------------------------------------------------------------------------
+// DetailView
+// ---------------------------------------------------------------------------
+
+/// Renders detailed information about the currently selected worktree.
+///
+/// Displayed fields:
+/// - path
+/// - branch
+/// - prompt_slug (if set)
+/// - pr_number (if set)
+/// - auto_continue_on_merge flag
+/// - status
+/// - placeholder for agent status/last-summary (P4)
+pub struct DetailView;
+
+impl DetailView {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Render the detail pane for `worktree` into `area`.
+    ///
+    /// If `worktree` is `None` (empty grid), shows a placeholder message.
+    pub fn render(&self, frame: &mut Frame, area: Rect, worktree: Option<&Worktree>) {
+        let block = Block::default()
+            .title(" worktree detail ")
+            .title_alignment(Alignment::Center)
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::DarkGray));
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let Some(wt) = worktree else {
+            let msg = Paragraph::new("no worktree selected")
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center);
+            frame.render_widget(msg, inner);
+            return;
+        };
+
+        let lines = build_detail_lines(wt);
+        let para = Paragraph::new(lines);
+        frame.render_widget(para, inner);
+    }
+}
+
+impl Default for DetailView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Detail line builder
+// ---------------------------------------------------------------------------
+
+fn build_detail_lines(wt: &Worktree) -> Vec<Line<'static>> {
+    let key_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    let val_style = Style::default().fg(Color::White);
+    let status_style = status_val_style(&wt.status);
+
+    let path_str = wt.path.display().to_string();
+
+    let mut lines = vec![
+        kv_line("path        ", &path_str, key_style, val_style),
+        kv_line("branch      ", &wt.branch, key_style, val_style),
+    ];
+
+    if let Some(slug) = &wt.prompt_slug {
+        lines.push(kv_line("prompt      ", slug, key_style, val_style));
+    } else {
+        lines.push(kv_line("prompt      ", "(none)", key_style, dim_style()));
+    }
+
+    if let Some(pr) = wt.pr_number {
+        lines.push(kv_line(
+            "PR          ",
+            &format!("#{pr}"),
+            key_style,
+            val_style,
+        ));
+    } else {
+        lines.push(kv_line("PR          ", "(none)", key_style, dim_style()));
+    }
+
+    let auto_str = if wt.auto_continue_on_merge {
+        "yes"
+    } else {
+        "no"
+    };
+    lines.push(kv_line("auto-cont   ", auto_str, key_style, val_style));
+
+    lines.push(kv_line(
+        "status      ",
+        status_label(&wt.status),
+        key_style,
+        status_style,
+    ));
+
+    // Blank separator.
+    lines.push(Line::from(""));
+
+    // TODO P4: agent status/summary goes here (no raw transcript).
+    lines.push(Line::from(Span::styled(
+        "agent       (no session — P4)",
+        dim_style(),
+    )));
+
+    lines
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn kv_line(key: &str, value: &str, key_style: Style, val_style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(key.to_string(), key_style),
+        Span::styled(value.to_string(), val_style),
+    ])
+}
+
+fn dim_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn status_label(status: &WorktreeStatus) -> &'static str {
+    match status {
+        WorktreeStatus::Idle => "Idle",
+        WorktreeStatus::Running => "Running",
+        WorktreeStatus::NeedsReview => "Needs Review",
+        WorktreeStatus::CIFailing => "CI Failing",
+        WorktreeStatus::PRMerged => "PR Merged",
+        WorktreeStatus::Error => "Error",
+    }
+}
+
+fn status_val_style(status: &WorktreeStatus) -> Style {
+    let color = match status {
+        WorktreeStatus::Idle => Color::Gray,
+        WorktreeStatus::Running => Color::Yellow,
+        WorktreeStatus::NeedsReview => Color::Magenta,
+        WorktreeStatus::CIFailing => Color::Red,
+        WorktreeStatus::PRMerged => Color::Green,
+        WorktreeStatus::Error => Color::Red,
+    };
+    let base = Style::default().fg(color);
+    match status {
+        WorktreeStatus::Error => base.add_modifier(Modifier::BOLD),
+        _ => base,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Layout helper used by ui/mod.rs
+// ---------------------------------------------------------------------------
+
+/// Split `area` into [grid_area, detail_area] side by side.
+///
+/// The detail pane is a fixed 36 columns wide; the grid takes the remainder.
+pub fn split_grid_detail(area: Rect) -> (Rect, Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(20), Constraint::Length(36)])
+        .split(area);
+    (chunks[0], chunks[1])
+}
