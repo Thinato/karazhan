@@ -107,6 +107,10 @@ async fn main() -> Result<()> {
     // sessions) will send AppEvents here in later phases.
     let (event_tx, event_rx) = mpsc::channel::<AppEvent>(64);
 
+    // Clone the sender for the App so spawned agent tasks can post status
+    // updates into the same event loop the UI drains.
+    let app_event_tx = event_tx.clone();
+
     // Spawn a tick task as a placeholder for future background work.
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
@@ -124,7 +128,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("prompts");
 
-    let app = App::new(event_rx, prompt_dir);
+    let app = App::new(event_rx, app_event_tx, prompt_dir);
     let result = app.run(&mut terminal).await;
 
     tracing::info!("karazhan shutting down");

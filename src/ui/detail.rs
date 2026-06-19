@@ -21,7 +21,7 @@ use crate::worktree::{Worktree, WorktreeStatus};
 /// - pr_number (if set)
 /// - auto_continue_on_merge flag
 /// - status
-/// - placeholder for agent status/last-summary (P4)
+/// - live agent status / last-line summary (no raw transcript)
 pub struct DetailView;
 
 impl DetailView {
@@ -31,8 +31,17 @@ impl DetailView {
 
     /// Render the detail pane for `worktree` into `area`.
     ///
-    /// If `worktree` is `None` (empty grid), shows a placeholder message.
-    pub fn render(&self, frame: &mut Frame, area: Rect, worktree: Option<&Worktree>) {
+    /// `summary` is the latest short agent summary (if any) and `prompt_input`
+    /// is the in-progress free-text prompt while the grid is in prompt-input
+    /// mode.  If `worktree` is `None` (empty grid), shows a placeholder message.
+    pub fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        worktree: Option<&Worktree>,
+        summary: Option<&str>,
+        prompt_input: Option<&str>,
+    ) {
         let block = Block::default()
             .title(" worktree detail ")
             .title_alignment(Alignment::Center)
@@ -51,8 +60,8 @@ impl DetailView {
             return;
         };
 
-        let lines = build_detail_lines(wt);
-        let para = Paragraph::new(lines);
+        let lines = build_detail_lines(wt, summary, prompt_input);
+        let para = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
         frame.render_widget(para, inner);
     }
 }
@@ -67,7 +76,11 @@ impl Default for DetailView {
 // Detail line builder
 // ---------------------------------------------------------------------------
 
-fn build_detail_lines(wt: &Worktree) -> Vec<Line<'static>> {
+fn build_detail_lines(
+    wt: &Worktree,
+    summary: Option<&str>,
+    prompt_input: Option<&str>,
+) -> Vec<Line<'static>> {
     let key_style = Style::default()
         .fg(Color::DarkGray)
         .add_modifier(Modifier::BOLD);
@@ -115,11 +128,39 @@ fn build_detail_lines(wt: &Worktree) -> Vec<Line<'static>> {
     // Blank separator.
     lines.push(Line::from(""));
 
-    // TODO P4: agent status/summary goes here (no raw transcript).
-    lines.push(Line::from(Span::styled(
-        "agent       (no session — P4)",
-        dim_style(),
-    )));
+    // Live agent status mirrors the worktree status (coarse, no transcript).
+    let agent_label = match wt.status {
+        WorktreeStatus::Running => "running",
+        WorktreeStatus::NeedsReview => "done (needs review)",
+        WorktreeStatus::Error => "error",
+        _ => "idle",
+    };
+    lines.push(kv_line(
+        "agent       ",
+        agent_label,
+        key_style,
+        status_style,
+    ));
+
+    // Last-line summary surfaced from the agent (truncated upstream).
+    if let Some(s) = summary {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("summary", key_style)));
+        lines.push(Line::from(Span::styled(s.to_string(), val_style)));
+    }
+
+    // In-progress prompt input (grid prompt-input mode).
+    if let Some(input) = prompt_input {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "run prompt (Enter=send, Esc=cancel):",
+            Style::default().fg(Color::Cyan),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("> {input}"),
+            Style::default().fg(Color::White),
+        )));
+    }
 
     lines
 }

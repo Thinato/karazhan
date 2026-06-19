@@ -2,25 +2,37 @@ use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures::StreamExt;
 use ratatui::Terminal;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
+use crate::agent::session::{run_session, StatusUpdate};
+use crate::agent::{
+    agent_status_to_worktree_status, claude_code::ClaudeCodeBackend, mock::MockBackend,
+    AgentBackend, AgentStatus,
+};
 use crate::prompts::PromptStore;
 use crate::ui::detail::{split_grid_detail, DetailView};
 use crate::ui::grid::GridView;
 use crate::ui::keymap::Motion;
 use crate::ui::library::{LibraryMode, LibraryView};
-use crate::worktree::{Worktree, WorktreeManager};
+use crate::worktree::{state, Worktree, WorktreeManager, WorktreeStatus};
 
-// TODO Phase 4: add agent status events (AgentStarted, AgentDone, AgentError)
 // TODO Phase 5: add github events (PRMerged, CIFailed)
 // TODO Phase 6: add watcher events (PollTick)
 #[derive(Debug)]
-#[allow(dead_code)] // Quit and future variants are reserved for background tasks (Phase 4+)
+#[allow(dead_code)] // Quit is reserved for background tasks (Phase 6+)
 pub enum AppEvent {
     Tick,
     Quit,
-    // TODO Phase 4+: agent/watcher events go here
+    /// A running agent session posted a coarse status update.  Sent from agent
+    /// tasks through the same channel the UI loop already drains.
+    AgentStatusChanged {
+        worktree_path: PathBuf,
+        status: AgentStatus,
+        summary: Option<String>,
+    },
 }
 
 /// Top-level view the application is currently showing.
@@ -30,23 +42,47 @@ pub enum View {
     Grid,
 }
 
+/// Grid input sub-mode (mirrors LibraryMode's input pattern).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GridMode {
+    /// Normal vim-motion navigation.
+    Normal,
+    /// Typing a free-text prompt to run against the selected worktree.
+    PromptInput,
+}
+
 pub struct App {
     pub running: bool,
     pub view: View,
     event_rx: mpsc::Receiver<AppEvent>,
+    /// Clone of the event sender handed to spawned agent tasks so their status
+    /// updates flow into the same loop the UI drains.
+    event_tx: mpsc::Sender<AppEvent>,
     library: LibraryView,
     // Grid view state.
     grid: GridView,
+    grid_mode: GridMode,
+    /// Free-text prompt buffer used in `GridMode::PromptInput`.
+    prompt_input: String,
     detail: DetailView,
     worktree_manager: WorktreeManager,
     /// Cached list of worktrees; refreshed when entering Grid view or on Tick.
     worktrees: Vec<Worktree>,
     /// True when the last worktree list refresh failed (non-git-repo, etc).
     worktree_error: Option<String>,
+    /// Pluggable agent backend chosen at startup (Claude Code if `claude` is on
+    /// PATH, else the offline mock).
+    backend: Arc<dyn AgentBackend>,
+    /// Latest agent summary per worktree path, surfaced in the detail pane.
+    agent_summaries: HashMap<PathBuf, String>,
 }
 
 impl App {
-    pub fn new(event_rx: mpsc::Receiver<AppEvent>, prompt_dir: PathBuf) -> Self {
+    pub fn new(
+        event_rx: mpsc::Receiver<AppEvent>,
+        event_tx: mpsc::Sender<AppEvent>,
+        prompt_dir: PathBuf,
+    ) -> Self {
         let store = PromptStore::new(prompt_dir);
         let library = LibraryView::new(store);
 
@@ -56,16 +92,23 @@ impl App {
         let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let worktree_manager = WorktreeManager::new(repo_root);
 
+        let backend = select_backend();
+
         let mut app = Self {
             running: true,
             view: View::Library,
             event_rx,
+            event_tx,
             library,
             grid: GridView::new(),
+            grid_mode: GridMode::Normal,
+            prompt_input: String::new(),
             detail: DetailView::new(),
             worktree_manager,
             worktrees: Vec::new(),
             worktree_error: None,
+            backend,
+            agent_summaries: HashMap::new(),
         };
 
         // Pre-load worktrees so Grid view is populated immediately on first switch.
@@ -129,7 +172,16 @@ impl App {
                         }
 
                         let selected_wt = self.worktrees.get(self.grid.selected);
-                        self.detail.render(frame, detail_area, selected_wt);
+                        let summary = selected_wt
+                            .and_then(|wt| self.agent_summaries.get(&wt.path))
+                            .map(|s| s.as_str());
+                        let prompt_input = if self.grid_mode == GridMode::PromptInput {
+                            Some(self.prompt_input.as_str())
+                        } else {
+                            None
+                        };
+                        self.detail
+                            .render(frame, detail_area, selected_wt, summary, prompt_input);
                     }
                 }
             })?;
@@ -232,6 +284,29 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn handle_grid_key(&mut self, code: KeyCode) {
+        // Prompt-input sub-mode intercepts all keys first (mirrors LibraryMode).
+        if self.grid_mode == GridMode::PromptInput {
+            match code {
+                KeyCode::Esc => {
+                    self.grid_mode = GridMode::Normal;
+                    self.prompt_input.clear();
+                }
+                KeyCode::Enter => {
+                    let prompt = std::mem::take(&mut self.prompt_input);
+                    self.grid_mode = GridMode::Normal;
+                    if !prompt.trim().is_empty() {
+                        self.run_agent(prompt);
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.prompt_input.pop();
+                }
+                KeyCode::Char(ch) => self.prompt_input.push(ch),
+                _ => {}
+            }
+            return;
+        }
+
         // Tab switches back to Library view.
         if code == KeyCode::Tab {
             self.view = View::Library;
@@ -286,6 +361,16 @@ impl App {
                 self.refresh_worktrees();
             }
 
+            // Run a custom free-text prompt against the selected worktree.
+            // TODO P5: built-in "address PR comments" / "check CI" commands.
+            KeyCode::Char('c') => {
+                self.grid.clear_pending_count();
+                if self.worktrees.get(self.grid.selected).is_some() {
+                    self.grid_mode = GridMode::PromptInput;
+                    self.prompt_input.clear();
+                }
+            }
+
             // Quit from grid view too.
             KeyCode::Char('q') => {
                 tracing::info!("quit requested via 'q' in grid view");
@@ -321,6 +406,144 @@ impl App {
             AppEvent::Tick => {
                 // TODO Phase 6: trigger watcher poll
             }
+            AppEvent::AgentStatusChanged {
+                worktree_path,
+                status,
+                summary,
+            } => {
+                self.apply_agent_status(&worktree_path, status, summary);
+            }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Agent integration
+    // -----------------------------------------------------------------------
+
+    /// Spawn an agent session on the selected worktree for `prompt`.
+    ///
+    /// Immediately marks the worktree `Running` (cached + persisted) and spawns
+    /// a tokio task that drives the session, forwarding status updates back into
+    /// the event loop via the cloned sender.  Never blocks the UI thread.
+    fn run_agent(&mut self, prompt: String) {
+        let Some(wt) = self.worktrees.get(self.grid.selected) else {
+            return;
+        };
+        let worktree_path = wt.path.clone();
+
+        // Optimistically reflect Running in the UI + persist it.
+        self.set_worktree_status(&worktree_path, WorktreeStatus::Running);
+        self.agent_summaries.remove(&worktree_path);
+
+        let backend = Arc::clone(&self.backend);
+        let app_tx = self.event_tx.clone();
+        let path = worktree_path.clone();
+
+        tracing::info!(worktree = %worktree_path.display(), "running agent");
+
+        tokio::spawn(async move {
+            // Bridge session StatusUpdates -> AppEvents.
+            let (status_tx, mut status_rx) = mpsc::channel::<StatusUpdate>(16);
+            let forward_tx = app_tx.clone();
+            let forwarder = tokio::spawn(async move {
+                while let Some(update) = status_rx.recv().await {
+                    let _ = forward_tx
+                        .send(AppEvent::AgentStatusChanged {
+                            worktree_path: update.worktree_path,
+                            status: update.status,
+                            summary: update.summary,
+                        })
+                        .await;
+                }
+            });
+
+            match backend.start(&path, &prompt).await {
+                Ok(handle) => {
+                    if let Err(e) = run_session(handle, status_tx).await {
+                        tracing::error!("agent session runner failed: {e}");
+                        let _ = app_tx
+                            .send(AppEvent::AgentStatusChanged {
+                                worktree_path: path.clone(),
+                                status: AgentStatus::Error(format!("{e}")),
+                                summary: None,
+                            })
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("failed to start agent: {e}");
+                    let _ = app_tx
+                        .send(AppEvent::AgentStatusChanged {
+                            worktree_path: path.clone(),
+                            status: AgentStatus::Error(format!("{e}")),
+                            summary: None,
+                        })
+                        .await;
+                }
+            }
+
+            let _ = forwarder.await;
+        });
+    }
+
+    /// Apply an incoming agent status update: map to WorktreeStatus, persist,
+    /// and store the summary for the detail pane.
+    fn apply_agent_status(
+        &mut self,
+        worktree_path: &std::path::Path,
+        status: AgentStatus,
+        summary: Option<String>,
+    ) {
+        let wt_status = agent_status_to_worktree_status(&status);
+        self.set_worktree_status(worktree_path, wt_status);
+
+        if let Some(s) = summary {
+            self.agent_summaries.insert(worktree_path.to_path_buf(), s);
+        }
+        tracing::info!(worktree = %worktree_path.display(), "agent status: {status:?}");
+    }
+
+    /// Update a worktree's status in the cached list and persist via state.
+    fn set_worktree_status(&mut self, worktree_path: &std::path::Path, status: WorktreeStatus) {
+        if let Some(wt) = self.worktrees.iter_mut().find(|w| w.path == worktree_path) {
+            wt.status = status.clone();
+        }
+        let repo_root = &self.worktree_manager.repo_root;
+        match state::load(repo_root) {
+            Ok(mut st) => {
+                st.set_status(worktree_path, status);
+                if let Err(e) = state::save(repo_root, &st) {
+                    tracing::warn!("failed to persist worktree status: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("failed to load state for status update: {e}"),
+        }
+    }
+}
+
+/// Choose the active agent backend at startup.
+///
+/// Uses [`ClaudeCodeBackend`] when the `claude` binary is resolvable on PATH;
+/// otherwise falls back to the offline [`MockBackend`].  Logs the choice.
+fn select_backend() -> Arc<dyn AgentBackend> {
+    if claude_on_path() {
+        tracing::info!("agent backend: ClaudeCodeBackend (claude found on PATH)");
+        Arc::new(ClaudeCodeBackend::new())
+    } else {
+        tracing::warn!("agent backend: MockBackend (claude not found on PATH)");
+        Arc::new(MockBackend::new())
+    }
+}
+
+/// Return true if a `claude` binary is resolvable on PATH.
+fn claude_on_path() -> bool {
+    use std::process::Command;
+    Command::new("claude")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
