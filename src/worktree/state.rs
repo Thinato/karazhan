@@ -203,7 +203,7 @@ mod tests {
         let p2 = PathBuf::from("/tmp/dead");
         state.upsert_worktree(make_worktree(&p1, "live"));
         state.upsert_worktree(make_worktree(&p2, "dead"));
-        state.prune_missing(&[p1.clone()]);
+        state.prune_missing(std::slice::from_ref(&p1));
         assert_eq!(state.worktrees.len(), 1);
         assert_eq!(state.worktrees[0].path, p1);
     }

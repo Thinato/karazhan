@@ -16,3 +16,7 @@
 2026-06-19T19:27:52.846816Z  INFO karazhan: karazhan starting up
 2026-06-19T19:27:55.768480Z  INFO karazhan::app: quit requested via 'q'
 2026-06-19T19:27:55.768637Z  INFO karazhan: karazhan shutting down
+2026-06-19T19:43:26.895854Z  INFO karazhan: karazhan starting up
+2026-06-19T19:43:27.505753Z  INFO karazhan::app: agent backend: ClaudeCodeBackend (claude found on PATH)
+2026-06-19T19:43:31.074550Z  INFO karazhan::app: quit requested via 'q'
+2026-06-19T19:43:31.074731Z  INFO karazhan: karazhan shutting down

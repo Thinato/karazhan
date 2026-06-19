@@ -12,6 +12,9 @@ use crate::agent::{
     agent_status_to_worktree_status, claude_code::ClaudeCodeBackend, mock::MockBackend,
     AgentBackend, AgentStatus,
 };
+use crate::github::commands::{build_address_pr_comments_prompt, build_check_ci_prompt};
+use crate::github::pr::pr_for_current_branch;
+use crate::github::RealGh;
 use crate::prompts::PromptStore;
 use crate::ui::detail::{split_grid_detail, DetailView};
 use crate::ui::grid::GridView;
@@ -19,7 +22,6 @@ use crate::ui::keymap::Motion;
 use crate::ui::library::{LibraryMode, LibraryView};
 use crate::worktree::{state, Worktree, WorktreeManager, WorktreeStatus};
 
-// TODO Phase 5: add github events (PRMerged, CIFailed)
 // TODO Phase 6: add watcher events (PollTick)
 #[derive(Debug)]
 #[allow(dead_code)] // Quit is reserved for background tasks (Phase 6+)
@@ -32,6 +34,19 @@ pub enum AppEvent {
         worktree_path: PathBuf,
         status: AgentStatus,
         summary: Option<String>,
+    },
+    /// A built-in command (address PR comments / check CI) has composed its
+    /// prompt text and is ready to be sent to the agent.  Posted from the
+    /// async gh task back into the main event loop.
+    RunComposedPrompt {
+        worktree_path: PathBuf,
+        prompt: String,
+    },
+    /// A built-in command failed (e.g. gh unavailable, no PR, no comments).
+    /// The UI surfaces this as a status/toast rather than crashing.
+    GhError {
+        worktree_path: PathBuf,
+        message: String,
     },
 }
 
@@ -49,6 +64,15 @@ pub enum GridMode {
     Normal,
     /// Typing a free-text prompt to run against the selected worktree.
     PromptInput,
+}
+
+/// Which built-in `gh`-backed command to execute on the selected worktree.
+#[derive(Debug, Clone, Copy)]
+enum GhCommand {
+    /// Compose a prompt from all open review comments on the worktree's PR.
+    AddressPrComments,
+    /// Compose a prompt from the failing CI checks/logs on the worktree's PR.
+    CheckCi,
 }
 
 pub struct App {
@@ -70,6 +94,9 @@ pub struct App {
     worktrees: Vec<Worktree>,
     /// True when the last worktree list refresh failed (non-git-repo, etc).
     worktree_error: Option<String>,
+    /// Short error message from the last failed built-in gh command, shown as
+    /// a status toast in the detail pane.  Cleared on the next command key.
+    gh_error: Option<String>,
     /// Pluggable agent backend chosen at startup (Claude Code if `claude` is on
     /// PATH, else the offline mock).
     backend: Arc<dyn AgentBackend>,
@@ -107,6 +134,7 @@ impl App {
             worktree_manager,
             worktrees: Vec::new(),
             worktree_error: None,
+            gh_error: None,
             backend,
             agent_summaries: HashMap::new(),
         };
@@ -362,13 +390,27 @@ impl App {
             }
 
             // Run a custom free-text prompt against the selected worktree.
-            // TODO P5: built-in "address PR comments" / "check CI" commands.
             KeyCode::Char('c') => {
                 self.grid.clear_pending_count();
+                self.gh_error = None;
                 if self.worktrees.get(self.grid.selected).is_some() {
                     self.grid_mode = GridMode::PromptInput;
                     self.prompt_input.clear();
                 }
+            }
+
+            // Built-in: "address all PR comments" for the selected worktree.
+            KeyCode::Char('p') => {
+                self.grid.clear_pending_count();
+                self.gh_error = None;
+                self.spawn_gh_command(GhCommand::AddressPrComments);
+            }
+
+            // Built-in: "check CI for failures" for the selected worktree.
+            KeyCode::Char('i') => {
+                self.grid.clear_pending_count();
+                self.gh_error = None;
+                self.spawn_gh_command(GhCommand::CheckCi);
             }
 
             // Quit from grid view too.
@@ -412,6 +454,23 @@ impl App {
                 summary,
             } => {
                 self.apply_agent_status(&worktree_path, status, summary);
+            }
+            AppEvent::RunComposedPrompt {
+                worktree_path,
+                prompt,
+            } => {
+                // Re-select the worktree so run_agent picks the right one.
+                if let Some(idx) = self.worktrees.iter().position(|w| w.path == worktree_path) {
+                    self.grid.selected = idx;
+                }
+                self.run_agent(prompt);
+            }
+            AppEvent::GhError {
+                worktree_path,
+                message,
+            } => {
+                tracing::warn!(worktree = %worktree_path.display(), "gh command error: {message}");
+                self.gh_error = Some(message);
             }
         }
     }
@@ -483,6 +542,86 @@ impl App {
             }
 
             let _ = forwarder.await;
+        });
+    }
+
+    /// Resolve a worktree's PR number: use the cached value if present, or ask
+    /// `gh` for the current branch's PR and cache the result in state.
+    ///
+    /// Returns `None` (non-fatally) when no PR is open; logs gh errors.
+    async fn resolve_pr_number(
+        runner: &RealGh,
+        wt: &Worktree,
+        repo_root: &std::path::Path,
+    ) -> Option<u64> {
+        if let Some(n) = wt.pr_number {
+            return Some(n);
+        }
+        match pr_for_current_branch(runner, &wt.path).await {
+            Ok(Some(n)) => {
+                // Persist the discovered PR number so future calls are fast.
+                if let Ok(mut st) = state::load(repo_root) {
+                    st.set_pr_number(&wt.path, Some(n));
+                    let _ = state::save(repo_root, &st);
+                }
+                Some(n)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!("pr_for_current_branch failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Spawn an async task that builds the `gh`-composed prompt for `cmd` on
+    /// the currently selected worktree, then posts the result back through the
+    /// event channel as either `RunComposedPrompt` or `GhError`.
+    ///
+    /// Never blocks the UI thread.
+    fn spawn_gh_command(&mut self, cmd: GhCommand) {
+        let Some(wt) = self.worktrees.get(self.grid.selected) else {
+            return;
+        };
+        let wt = wt.clone();
+        let repo_root = self.worktree_manager.repo_root.clone();
+        let app_tx = self.event_tx.clone();
+
+        tokio::spawn(async move {
+            let runner = RealGh::new();
+            let worktree_path = wt.path.clone();
+
+            let pr_opt = Self::resolve_pr_number(&runner, &wt, &repo_root).await;
+
+            let result: Result<String> = match cmd {
+                GhCommand::AddressPrComments => match pr_opt {
+                    None => Err(anyhow::anyhow!(
+                        "no open PR found for worktree {}",
+                        wt.path.display()
+                    )),
+                    Some(pr) => build_address_pr_comments_prompt(&runner, &wt.path, pr).await,
+                },
+                GhCommand::CheckCi => match pr_opt {
+                    None => Err(anyhow::anyhow!(
+                        "no open PR found for worktree {}",
+                        wt.path.display()
+                    )),
+                    Some(pr) => build_check_ci_prompt(&runner, &wt.path, pr).await,
+                },
+            };
+
+            let event = match result {
+                Ok(prompt) => AppEvent::RunComposedPrompt {
+                    worktree_path,
+                    prompt,
+                },
+                Err(e) => AppEvent::GhError {
+                    worktree_path,
+                    message: format!("{e}"),
+                },
+            };
+
+            let _ = app_tx.send(event).await;
         });
     }
 
