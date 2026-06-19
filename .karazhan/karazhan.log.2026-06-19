@@ -1,3 +1,7 @@
 2026-06-19T19:12:53.790656Z  INFO karazhan: karazhan starting up
 2026-06-19T19:12:57.084745Z  INFO karazhan::app: quit requested via 'q'
 2026-06-19T19:12:57.085655Z  INFO karazhan: karazhan shutting down
+2026-06-19T19:23:43.740657Z  INFO karazhan: karazhan starting up
+2026-06-19T19:23:43.742265Z  WARN karazhan::ui::library: library: could not load prompts: cannot read prompt dir "/Users/paulolisecki/repos/thinato/karazhan/prompts"
+2026-06-19T19:23:47.891452Z  INFO karazhan::app: quit requested via 'q'
+2026-06-19T19:23:47.891589Z  INFO karazhan: karazhan shutting down
