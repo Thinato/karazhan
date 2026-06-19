@@ -20,12 +20,14 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::{io, panic, path::PathBuf};
+use std::{io, panic, path::PathBuf, time::Duration};
 use tokio::sync::mpsc;
 use tracing_appender::rolling;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use app::{App, AppEvent};
+use config::Config;
+use watcher::WatcherConfig;
 
 /// Karazhan — TUI prompt manager and agent orchestrator
 #[derive(Parser, Debug)]
@@ -34,7 +36,6 @@ struct Args {
     /// Path to the project directory (defaults to current dir)
     #[arg(short, long)]
     project: Option<PathBuf>,
-    // TODO Phase 7: add --config, --log-level, etc.
 }
 
 /// RAII guard that owns terminal raw mode + alternate screen.
@@ -93,6 +94,15 @@ async fn main() -> Result<()> {
 
     tracing::info!("karazhan starting up");
 
+    // Load config (missing or malformed file → defaults, never errors).
+    let cfg = Config::load();
+    tracing::info!(
+        poll_interval_secs = cfg.poll_interval_secs,
+        claude_bin = %cfg.claude_bin,
+        gh_bin = %cfg.gh_bin,
+        "config loaded"
+    );
+
     // Install panic hook so terminal is restored on unexpected panics.
     install_panic_hook();
 
@@ -104,14 +114,14 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create the internal event channel.  Background tasks (watcher, agent
-    // sessions) will send AppEvents here in later phases.
+    // sessions) will send AppEvents here.
     let (event_tx, event_rx) = mpsc::channel::<AppEvent>(64);
 
     // Clone the sender for the App so spawned agent tasks can post status
     // updates into the same event loop the UI drains.
     let app_event_tx = event_tx.clone();
 
-    // Spawn a tick task as a placeholder for future background work.
+    // Spawn a tick task.
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
         loop {
@@ -123,18 +133,22 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Resolve the prompt directory: default to `<cwd>/prompts`.
-    let prompt_dir = std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("prompts");
+    // Resolve the prompt directory from config or fall back to <cwd>/prompts.
+    let prompt_dir = cfg.prompt_dir.clone().unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("prompts")
+    });
 
-    let mut app = App::new(event_rx, app_event_tx, prompt_dir);
+    let watcher_config = WatcherConfig {
+        interval: Duration::from_secs(cfg.poll_interval_secs),
+    };
+
+    let mut app = App::new(event_rx, app_event_tx, prompt_dir, cfg);
 
     // Spawn the background watcher only when `gh` is available.
-    // When absent, GitHub features degrade gracefully — we log a warning and
-    // continue without polling.
     if github::gh_available().await {
-        app.start_watcher();
+        app.start_watcher(watcher_config);
     } else {
         tracing::warn!("gh not available — background watcher disabled");
     }

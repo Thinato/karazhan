@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -31,9 +31,11 @@ impl DetailView {
 
     /// Render the detail pane for `worktree` into `area`.
     ///
-    /// `summary` is the latest short agent summary (if any) and `prompt_input`
+    /// `summary` is the latest short agent summary (if any), `prompt_input`
     /// is the in-progress free-text prompt while the grid is in prompt-input
-    /// mode.  If `worktree` is `None` (empty grid), shows a placeholder message.
+    /// mode, and `status_line` is an optional message shown at the bottom of
+    /// the pane (backend name, gh errors, transient notifications, …).
+    /// If `worktree` is `None` (empty grid), shows a placeholder message.
     pub fn render(
         &self,
         frame: &mut Frame,
@@ -41,6 +43,7 @@ impl DetailView {
         worktree: Option<&Worktree>,
         summary: Option<&str>,
         prompt_input: Option<&str>,
+        status_line: Option<&str>,
     ) {
         let block = Block::default()
             .title(" worktree detail ")
@@ -52,17 +55,28 @@ impl DetailView {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        // Split inner into content area + 1-row status line at the bottom.
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(inner);
+        let content_area = chunks[0];
+        let status_area = chunks[1];
+
         let Some(wt) = worktree else {
             let msg = Paragraph::new("no worktree selected")
                 .style(Style::default().fg(Color::DarkGray))
                 .alignment(Alignment::Center);
-            frame.render_widget(msg, inner);
+            frame.render_widget(msg, content_area);
+            render_status_line(frame, status_area, status_line);
             return;
         };
 
         let lines = build_detail_lines(wt, summary, prompt_input);
         let para = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
-        frame.render_widget(para, inner);
+        frame.render_widget(para, content_area);
+
+        render_status_line(frame, status_area, status_line);
     }
 }
 
@@ -205,6 +219,21 @@ fn status_val_style(status: &WorktreeStatus) -> Style {
         WorktreeStatus::Error => base.add_modifier(Modifier::BOLD),
         _ => base,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Status line helper
+// ---------------------------------------------------------------------------
+
+/// Render a single-row status line at the bottom of the detail pane.
+///
+/// Shows the backend name + transient messages (gh errors, PR merged, CI
+/// status, etc.).  Falls back to a default hint when no message is set.
+fn render_status_line(frame: &mut Frame, area: Rect, status_line: Option<&str>) {
+    frame.render_widget(Clear, area);
+    let text = status_line.unwrap_or("Tab: switch view  ?: help  q: quit");
+    let para = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(para, area);
 }
 
 // ---------------------------------------------------------------------------

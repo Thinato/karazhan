@@ -20,3 +20,21 @@
 2026-06-19T19:43:27.505753Z  INFO karazhan::app: agent backend: ClaudeCodeBackend (claude found on PATH)
 2026-06-19T19:43:31.074550Z  INFO karazhan::app: quit requested via 'q'
 2026-06-19T19:43:31.074731Z  INFO karazhan: karazhan shutting down
+2026-06-19T20:09:53.501809Z  INFO karazhan: karazhan starting up
+2026-06-19T20:09:53.502185Z  INFO karazhan: config loaded poll_interval_secs=30 claude_bin=claude gh_bin=gh
+2026-06-19T20:09:54.542946Z  INFO karazhan::app: agent backend: ClaudeCodeBackend (claude found on PATH)
+2026-06-19T20:09:54.772555Z  INFO karazhan::app: watcher started
+2026-06-19T20:10:35.890047Z  INFO karazhan::app: entered grid view (1 worktrees)
+2026-06-19T20:15:40.174091Z  INFO karazhan::app: entered grid view (1 worktrees)
+2026-06-19T20:18:59.114034Z  INFO karazhan::app: quit requested via 'q' in grid view
+2026-06-19T20:18:59.114377Z  INFO karazhan::watcher: watcher: shutdown signal received, exiting
+2026-06-19T20:18:59.115003Z  INFO karazhan::app: watcher stopped cleanly
+2026-06-19T20:18:59.115063Z  INFO karazhan: karazhan shutting down
+2026-06-19T20:20:46.791788Z  INFO karazhan: karazhan starting up
+2026-06-19T20:20:46.792040Z  INFO karazhan: config loaded poll_interval_secs=30 claude_bin=claude gh_bin=gh
+2026-06-19T20:20:47.273453Z  INFO karazhan::app: agent backend: ClaudeCodeBackend (claude found on PATH)
+2026-06-19T20:20:47.380341Z  INFO karazhan::app: watcher started
+2026-06-19T20:27:05.446720Z  INFO karazhan::app: quit requested via 'q'
+2026-06-19T20:27:05.447124Z  INFO karazhan::watcher: watcher: shutdown signal received, exiting
+2026-06-19T20:27:05.447178Z  INFO karazhan::app: watcher stopped cleanly
+2026-06-19T20:27:05.447226Z  INFO karazhan: karazhan shutting down
