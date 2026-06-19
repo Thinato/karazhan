@@ -128,7 +128,17 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("prompts");
 
-    let app = App::new(event_rx, app_event_tx, prompt_dir);
+    let mut app = App::new(event_rx, app_event_tx, prompt_dir);
+
+    // Spawn the background watcher only when `gh` is available.
+    // When absent, GitHub features degrade gracefully — we log a warning and
+    // continue without polling.
+    if github::gh_available().await {
+        app.start_watcher();
+    } else {
+        tracing::warn!("gh not available — background watcher disabled");
+    }
+
     let result = app.run(&mut terminal).await;
 
     tracing::info!("karazhan shutting down");
