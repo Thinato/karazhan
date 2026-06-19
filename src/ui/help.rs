@@ -103,7 +103,17 @@ fn help_lines() -> Vec<Line<'static>> {
         ),
         kv("a       ", "toggle auto-continue on PR merge", key, desc),
         kv("r       ", "refresh worktree list", key, desc),
+        kv(
+            "Q       ",
+            "stop the supervisor daemon, then quit",
+            key,
+            desc,
+        ),
         Line::from(""),
+        Line::from(Span::styled(
+            "  q / Ctrl-C quit the TUI; the daemon (agents + watcher) keeps running.",
+            dim,
+        )),
         Line::from(Span::styled(
             "  (prompt input)  Enter: send  Esc: cancel  Backspace: delete",
             dim,

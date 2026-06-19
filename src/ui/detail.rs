@@ -6,7 +6,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::worktree::{Worktree, WorktreeStatus};
+use crate::ipc::WorktreeView;
+use crate::worktree::WorktreeStatus;
 
 // ---------------------------------------------------------------------------
 // DetailView
@@ -40,7 +41,7 @@ impl DetailView {
         &self,
         frame: &mut Frame,
         area: Rect,
-        worktree: Option<&Worktree>,
+        worktree: Option<&WorktreeView>,
         summary: Option<&str>,
         prompt_input: Option<&str>,
         status_line: Option<&str>,
@@ -91,7 +92,7 @@ impl Default for DetailView {
 // ---------------------------------------------------------------------------
 
 fn build_detail_lines(
-    wt: &Worktree,
+    wt: &WorktreeView,
     summary: Option<&str>,
     prompt_input: Option<&str>,
 ) -> Vec<Line<'static>> {

@@ -1,5 +1,8 @@
 mod app;
+pub mod client;
 mod config;
+pub mod daemon;
+pub mod ipc;
 mod watcher;
 
 // TODO Phase 1
@@ -20,14 +23,13 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::{io, panic, path::PathBuf, time::Duration};
+use std::{io, panic, path::PathBuf};
 use tokio::sync::mpsc;
 use tracing_appender::rolling;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use app::{App, AppEvent};
 use config::Config;
-use watcher::WatcherConfig;
 
 /// Karazhan — TUI prompt manager and agent orchestrator
 #[derive(Parser, Debug)]
@@ -84,8 +86,23 @@ fn init_tracing() -> Result<tracing_appender::non_blocking::WorkerGuard> {
     Ok(guard)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Supervisor branch: must be handled BEFORE constructing the client tokio
+    // runtime, because `run_supervisor()` builds its OWN multi-thread runtime
+    // (nesting runtimes panics).  When `--supervisor` is present we hand off to
+    // the daemon entry point and never run any TUI/terminal setup.
+    if std::env::args().any(|a| a == "--supervisor") {
+        return daemon::run_supervisor();
+    }
+
+    // Otherwise build the client runtime and run the existing async TUI logic.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run_client())
+}
+
+async fn run_client() -> Result<()> {
     let _args = Args::parse();
 
     // Initialise tracing before anything else (guard must live for the full
@@ -113,20 +130,17 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    // Create the internal event channel.  Background tasks (watcher, agent
-    // sessions) will send AppEvents here.
+    // Create the internal event channel.  The daemon-client reader task and the
+    // tick task post AppEvents here; the App's event loop drains them.
     let (event_tx, event_rx) = mpsc::channel::<AppEvent>(64);
 
-    // Clone the sender for the App so spawned agent tasks can post status
-    // updates into the same event loop the UI drains.
-    let app_event_tx = event_tx.clone();
-
     // Spawn a tick task.
+    let tick_tx = event_tx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
         loop {
             interval.tick().await;
-            if event_tx.send(AppEvent::Tick).await.is_err() {
+            if tick_tx.send(AppEvent::Tick).await.is_err() {
                 // Receiver (App) has been dropped — stop ticking.
                 break;
             }
@@ -140,18 +154,11 @@ async fn main() -> Result<()> {
             .join("prompts")
     });
 
-    let watcher_config = WatcherConfig {
-        interval: Duration::from_secs(cfg.poll_interval_secs),
-    };
+    // Connect to the supervisor daemon (auto-spawning it on first launch).  The
+    // daemon owns the agent backend, the watcher, and all state.toml writes.
+    let client = client::connect(event_tx.clone()).await?;
 
-    let mut app = App::new(event_rx, app_event_tx, prompt_dir, cfg);
-
-    // Spawn the background watcher only when `gh` is available.
-    if github::gh_available().await {
-        app.start_watcher(watcher_config);
-    } else {
-        tracing::warn!("gh not available — background watcher disabled");
-    }
+    let app = App::new(event_rx, prompt_dir, cfg, client);
 
     let result = app.run(&mut terminal).await;
 

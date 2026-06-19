@@ -6,9 +6,10 @@ use ratatui::{
     Frame,
 };
 
-use crate::worktree::{Worktree, WorktreeStatus};
+use crate::ipc::WorktreeView;
+use crate::worktree::WorktreeStatus;
 
-use super::keymap::{apply_motion, clamp_selection, Motion};
+use super::keymap::{apply_motion, Motion};
 
 // ---------------------------------------------------------------------------
 // Cell geometry
@@ -72,11 +73,6 @@ impl GridView {
         self.pending_count = None;
     }
 
-    /// Clamp `selected` when the item list changes (items added/removed).
-    pub fn clamp(&mut self, item_count: usize) {
-        self.selected = clamp_selection(self.selected, item_count);
-    }
-
     /// Compute the number of grid columns that fit within `area_width`.
     pub fn cols_for_width(area_width: u16) -> usize {
         // At least 1 column even on very narrow terminals.
@@ -91,7 +87,7 @@ impl GridView {
     ///
     /// Each worktree gets a fixed-size cell (CELL_W × CELL_H) arranged in rows.
     /// The selected cell is rendered with a double-line border and inverted text.
-    pub fn render(&self, frame: &mut Frame, area: Rect, worktrees: &[Worktree]) {
+    pub fn render(&self, frame: &mut Frame, area: Rect, worktrees: &[WorktreeView]) {
         if worktrees.is_empty() {
             let msg = Paragraph::new(" No worktrees found.  Create one with `git worktree add`.")
                 .style(Style::default().fg(Color::DarkGray));
@@ -119,7 +115,7 @@ impl GridView {
         }
     }
 
-    fn render_cell(&self, frame: &mut Frame, area: Rect, wt: &Worktree, selected: bool) {
+    fn render_cell(&self, frame: &mut Frame, area: Rect, wt: &WorktreeView, selected: bool) {
         // Derive colors from status.
         let (border_color, label_color) = status_colors(&wt.status);
 

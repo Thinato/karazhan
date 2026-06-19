@@ -38,3 +38,20 @@
 2026-06-19T20:27:05.447124Z  INFO karazhan::watcher: watcher: shutdown signal received, exiting
 2026-06-19T20:27:05.447178Z  INFO karazhan::app: watcher stopped cleanly
 2026-06-19T20:27:05.447226Z  INFO karazhan: karazhan shutting down
+2026-06-19T20:40:53.351166Z  INFO karazhan: karazhan starting up
+2026-06-19T20:40:53.351385Z  INFO karazhan: config loaded poll_interval_secs=30 claude_bin=claude gh_bin=gh
+2026-06-19T20:40:53.921133Z  INFO karazhan::app: agent backend: ClaudeCodeBackend (claude found on PATH)
+2026-06-19T20:40:54.084036Z  INFO karazhan::app: watcher started
+2026-06-19T20:40:54.778755Z  INFO karazhan::app: entered grid view (1 worktrees)
+2026-06-19T20:40:56.419483Z  INFO karazhan::app: entered grid view (1 worktrees)
+2026-06-19T20:55:28.214837Z  INFO karazhan::app: quit requested via 'q' in grid view
+2026-06-19T20:55:28.217366Z  INFO karazhan::watcher: watcher: shutdown signal received, exiting
+2026-06-19T20:55:28.218078Z  INFO karazhan::app: watcher stopped cleanly
+2026-06-19T20:55:28.218166Z  INFO karazhan: karazhan shutting down
+2026-06-19T20:55:32.237476Z  INFO karazhan: karazhan starting up
+2026-06-19T20:55:32.237690Z  INFO karazhan: config loaded poll_interval_secs=30 claude_bin=claude gh_bin=gh
+2026-06-19T20:55:32.239223Z  INFO karazhan::client: client: no daemon listening — auto-spawning supervisor socket=/Users/paulolisecki/.cache/karazhan/sock
+2026-06-19T20:55:32.717729Z  INFO karazhan::client: client: attached to supervisor supervisor_pid=70928
+2026-06-19T20:55:34.389691Z  INFO karazhan::app: entered grid view (1 worktrees)
+2026-06-19T20:55:36.640952Z  INFO karazhan::app: quit requested via 'q' in grid view
+2026-06-19T20:55:36.641138Z  INFO karazhan: karazhan shutting down

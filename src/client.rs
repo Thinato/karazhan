@@ -1,0 +1,249 @@
+//! Thin-client connection to the supervisor daemon (Stage 8c).
+//!
+//! The TUI no longer owns the agent backend, the watcher, or `state.toml`
+//! writes.  Instead it connects to the supervisor daemon over a Unix domain
+//! socket, renders from daemon-pushed [`ipc::WorktreeView`]s, and sends
+//! [`ipc::ClientMsg`] for every action.  When the TUI quits the daemon (and all
+//! agent sessions + the watcher) keeps running.
+//!
+//! [`connect`] resolves the socket path and, if no daemon is listening yet,
+//! auto-spawns one via [`crate::daemon::spawn_supervisor`] (double-fork) and
+//! waits for the socket to come up.  It then performs the handshake, forwards
+//! the initial snapshot as an [`AppEvent::Snapshot`], and spawns a reader task
+//! (daemon → [`AppEvent`]) and a writer task ([`ClientMsg`] → socket).
+
+use std::io::ErrorKind;
+
+use anyhow::{bail, Result};
+use tokio::net::UnixStream;
+use tokio::sync::mpsc;
+
+use crate::app::AppEvent;
+use crate::daemon;
+use crate::ipc::{self, ClientMsg, HandshakeReq, HandshakeResp, SupervisorMsg, PROTOCOL_VERSION};
+
+/// Capacity of the outbound `ClientMsg` channel feeding the writer task.
+const CLIENT_TX_CAP: usize = 64;
+
+/// Handle the TUI uses to talk to the supervisor daemon.
+///
+/// Cloning is not needed: the `App` owns a single client.  Outgoing commands
+/// are pushed onto an mpsc channel drained by a background writer task, so the
+/// async event loop never blocks on socket I/O.
+pub struct SupervisorClient {
+    tx: mpsc::Sender<ClientMsg>,
+    /// PID of the daemon we are connected to (informational / status line).
+    pub supervisor_pid: u32,
+}
+
+impl SupervisorClient {
+    /// Send a `ClientMsg` to the daemon.  Awaits a free slot in the writer
+    /// channel; if the writer task has gone away the send is logged and dropped.
+    pub async fn send(&self, msg: ClientMsg) {
+        if let Err(e) = self.tx.send(msg).await {
+            tracing::warn!("client: failed to enqueue ClientMsg (writer gone): {e}");
+        }
+    }
+}
+
+/// Translate a daemon-pushed [`SupervisorMsg`] into the [`AppEvent`] the UI loop
+/// consumes.  Pure (no I/O) so it can be unit-tested.
+pub fn supervisor_msg_to_app_event(msg: SupervisorMsg) -> AppEvent {
+    match msg {
+        SupervisorMsg::Snapshot { worktrees } => AppEvent::Snapshot { worktrees },
+        SupervisorMsg::StatusChanged {
+            worktree_path,
+            status,
+            summary,
+        } => AppEvent::WorktreeStatusChanged {
+            worktree_path,
+            status,
+            summary,
+        },
+        SupervisorMsg::Error {
+            worktree_path,
+            message,
+        } => AppEvent::DaemonError {
+            worktree_path,
+            message,
+        },
+    }
+}
+
+/// Connect to the supervisor daemon, auto-spawning it on first launch.
+///
+/// On success the initial snapshot is forwarded into `event_tx` as an
+/// [`AppEvent::Snapshot`] and reader/writer tasks are spawned.
+pub async fn connect(event_tx: mpsc::Sender<AppEvent>) -> Result<SupervisorClient> {
+    let sock_path = ipc::resolve_socket_path();
+
+    // Probe the socket; auto-spawn the daemon if nothing is listening.
+    let stream = match UnixStream::connect(&sock_path).await {
+        Ok(s) => s,
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
+            tracing::info!(
+                socket = %sock_path.display(),
+                "client: no daemon listening — auto-spawning supervisor"
+            );
+            daemon::spawn_supervisor()?;
+            daemon::wait_for_socket(&sock_path, std::time::Duration::from_secs(2)).await?;
+            UnixStream::connect(&sock_path).await?
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let (mut read_half, mut write_half) = stream.into_split();
+
+    // Handshake.
+    ipc::write_frame_async(
+        &mut write_half,
+        &HandshakeReq {
+            protocol: PROTOCOL_VERSION,
+            client_pid: std::process::id(),
+        },
+    )
+    .await?;
+
+    let resp: HandshakeResp = ipc::read_frame_async(&mut read_half).await?;
+    let supervisor_pid = match resp {
+        HandshakeResp::Ok {
+            supervisor_pid,
+            worktrees,
+        } => {
+            // Seed the UI with current state immediately.
+            let _ = event_tx.send(AppEvent::Snapshot { worktrees }).await;
+            supervisor_pid
+        }
+        HandshakeResp::ProtocolMismatch { supervisor } => {
+            bail!(
+                "protocol mismatch: client speaks v{PROTOCOL_VERSION}, supervisor speaks v{supervisor}. \
+                 Stop the daemon (kill via {}) and relaunch.",
+                ipc::pidfile_path(&sock_path).display()
+            );
+        }
+    };
+
+    tracing::info!(supervisor_pid, "client: attached to supervisor");
+
+    // Reader task: daemon → AppEvent.
+    let reader_event_tx = event_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            match ipc::read_frame_async::<_, SupervisorMsg>(&mut read_half).await {
+                Ok(msg) => {
+                    let event = supervisor_msg_to_app_event(msg);
+                    if reader_event_tx.send(event).await.is_err() {
+                        // UI gone; stop reading.
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::info!("client: reader stopped (daemon disconnected): {e}");
+                    let _ = reader_event_tx.send(AppEvent::DaemonDisconnected).await;
+                    break;
+                }
+            }
+        }
+    });
+
+    // Writer task: ClientMsg → socket.
+    let (tx, mut rx) = mpsc::channel::<ClientMsg>(CLIENT_TX_CAP);
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if let Err(e) = ipc::write_frame_async(&mut write_half, &msg).await {
+                tracing::warn!("client: write failed; writer task exiting: {e}");
+                break;
+            }
+        }
+    });
+
+    Ok(SupervisorClient { tx, supervisor_pid })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worktree::WorktreeStatus;
+    use std::path::PathBuf;
+
+    #[test]
+    fn snapshot_maps_to_app_snapshot() {
+        let views = vec![ipc::WorktreeView {
+            path: PathBuf::from("/wt"),
+            branch: "main".into(),
+            prompt_slug: None,
+            pr_number: None,
+            auto_continue_on_merge: false,
+            status: WorktreeStatus::Idle,
+            last_summary: None,
+        }];
+        let event = supervisor_msg_to_app_event(SupervisorMsg::Snapshot {
+            worktrees: views.clone(),
+        });
+        match event {
+            AppEvent::Snapshot { worktrees } => assert_eq!(worktrees, views),
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_changed_maps_to_worktree_status_changed() {
+        let event = supervisor_msg_to_app_event(SupervisorMsg::StatusChanged {
+            worktree_path: PathBuf::from("/wt"),
+            status: WorktreeStatus::NeedsReview,
+            summary: Some("done".into()),
+        });
+        match event {
+            AppEvent::WorktreeStatusChanged {
+                worktree_path,
+                status,
+                summary,
+            } => {
+                assert_eq!(worktree_path, PathBuf::from("/wt"));
+                assert_eq!(status, WorktreeStatus::NeedsReview);
+                assert_eq!(summary, Some("done".to_string()));
+            }
+            other => panic!("expected WorktreeStatusChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_with_path_maps_to_daemon_error() {
+        let event = supervisor_msg_to_app_event(SupervisorMsg::Error {
+            worktree_path: Some(PathBuf::from("/wt")),
+            message: "gh failed".into(),
+        });
+        match event {
+            AppEvent::DaemonError {
+                worktree_path,
+                message,
+            } => {
+                assert_eq!(worktree_path, Some(PathBuf::from("/wt")));
+                assert_eq!(message, "gh failed");
+            }
+            other => panic!("expected DaemonError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_no_path_maps_to_daemon_error() {
+        let event = supervisor_msg_to_app_event(SupervisorMsg::Error {
+            worktree_path: None,
+            message: "internal".into(),
+        });
+        match event {
+            AppEvent::DaemonError {
+                worktree_path,
+                message,
+            } => {
+                assert_eq!(worktree_path, None);
+                assert_eq!(message, "internal");
+            }
+            other => panic!("expected DaemonError, got {other:?}"),
+        }
+    }
+}
