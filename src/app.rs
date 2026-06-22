@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
 use crate::client::SupervisorClient;
+use crate::commands::{self, CommandId, Palette};
 use crate::config::Config;
 use crate::ipc::{BuiltinKind, ClientMsg, WorktreeView};
 use crate::prompts::PromptStore;
@@ -99,6 +100,8 @@ pub struct App {
     /// Path of a prompt file queued to open in `$EDITOR` (set by the `e` key,
     /// drained by the run loop so the editor runs outside the event stream).
     pending_edit: Option<PathBuf>,
+    /// Command palette modal; `Some` while open (Ctrl-P).  Intercepts all keys.
+    palette: Option<Palette>,
 }
 
 impl App {
@@ -126,6 +129,7 @@ impl App {
             config,
             show_help: false,
             pending_edit: None,
+            palette: None,
         }
     }
 
@@ -171,6 +175,11 @@ impl App {
                 // Render help overlay on top of whatever view is active.
                 if self.show_help {
                     crate::ui::help::render_help(frame, area);
+                }
+
+                // Render the command palette on top of everything else.
+                if let Some(palette) = &self.palette {
+                    crate::ui::palette::render_palette(frame, area, palette);
                 }
             })?;
 
@@ -292,6 +301,12 @@ impl App {
                 return;
             }
 
+            // Command palette: while open it intercepts ALL keys.
+            if self.palette.is_some() {
+                self.handle_palette_key(code, modifiers).await;
+                return;
+            }
+
             // Help overlay: ? toggles it; Esc/q close it while open.
             if self.show_help {
                 match code {
@@ -309,41 +324,189 @@ impl App {
                 return;
             }
 
+            // Global Ctrl-P opens the command palette — but only from Normal
+            // modes, so it does not steal a character from an active text input.
+            if code == KeyCode::Char('p') && modifiers.contains(KeyModifiers::CONTROL) {
+                let in_input =
+                    self.library.mode != LibraryMode::Normal || self.grid_mode != GridMode::Normal;
+                if !in_input {
+                    self.palette = Some(commands::Palette::open(self.view == View::Grid));
+                    return;
+                }
+            }
+
             match self.view {
-                View::Library => self.handle_library_key(code, modifiers),
+                View::Library => self.handle_library_key(code, modifiers).await,
                 View::Grid => self.handle_grid_key(code).await,
             }
         }
     }
 
     // -----------------------------------------------------------------------
+    // Command palette
+    // -----------------------------------------------------------------------
+
+    /// Handle a key while the command palette is open.  The palette intercepts
+    /// every key: navigation, query editing, run (Enter), cancel (Esc).
+    async fn handle_palette_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+
+        // Ctrl-N / Ctrl-P move the cursor down / up.
+        if ctrl {
+            match code {
+                KeyCode::Char('n') => {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.move_cursor(1);
+                    }
+                    return;
+                }
+                KeyCode::Char('p') => {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.move_cursor(-1);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        match code {
+            KeyCode::Esc => {
+                self.palette = None;
+            }
+            KeyCode::Down => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.move_cursor(1);
+                }
+            }
+            KeyCode::Up => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.move_cursor(-1);
+                }
+            }
+            KeyCode::Enter => {
+                let selected = self.palette.take().and_then(|p| p.selected());
+                if let Some(id) = selected {
+                    self.execute_command(id).await;
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.query.pop();
+                    p.refilter();
+                }
+            }
+            KeyCode::Char(ch) if !ctrl => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.query.push(ch);
+                    p.refilter();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Run a command.  Single implementation per command, shared by both the
+    /// palette and the inline key handlers.
+    ///
+    /// The `match` is *exhaustive* (no wildcard): adding a [`CommandId`] variant
+    /// without a handler here is a compile error, which is what forces every
+    /// new command into the palette.
+    async fn execute_command(&mut self, id: CommandId) {
+        match id {
+            CommandId::SwitchView => match self.view {
+                View::Library => self.enter_grid_view(),
+                View::Grid => self.view = View::Library,
+            },
+            CommandId::ToggleHelp => {
+                self.show_help = !self.show_help;
+            }
+            CommandId::Quit => {
+                tracing::info!("quit requested via command");
+                self.running = false;
+            }
+            CommandId::StopDaemon => {
+                tracing::info!("daemon shutdown requested via command");
+                self.client.send(ClientMsg::Shutdown).await;
+                self.running = false;
+            }
+            CommandId::NewPrompt => {
+                self.view = View::Library;
+                self.library.enter_new_prompt();
+            }
+            CommandId::EditPrompt => {
+                if self.view == View::Library {
+                    match self.library.selected_prompt_path() {
+                        Some(path) => self.pending_edit = Some(path),
+                        None => self.library.status = Some("no prompt selected".to_string()),
+                    }
+                } else {
+                    self.set_status("edit prompt: switch to Library view first");
+                }
+            }
+            CommandId::FilterPrompts => {
+                self.view = View::Library;
+                self.library.enter_filter();
+            }
+            CommandId::RefreshWorktrees => {
+                self.client.send(ClientMsg::Refresh).await;
+                self.set_status("refreshing…");
+            }
+            CommandId::RunCustomPrompt => {
+                self.view = View::Grid;
+                if self.selected_worktree_path().is_some() {
+                    self.grid_mode = GridMode::PromptInput;
+                    self.prompt_input.clear();
+                } else {
+                    self.set_status("no worktree selected");
+                }
+            }
+            CommandId::AddressPrComments => {
+                self.view = View::Grid;
+                self.send_run_builtin(BuiltinKind::AddressPrComments).await;
+            }
+            CommandId::CheckCi => {
+                self.view = View::Grid;
+                self.send_run_builtin(BuiltinKind::CheckCi).await;
+            }
+            CommandId::ToggleAutoContinue => {
+                self.view = View::Grid;
+                self.send_toggle_auto_continue().await;
+            }
+        }
+    }
+
+    /// Filesystem path of the currently selected worktree, if any.
+    fn selected_worktree_path(&self) -> Option<PathBuf> {
+        self.worktrees
+            .get(self.grid.selected)
+            .map(|wt| wt.path.clone())
+    }
+
+    // -----------------------------------------------------------------------
     // Library key handling
     // -----------------------------------------------------------------------
 
-    fn handle_library_key(&mut self, code: KeyCode, _modifiers: KeyModifiers) {
+    async fn handle_library_key(&mut self, code: KeyCode, _modifiers: KeyModifiers) {
         // Clear transient status on any keypress.
         self.status_message = None;
         self.library.status = None;
 
         if code == KeyCode::Tab {
-            self.enter_grid_view();
+            self.execute_command(CommandId::SwitchView).await;
             return;
         }
 
         match self.library.mode {
             LibraryMode::Normal => match code {
-                KeyCode::Char('q') => {
-                    tracing::info!("quit requested via 'q'");
-                    self.running = false;
-                }
+                KeyCode::Char('q') => self.execute_command(CommandId::Quit).await,
                 KeyCode::Char('j') | KeyCode::Down => self.library.move_down(),
                 KeyCode::Char('k') | KeyCode::Up => self.library.move_up(),
-                KeyCode::Char('/') => self.library.enter_filter(),
-                KeyCode::Char('n') | KeyCode::Char('a') => self.library.enter_new_prompt(),
-                KeyCode::Char('e') => match self.library.selected_prompt_path() {
-                    Some(path) => self.pending_edit = Some(path),
-                    None => self.library.status = Some("no prompt selected".to_string()),
-                },
+                KeyCode::Char('/') => self.execute_command(CommandId::FilterPrompts).await,
+                KeyCode::Char('n') | KeyCode::Char('a') => {
+                    self.execute_command(CommandId::NewPrompt).await
+                }
+                KeyCode::Char('e') => self.execute_command(CommandId::EditPrompt).await,
                 _ => {}
             },
             LibraryMode::Filter => match code {
@@ -400,7 +563,7 @@ impl App {
         self.status_message = None;
 
         if code == KeyCode::Tab {
-            self.view = View::Library;
+            self.execute_command(CommandId::SwitchView).await;
             return;
         }
 
@@ -442,43 +605,38 @@ impl App {
 
             KeyCode::Char('r') => {
                 self.grid.clear_pending_count();
-                self.client.send(ClientMsg::Refresh).await;
-                self.set_status("refreshing…");
+                self.execute_command(CommandId::RefreshWorktrees).await;
             }
 
             KeyCode::Char('c') => {
                 self.grid.clear_pending_count();
-                if self.worktrees.get(self.grid.selected).is_some() {
-                    self.grid_mode = GridMode::PromptInput;
-                    self.prompt_input.clear();
-                }
+                self.execute_command(CommandId::RunCustomPrompt).await;
             }
 
             KeyCode::Char('p') => {
                 self.grid.clear_pending_count();
-                self.send_run_builtin(BuiltinKind::AddressPrComments).await;
+                self.execute_command(CommandId::AddressPrComments).await;
             }
 
             KeyCode::Char('i') => {
                 self.grid.clear_pending_count();
-                self.send_run_builtin(BuiltinKind::CheckCi).await;
+                self.execute_command(CommandId::CheckCi).await;
             }
 
             KeyCode::Char('a') => {
                 self.grid.clear_pending_count();
-                self.send_toggle_auto_continue().await;
+                self.execute_command(CommandId::ToggleAutoContinue).await;
             }
 
             // Shift-Q stops the daemon entirely (sessions + watcher), then quits.
             KeyCode::Char('Q') => {
-                tracing::info!("daemon shutdown requested via 'Q'");
-                self.client.send(ClientMsg::Shutdown).await;
-                self.running = false;
+                self.grid.clear_pending_count();
+                self.execute_command(CommandId::StopDaemon).await;
             }
 
             KeyCode::Char('q') => {
-                tracing::info!("quit requested via 'q' in grid view");
-                self.running = false;
+                self.grid.clear_pending_count();
+                self.execute_command(CommandId::Quit).await;
             }
 
             _ => {

@@ -53,6 +53,7 @@ fn help_lines() -> Vec<Line<'static>> {
             desc,
         ),
         kv("?       ", "toggle this help overlay", key, desc),
+        kv("C-p     ", "open command palette", key, desc),
         kv("q       ", "quit karazhan", key, desc),
         kv("Ctrl-C  ", "quit (always works)", key, desc),
         Line::from(""),

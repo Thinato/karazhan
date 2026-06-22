@@ -1,5 +1,6 @@
 mod app;
 pub mod client;
+mod commands;
 mod config;
 pub mod daemon;
 pub mod ipc;
