@@ -54,6 +54,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ),
         kv("?       ", "toggle this help overlay", key, desc),
         kv("C-p     ", "open command palette", key, desc),
+        kv("A       ", "add project (register a git repo)", key, desc),
         kv("q       ", "quit karazhan", key, desc),
         kv("Ctrl-C  ", "quit (always works)", key, desc),
         Line::from(""),
@@ -114,6 +115,10 @@ fn help_lines() -> Vec<Line<'static>> {
             desc,
         ),
         Line::from(""),
+        Line::from(Span::styled(
+            "  the grid is grouped by project (header + divider per project); motion is continuous.",
+            dim,
+        )),
         Line::from(Span::styled(
             "  q / Ctrl-C quit the TUI; the daemon (agents + watcher) keeps running.",
             dim,

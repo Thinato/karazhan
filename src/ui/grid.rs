@@ -83,35 +83,62 @@ impl GridView {
     // Rendering
     // -----------------------------------------------------------------------
 
-    /// Render the worktree grid into `area`.
+    /// Render the worktree grid into `area`, GROUPED by project.
     ///
-    /// Each worktree gets a fixed-size cell (CELL_W × CELL_H) arranged in rows.
-    /// The selected cell is rendered with a double-line border and inverted text.
+    /// Each project group is rendered as a header line (project name + a
+    /// horizontal divider rule) followed by that project's worktree squares
+    /// wrapping at `cols`.  Groups stack vertically in the daemon's project
+    /// order.  Selection uses a FLAT index over the concatenated worktree list
+    /// (same order as `worktrees`), so the highlight lands on the correct square
+    /// within its group.  A project with zero worktrees still shows its header.
     pub fn render(&self, frame: &mut Frame, area: Rect, worktrees: &[WorktreeView]) {
         if worktrees.is_empty() {
-            let msg = Paragraph::new(" No worktrees found.  Create one with `git worktree add`.")
+            let msg = Paragraph::new(" No worktrees found.  Add a project with `A`.")
                 .style(Style::default().fg(Color::DarkGray));
             frame.render_widget(msg, area);
             return;
         }
 
         let cols = Self::cols_for_width(area.width) as u16;
+        let groups = group_by_project(worktrees);
 
-        for (i, wt) in worktrees.iter().enumerate() {
-            let col = (i as u16) % cols;
-            let row = (i as u16) / cols;
+        // `y` tracks the current vertical offset within `area`; `flat` tracks
+        // the running flat index across all groups (matches `worktrees` order).
+        let mut y = area.y;
+        let mut flat: usize = 0;
 
-            let x = area.x + col * CELL_W;
-            let y = area.y + row * CELL_H;
-
-            // Stop rendering if the cell would go outside the available area.
-            if x + CELL_W > area.x + area.width || y + CELL_H > area.y + area.height {
+        for group in &groups {
+            // Header + divider row (1 line).
+            if y >= area.y + area.height {
                 break;
             }
+            let header_area = Rect::new(area.x, y, area.width, 1);
+            render_group_header(frame, header_area, &group.project);
+            y += 1;
 
-            let cell_area = Rect::new(x, y, CELL_W, CELL_H);
-            let is_selected = i == self.selected;
-            self.render_cell(frame, cell_area, wt, is_selected);
+            // Worktree squares for this group, wrapping at `cols`.
+            let group_rows = group.len().div_ceil(cols.max(1) as usize) as u16;
+            for (local, wt) in group.worktrees.iter().enumerate() {
+                let col = (local as u16) % cols;
+                let row = (local as u16) / cols;
+                let x = area.x + col * CELL_W;
+                let cell_y = y + row * CELL_H;
+
+                // Stop this group's cells if they would overflow the area.
+                if x + CELL_W > area.x + area.width || cell_y + CELL_H > area.y + area.height {
+                    flat += 1;
+                    continue;
+                }
+
+                let cell_area = Rect::new(x, cell_y, CELL_W, CELL_H);
+                let is_selected = flat == self.selected;
+                self.render_cell(frame, cell_area, wt, is_selected);
+                flat += 1;
+            }
+
+            // Advance past this group's cell rows (at least one blank row so
+            // empty groups still occupy space below their header).
+            y += group_rows.max(1) * CELL_H;
         }
     }
 
@@ -211,8 +238,87 @@ impl Default for GridView {
 }
 
 // ---------------------------------------------------------------------------
+// Project grouping
+// ---------------------------------------------------------------------------
+
+/// A contiguous run of worktrees that share a project, in flat order.
+pub struct ProjectGroup<'a> {
+    pub project: String,
+    pub worktrees: Vec<&'a WorktreeView>,
+}
+
+impl ProjectGroup<'_> {
+    pub fn len(&self) -> usize {
+        self.worktrees.len()
+    }
+
+    #[allow(dead_code)] // completeness for the grouping API (used in tests)
+    pub fn is_empty(&self) -> bool {
+        self.worktrees.is_empty()
+    }
+}
+
+/// Group a flat `worktrees` slice into per-project groups, preserving the flat
+/// order (the daemon already concatenates in project order, so consecutive
+/// entries with the same project name form one group).  The concatenation of
+/// the groups' worktrees, in order, exactly reproduces the input — so a flat
+/// index maps to `(group, local index within that group)` by walking the
+/// groups and summing their lengths.
+pub fn group_by_project<'a>(worktrees: &'a [WorktreeView]) -> Vec<ProjectGroup<'a>> {
+    let mut groups: Vec<ProjectGroup<'a>> = Vec::new();
+    for wt in worktrees {
+        match groups.last_mut() {
+            Some(g) if g.project == wt.project => g.worktrees.push(wt),
+            _ => groups.push(ProjectGroup {
+                project: wt.project.clone(),
+                worktrees: vec![wt],
+            }),
+        }
+    }
+    groups
+}
+
+/// Map a flat selection index to `(project_name, local_index)` within its
+/// group, using the same grouping as [`group_by_project`].  Returns `None` if
+/// the index is out of range.
+#[allow(dead_code)] // pure helper exercised by unit tests; available for callers
+pub fn flat_to_group_local(worktrees: &[WorktreeView], flat: usize) -> Option<(String, usize)> {
+    let groups = group_by_project(worktrees);
+    let mut base = 0usize;
+    for g in &groups {
+        if flat < base + g.len() {
+            return Some((g.project.clone(), flat - base));
+        }
+        base += g.len();
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Render a project group header: the project name followed by a `─`-filled
+/// divider spanning the remaining width.
+fn render_group_header(frame: &mut Frame, area: Rect, project: &str) {
+    if area.width == 0 {
+        return;
+    }
+    let name = format!(" {project} ");
+    let name_len = name.chars().count() as u16;
+    let rule_len = area.width.saturating_sub(name_len);
+    let rule: String = "─".repeat(rule_len as usize);
+    let line = Line::from(vec![
+        Span::styled(
+            name,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(rule, Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
 
 /// Return (border_color, label_color) for a given status.
 fn status_colors(status: &WorktreeStatus) -> (Color, Color) {
@@ -249,5 +355,93 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let take = max.saturating_sub(1);
         chars[..take].iter().collect::<String>() + "…"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn wv(project: &str, name: &str) -> WorktreeView {
+        WorktreeView {
+            path: PathBuf::from(format!("/wt/{project}/{name}")),
+            project: project.to_string(),
+            name: name.to_string(),
+            branch: "HEAD".to_string(),
+            prompt_slug: None,
+            pr_number: None,
+            auto_continue_on_merge: false,
+            status: WorktreeStatus::Idle,
+            last_summary: None,
+        }
+    }
+
+    #[test]
+    fn group_by_project_preserves_order_and_runs() {
+        let wts = vec![
+            wv("alpha", "a1"),
+            wv("alpha", "a2"),
+            wv("beta", "b1"),
+            wv("alpha", "a3"), // a fresh "alpha" run (not merged with the first)
+        ];
+        let groups = group_by_project(&wts);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].project, "alpha");
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[1].project, "beta");
+        assert_eq!(groups[1].len(), 1);
+        assert_eq!(groups[2].project, "alpha");
+        assert_eq!(groups[2].len(), 1);
+        assert!(!groups[0].is_empty());
+    }
+
+    #[test]
+    fn group_by_project_single_project() {
+        let wts = vec![wv("solo", "x"), wv("solo", "y")];
+        let groups = group_by_project(&wts);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn group_by_project_empty() {
+        let wts: Vec<WorktreeView> = vec![];
+        assert!(group_by_project(&wts).is_empty());
+    }
+
+    #[test]
+    fn flat_index_maps_to_group_local() {
+        let wts = vec![
+            wv("alpha", "a1"), // flat 0 -> (alpha, 0)
+            wv("alpha", "a2"), // flat 1 -> (alpha, 1)
+            wv("beta", "b1"),  // flat 2 -> (beta, 0)
+            wv("beta", "b2"),  // flat 3 -> (beta, 1)
+            wv("beta", "b3"),  // flat 4 -> (beta, 2)
+        ];
+        assert_eq!(flat_to_group_local(&wts, 0), Some(("alpha".to_string(), 0)));
+        assert_eq!(flat_to_group_local(&wts, 1), Some(("alpha".to_string(), 1)));
+        assert_eq!(flat_to_group_local(&wts, 2), Some(("beta".to_string(), 0)));
+        assert_eq!(flat_to_group_local(&wts, 4), Some(("beta".to_string(), 2)));
+        // Out of range.
+        assert_eq!(flat_to_group_local(&wts, 5), None);
+    }
+
+    #[test]
+    fn flat_concatenation_reproduces_input() {
+        let wts = vec![wv("alpha", "a1"), wv("beta", "b1"), wv("beta", "b2")];
+        let groups = group_by_project(&wts);
+        let flat: Vec<&WorktreeView> = groups
+            .iter()
+            .flat_map(|g| g.worktrees.iter().copied())
+            .collect();
+        assert_eq!(flat.len(), wts.len());
+        for (i, wt) in wts.iter().enumerate() {
+            assert_eq!(flat[i].path, wt.path);
+        }
     }
 }

@@ -116,8 +116,14 @@ pub fn render_palette(frame: &mut Frame, area: Rect, palette: &Palette) {
 }
 
 /// Render the new-worktree modal over `area`.  Mirrors [`render_palette`]:
-/// centered rounded block, query line, scrollable list, footer hint.
-pub fn render_new_worktree(frame: &mut Frame, area: Rect, modal: &NewWorktreeModal) {
+/// centered rounded block, query line, scrollable list, footer hint.  The
+/// block title shows the target `project` when known.
+pub fn render_new_worktree(
+    frame: &mut Frame,
+    area: Rect,
+    modal: &NewWorktreeModal,
+    project: Option<&str>,
+) {
     // ---- Popup geometry ----
     let width = 72u16.min(area.width.saturating_sub(2)).max(1);
     let rows = modal.filtered.len() as u16;
@@ -130,8 +136,12 @@ pub fn render_new_worktree(frame: &mut Frame, area: Rect, modal: &NewWorktreeMod
 
     frame.render_widget(Clear, popup);
 
+    let title = match project {
+        Some(p) => format!(" New worktree in {p} "),
+        None => " New worktree ".to_string(),
+    };
     let block = Block::default()
-        .title(" New worktree ")
+        .title(title)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan));
@@ -197,6 +207,63 @@ pub fn render_new_worktree(frame: &mut Frame, area: Rect, modal: &NewWorktreeMod
     }
 
     let footer = truncate("type to filter · Enter create · Esc cancel", inner_w);
+    lines.push(Line::from(Span::styled(
+        footer,
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Render the add-project path input as a small centered single-line modal.
+///
+/// `input` is the in-progress path string (prefilled with the cwd).
+pub fn render_add_project(frame: &mut Frame, area: Rect, input: &str) {
+    let width = 72u16.min(area.width.saturating_sub(2)).max(1);
+    let height = 5u16.min(area.height.max(1));
+
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + area.height / 6;
+    let y = y.min(area.y + area.height.saturating_sub(height));
+    let popup = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Add project ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let inner_w = inner.width as usize;
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("> ", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            truncate(input, inner_w.saturating_sub(3)),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("█", Style::default().fg(Color::Cyan)),
+    ]));
+
+    while lines.len() + 1 < inner.height as usize {
+        lines.push(Line::from(""));
+    }
+
+    let footer = truncate(
+        "path to a git repo · Enter add · Esc cancel · Backspace delete",
+        inner_w,
+    );
     lines.push(Line::from(Span::styled(
         footer,
         Style::default().fg(Color::DarkGray),

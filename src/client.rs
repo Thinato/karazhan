@@ -320,6 +320,7 @@ mod tests {
     fn snapshot_maps_to_app_snapshot() {
         let views = vec![ipc::WorktreeView {
             path: PathBuf::from("/wt"),
+            project: "proj".into(),
             name: "Unnamed".into(),
             branch: "main".into(),
             prompt_slug: None,

@@ -106,6 +106,13 @@ pub struct App {
     palette: Option<Palette>,
     /// New-worktree modal; `Some` while open (`n` in Grid).  Intercepts all keys.
     new_worktree: Option<NewWorktreeModal>,
+    /// Target project for the open new-worktree modal.  v1: the project of the
+    /// currently-selected worktree, else the first project.  (Explicit project
+    /// selection in the modal can come later.)
+    new_worktree_project: Option<String>,
+    /// Add-project path input overlay; `Some` while open (`A`).  Holds the
+    /// in-progress path string (prefilled with the cwd).  Intercepts all keys.
+    add_project_input: Option<String>,
 }
 
 impl App {
@@ -135,6 +142,8 @@ impl App {
             pending_edit: None,
             palette: None,
             new_worktree: None,
+            new_worktree_project: None,
+            add_project_input: None,
         }
     }
 
@@ -189,7 +198,17 @@ impl App {
 
                 // Render the new-worktree modal last (above palette/help).
                 if let Some(modal) = &self.new_worktree {
-                    crate::ui::palette::render_new_worktree(frame, area, modal);
+                    crate::ui::palette::render_new_worktree(
+                        frame,
+                        area,
+                        modal,
+                        self.new_worktree_project.as_deref(),
+                    );
+                }
+
+                // Render the add-project path input on top of everything.
+                if let Some(input) = &self.add_project_input {
+                    crate::ui::palette::render_add_project(frame, area, input);
                 }
             })?;
 
@@ -314,6 +333,12 @@ impl App {
             if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
                 tracing::info!("quit requested via Ctrl-C");
                 self.running = false;
+                return;
+            }
+
+            // Add-project input: while open it intercepts ALL keys (any view).
+            if self.add_project_input.is_some() {
+                self.handle_add_project_key(code).await;
                 return;
             }
 
@@ -454,6 +479,7 @@ impl App {
         match code {
             KeyCode::Esc => {
                 self.new_worktree = None;
+                self.new_worktree_project = None;
             }
             KeyCode::Down => {
                 if let Some(m) = self.new_worktree.as_mut() {
@@ -467,13 +493,15 @@ impl App {
             }
             KeyCode::Enter => {
                 let choice = self.new_worktree.take().and_then(|m| m.selected().cloned());
-                if let Some(choice) = choice {
+                let project = self.new_worktree_project.take();
+                if let (Some(choice), Some(project)) = (choice, project) {
                     let (prompt_slug, prompt_body) = match choice {
                         WorktreeChoice::Blank => (None, None),
                         WorktreeChoice::Prompt { slug, body, .. } => (Some(slug), Some(body)),
                     };
                     self.client
                         .send(ClientMsg::NewWorktree {
+                            project,
                             prompt_slug,
                             prompt_body,
                         })
@@ -491,6 +519,43 @@ impl App {
                 if let Some(m) = self.new_worktree.as_mut() {
                     m.query.push(ch);
                     m.refilter();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle a key while the add-project path input is open.  Enter submits the
+    /// `AddProject` command with the typed path; Esc cancels; typing/Backspace
+    /// edit the path.
+    async fn handle_add_project_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.add_project_input = None;
+            }
+            KeyCode::Enter => {
+                if let Some(path) = self.add_project_input.take() {
+                    let path = path.trim().to_string();
+                    if path.is_empty() {
+                        self.set_status("add project: empty path");
+                    } else {
+                        self.client
+                            .send(ClientMsg::AddProject {
+                                path: PathBuf::from(path),
+                            })
+                            .await;
+                        self.set_status("adding project…");
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(s) = self.add_project_input.as_mut() {
+                    s.pop();
+                }
+            }
+            KeyCode::Char(ch) => {
+                if let Some(s) = self.add_project_input.as_mut() {
+                    s.push(ch);
                 }
             }
             _ => {}
@@ -566,9 +631,24 @@ impl App {
             }
             CommandId::NewWorktree => {
                 self.view = View::Grid;
-                let mut modal = NewWorktreeModal::new(self.library.all_prompt_choices());
-                modal.refilter();
-                self.new_worktree = Some(modal);
+                // Target project: the selected worktree's project, else the
+                // first project in the daemon's order.  (v1: explicit project
+                // selection in the modal can come later.)
+                match self.target_project() {
+                    Some(project) => {
+                        let mut modal = NewWorktreeModal::new(self.library.all_prompt_choices());
+                        modal.refilter();
+                        self.new_worktree = Some(modal);
+                        self.new_worktree_project = Some(project);
+                    }
+                    None => self.set_status("add a project first (A)"),
+                }
+            }
+            CommandId::AddProject => {
+                let cwd = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                self.add_project_input = Some(cwd);
             }
             CommandId::RenameWorktree => {
                 self.view = View::Grid;
@@ -587,6 +667,16 @@ impl App {
         self.worktrees
             .get(self.grid.selected)
             .map(|wt| wt.path.clone())
+    }
+
+    /// The project to target for a new worktree: the selected worktree's
+    /// project, else the first project present in the worktree list.  `None`
+    /// only when there are no worktrees at all (i.e. no projects).
+    fn target_project(&self) -> Option<String> {
+        if let Some(wt) = self.worktrees.get(self.grid.selected) {
+            return Some(wt.project.clone());
+        }
+        self.worktrees.first().map(|wt| wt.project.clone())
     }
 
     // -----------------------------------------------------------------------
@@ -613,6 +703,7 @@ impl App {
                     self.execute_command(CommandId::NewPrompt).await
                 }
                 KeyCode::Char('e') => self.execute_command(CommandId::EditPrompt).await,
+                KeyCode::Char('A') => self.execute_command(CommandId::AddProject).await,
                 _ => {}
             },
             LibraryMode::Filter => match code {
@@ -765,6 +856,11 @@ impl App {
             KeyCode::Char('N') => {
                 self.grid.clear_pending_count();
                 self.execute_command(CommandId::RenameWorktree).await;
+            }
+
+            KeyCode::Char('A') => {
+                self.grid.clear_pending_count();
+                self.execute_command(CommandId::AddProject).await;
             }
 
             // Shift-Q stops the daemon entirely (sessions + watcher), then quits.

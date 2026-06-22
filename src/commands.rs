@@ -51,6 +51,8 @@ pub enum CommandId {
     NewWorktree,
     /// Rename the selected worktree (Grid; same as `N`).
     RenameWorktree,
+    /// Register a git repo as a new project (Global; same as `A`).
+    AddProject,
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +182,13 @@ pub const ALL_COMMANDS: &[CommandSpec] = &[
         description: "rename the selected worktree",
         keybind: "N",
         context: CommandContext::Grid,
+    },
+    CommandSpec {
+        id: CommandId::AddProject,
+        title: "Add project",
+        description: "register a git repo as a project",
+        keybind: "A",
+        context: CommandContext::Global,
     },
 ];
 
@@ -457,13 +466,14 @@ mod tests {
             ToggleAutoContinue,
             NewWorktree,
             RenameWorktree,
+            AddProject,
         ];
         // Exhaustive match: a new variant forces a compile error here.
         for id in all {
             match id {
                 SwitchView | ToggleHelp | Quit | StopDaemon | NewPrompt | EditPrompt
                 | FilterPrompts | RefreshWorktrees | RunCustomPrompt | AddressPrComments
-                | CheckCi | ToggleAutoContinue | NewWorktree | RenameWorktree => {}
+                | CheckCi | ToggleAutoContinue | NewWorktree | RenameWorktree | AddProject => {}
             }
         }
         all.to_vec()

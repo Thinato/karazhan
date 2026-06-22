@@ -136,7 +136,6 @@ pub fn should_auto_continue(auto_continue_on_merge: bool) -> bool {
 ///
 /// # Parameters
 /// - `runner`: shared `gh` implementation (real or mock).
-/// - `cwd`: repository root passed to each `gh` call.
 /// - `event_tx`: sender half of the App's event channel.
 /// - `watch_set`: shared, mutable list of (path, pr_number) pairs to poll;
 ///   the App updates this after every `refresh_worktrees()`.
@@ -153,7 +152,6 @@ pub fn should_auto_continue(auto_continue_on_merge: bool) -> bool {
 /// await it on app shutdown.
 pub fn spawn_watcher(
     runner: Arc<dyn GhRunner>,
-    cwd: PathBuf,
     event_tx: tokio::sync::mpsc::Sender<AppEvent>,
     watch_set: Arc<Mutex<Vec<WatchItem>>>,
     config: WatcherConfig,
@@ -181,9 +179,12 @@ pub fn spawn_watcher(
                     for item in &items {
                         let key = (item.worktree_path.clone(), item.pr_number);
 
-                        // Fetch fresh PR + CI state.
-                        let pr_result = pr_state(runner.as_ref(), &cwd, item.pr_number).await;
-                        let ci_result = ci_status(runner.as_ref(), &cwd, item.pr_number).await;
+                        // Fetch fresh PR + CI state from the worktree's own cwd
+                        // (project-agnostic: each gh call runs in its worktree).
+                        let pr_result =
+                            pr_state(runner.as_ref(), &item.worktree_path, item.pr_number).await;
+                        let ci_result =
+                            ci_status(runner.as_ref(), &item.worktree_path, item.pr_number).await;
 
                         let (merged, ci_all_passing) = match (pr_result, ci_result) {
                             (Ok(pr), Ok(ci)) => (pr.merged, ci.all_passing),
@@ -403,7 +404,6 @@ mod tests {
 
         let handle = spawn_watcher(
             mock,
-            PathBuf::from("/tmp"),
             event_tx,
             watch_set,
             WatcherConfig {

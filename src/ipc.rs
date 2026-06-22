@@ -50,7 +50,7 @@ use crate::worktree::model::{Worktree, WorktreeStatus};
 /// the handshake request and a `ProtocolMismatch` reply even when every other
 /// wire-format item has changed. Do NOT reorder these two; only append new
 /// variants after `ProtocolMismatch`.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Maximum frame body size accepted by `read_frame_async` (64 MiB).
 const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
@@ -61,6 +61,8 @@ const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct WorktreeView {
     pub path: PathBuf,
+    /// Name of the owning project (assigned by the daemon when building views).
+    pub project: String,
     /// Human-facing name (supervisor-managed dictionary).
     pub name: String,
     pub branch: String,
@@ -73,10 +75,12 @@ pub struct WorktreeView {
 }
 
 impl WorktreeView {
-    /// Build a `WorktreeView` from a live [`Worktree`] plus an optional summary.
-    pub fn from_worktree(wt: &Worktree, last_summary: Option<String>) -> Self {
+    /// Build a `WorktreeView` from a live [`Worktree`], its owning project's
+    /// name, and an optional summary.
+    pub fn from_worktree(wt: &Worktree, project: String, last_summary: Option<String>) -> Self {
         Self {
             path: wt.path.clone(),
+            project,
             name: wt.name.clone(),
             branch: wt.branch.clone(),
             prompt_slug: wt.prompt_slug.clone(),
@@ -85,12 +89,6 @@ impl WorktreeView {
             status: wt.status.clone(),
             last_summary,
         }
-    }
-}
-
-impl From<&Worktree> for WorktreeView {
-    fn from(wt: &Worktree) -> Self {
-        Self::from_worktree(wt, None)
     }
 }
 
@@ -159,8 +157,14 @@ pub enum ClientMsg {
     /// since the daemon has no prompt access).  `prompt_slug` is recorded as
     /// metadata when present.
     NewWorktree {
+        /// Name of the project (git repo) to create the detached worktree in.
+        project: String,
         prompt_slug: Option<String>,
         prompt_body: Option<String>,
+    },
+    /// Register a git repository as a new project in the global registry.
+    AddProject {
+        path: PathBuf,
     },
     /// Rename a worktree (updates the supervisor name dictionary in state.toml).
     SetWorktreeName {
@@ -323,6 +327,7 @@ mod tests {
     fn worktree_view_round_trip() {
         let wv = WorktreeView {
             path: PathBuf::from("/repo/feature"),
+            project: "karazhan".into(),
             name: "my-worktree".into(),
             branch: "feature/x".into(),
             prompt_slug: Some("refactor".into()),
@@ -350,6 +355,7 @@ mod tests {
             supervisor_pid: 999,
             worktrees: vec![WorktreeView {
                 path: PathBuf::from("/a"),
+                project: "proj".into(),
                 name: "Unnamed".into(),
                 branch: "main".into(),
                 prompt_slug: None,
@@ -369,8 +375,8 @@ mod tests {
     // ── Protocol version + frozen wire format ─────────────────────────────────
 
     #[test]
-    fn protocol_version_is_two() {
-        assert_eq!(PROTOCOL_VERSION, 2);
+    fn protocol_version_is_three() {
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     /// Locks the FROZEN variant order of `HandshakeResp`: the first body byte is
@@ -482,6 +488,7 @@ mod tests {
     #[test]
     fn client_msg_new_worktree_blank() {
         rt(&ClientMsg::NewWorktree {
+            project: "karazhan".into(),
             prompt_slug: None,
             prompt_body: None,
         });
@@ -490,8 +497,16 @@ mod tests {
     #[test]
     fn client_msg_new_worktree_with_prompt() {
         rt(&ClientMsg::NewWorktree {
+            project: "karazhan".into(),
             prompt_slug: Some("refactor".into()),
             prompt_body: Some("refactor the parser".into()),
+        });
+    }
+
+    #[test]
+    fn client_msg_add_project() {
+        rt(&ClientMsg::AddProject {
+            path: PathBuf::from("/repo/another"),
         });
     }
 
@@ -687,15 +702,16 @@ mod tests {
             auto_continue_on_merge: false,
             status: WorktreeStatus::CIFailing,
         };
-        let view = WorktreeView::from_worktree(&wt, Some("summary here".into()));
+        let view = WorktreeView::from_worktree(&wt, "karazhan".into(), Some("summary here".into()));
         assert_eq!(view.path, wt.path);
+        assert_eq!(view.project, "karazhan");
         assert_eq!(view.name, wt.name);
         assert_eq!(view.branch, wt.branch);
         assert_eq!(view.status, WorktreeStatus::CIFailing);
         assert_eq!(view.last_summary, Some("summary here".into()));
 
-        // From<&Worktree> gives None summary.
-        let view2 = WorktreeView::from(&wt);
+        // No summary → None.
+        let view2 = WorktreeView::from_worktree(&wt, "karazhan".into(), None);
         assert_eq!(view2.last_summary, None);
     }
 

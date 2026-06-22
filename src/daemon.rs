@@ -44,6 +44,7 @@ use crate::github::pr::pr_for_current_branch;
 use crate::github::{GhRunner, RealGh};
 use crate::ipc::{self, BuiltinKind, ClientMsg, HandshakeReq, HandshakeResp, SupervisorMsg};
 use crate::project_config::ProjectConfig;
+use crate::projects;
 use crate::watcher::{spawn_watcher, WatchItem, WatcherConfig};
 use crate::worktree::{state, WorktreeManager, WorktreeStatus};
 
@@ -54,40 +55,71 @@ const BROADCAST_CAP: usize = 256;
 // Registry — authoritative in-memory state
 // ---------------------------------------------------------------------------
 
+/// One managed project (git repo) with its own worktree manager, agent config,
+/// and agent backend.  Each repo may configure a different agent.
+pub struct ProjectRuntime {
+    pub name: String,
+    pub root: PathBuf,
+    pub manager: WorktreeManager,
+    pub project_config: ProjectConfig,
+    pub backend: Arc<dyn AgentBackend>,
+    pub backend_name: &'static str,
+}
+
+impl ProjectRuntime {
+    /// Build a runtime for `project`: load its per-repo `.karazhan/config.toml`
+    /// and select its agent backend (Mock fallback when the configured command
+    /// is not on PATH).
+    fn from_project(project: &projects::Project) -> Self {
+        let root = project.path.clone();
+        let project_config = ProjectConfig::load(&root);
+        let (backend, backend_name) = select_backend(project_config.clone());
+        tracing::info!(
+            project = %project.name,
+            root = %root.display(),
+            "daemon: project backend = {backend_name}"
+        );
+        Self {
+            name: project.name.clone(),
+            root: root.clone(),
+            manager: WorktreeManager::new(root),
+            project_config,
+            backend,
+            backend_name,
+        }
+    }
+}
+
 /// Authoritative worktree state held by the daemon.
 ///
 /// `worktrees` is the live set keyed by canonical path; `summaries` holds the
-/// most recent agent summary line per worktree (mirrors `App::agent_summaries`).
+/// most recent agent summary line per worktree.  `project_of` maps each
+/// worktree path to its owning project's name, and `order` records the flat
+/// snapshot order (project order, then per-project list order).
 pub struct Registry {
     pub worktrees: HashMap<PathBuf, ipc::WorktreeView>,
     pub summaries: HashMap<PathBuf, String>,
+    pub project_of: HashMap<PathBuf, String>,
+    pub order: Vec<PathBuf>,
 }
 
 impl Registry {
-    /// Build a `Registry` from the worktree manager's overlaid list.
-    fn from_manager(manager: &WorktreeManager) -> Self {
-        let mut worktrees = HashMap::new();
-        match manager.list() {
-            Ok(list) => {
-                for wt in &list {
-                    worktrees.insert(wt.path.clone(), ipc::WorktreeView::from(wt));
-                }
-            }
-            Err(e) => {
-                tracing::warn!("daemon: initial worktree list failed (not a git repo?): {e}");
-            }
-        }
+    /// An empty registry.
+    fn empty() -> Self {
         Self {
-            worktrees,
+            worktrees: HashMap::new(),
             summaries: HashMap::new(),
+            project_of: HashMap::new(),
+            order: Vec::new(),
         }
     }
 
-    /// Snapshot the current views as a sorted vec (stable order for clients).
+    /// Snapshot the current views in flat project order.
     fn snapshot(&self) -> Vec<ipc::WorktreeView> {
-        let mut views: Vec<ipc::WorktreeView> = self.worktrees.values().cloned().collect();
-        views.sort_by(|a, b| a.path.cmp(&b.path));
-        views
+        self.order
+            .iter()
+            .filter_map(|p| self.worktrees.get(p).cloned())
+            .collect()
     }
 }
 
@@ -98,13 +130,11 @@ impl Registry {
 /// Shared state passed (behind `Arc`) to every connection task and internal
 /// emitter (watcher handler, agent tasks).
 pub struct Shared {
+    /// All managed projects.  `AddProject` mutates this, so it is behind a Mutex.
+    pub projects: Mutex<Vec<ProjectRuntime>>,
     pub registry: Mutex<Registry>,
-    pub backend: Arc<dyn AgentBackend>,
     pub gh: Arc<dyn GhRunner>,
-    pub manager: WorktreeManager,
-    pub repo_root: PathBuf,
     pub config: Config,
-    pub project_config: ProjectConfig,
     pub events: broadcast::Sender<SupervisorMsg>,
     pub watch_set: Arc<Mutex<Vec<WatchItem>>>,
 }
@@ -118,12 +148,57 @@ impl Shared {
         let _ = self.events.send(msg);
     }
 
-    /// Persist a worktree status change to `.karazhan/state.toml`.
-    fn persist_status(&self, path: &Path, status: &WorktreeStatus) {
-        match state::load(&self.repo_root) {
+    /// Resolve the owning project's root for a worktree `path`.
+    ///
+    /// First consults the registry's `project_of` map; falls back to matching
+    /// the deepest project root that is an ancestor of `path`.
+    async fn project_root_for(&self, path: &Path) -> Option<PathBuf> {
+        let name = {
+            let reg = self.registry.lock().await;
+            reg.project_of.get(path).cloned()
+        };
+        let projects = self.projects.lock().await;
+        if let Some(name) = name {
+            if let Some(p) = projects.iter().find(|p| p.name == name) {
+                return Some(p.root.clone());
+            }
+        }
+        // Fallback: longest ancestor match.
+        projects
+            .iter()
+            .filter(|p| path.starts_with(&p.root))
+            .max_by_key(|p| p.root.as_os_str().len())
+            .map(|p| p.root.clone())
+    }
+
+    /// Resolve the owning project's agent backend for a worktree `path`.
+    async fn backend_for(&self, path: &Path) -> Option<Arc<dyn AgentBackend>> {
+        let name = {
+            let reg = self.registry.lock().await;
+            reg.project_of.get(path).cloned()
+        };
+        let projects = self.projects.lock().await;
+        let runtime = if let Some(name) = name {
+            projects.iter().find(|p| p.name == name)
+        } else {
+            projects
+                .iter()
+                .filter(|p| path.starts_with(&p.root))
+                .max_by_key(|p| p.root.as_os_str().len())
+        };
+        runtime.map(|p| Arc::clone(&p.backend))
+    }
+
+    /// Persist a worktree status change to the OWNING project's `state.toml`.
+    async fn persist_status(&self, path: &Path, status: &WorktreeStatus) {
+        let Some(root) = self.project_root_for(path).await else {
+            tracing::warn!("daemon: no owning project for {} (status)", path.display());
+            return;
+        };
+        match state::load(&root) {
             Ok(mut st) => {
                 st.set_status(path, status.clone());
-                if let Err(e) = state::save(&self.repo_root, &st) {
+                if let Err(e) = state::save(&root, &st) {
                     tracing::warn!("daemon: failed to persist worktree status: {e}");
                 }
             }
@@ -132,8 +207,6 @@ impl Shared {
     }
 
     /// Update registry + persist + broadcast a `StatusChanged` for one worktree.
-    ///
-    /// Mirrors `App::set_worktree_status`, additionally tracking the summary.
     async fn set_status(&self, path: &Path, status: WorktreeStatus, summary: Option<String>) {
         {
             let mut reg = self.registry.lock().await;
@@ -147,7 +220,7 @@ impl Shared {
                 reg.summaries.insert(path.to_path_buf(), s.clone());
             }
         }
-        self.persist_status(path, &status);
+        self.persist_status(path, &status).await;
         self.broadcast(SupervisorMsg::StatusChanged {
             worktree_path: path.to_path_buf(),
             status,
@@ -155,7 +228,8 @@ impl Shared {
         });
     }
 
-    /// Rebuild the shared watch-set from the registry (worktrees with a PR).
+    /// Rebuild the shared watch-set from the registry (worktrees with a PR),
+    /// aggregating across ALL projects.
     async fn rebuild_watch_set(&self) {
         let items: Vec<WatchItem> = {
             let reg = self.registry.lock().await;
@@ -173,26 +247,52 @@ impl Shared {
         *guard = items;
     }
 
-    /// Re-scan worktrees via `manager.list()` and overlay into the registry,
-    /// preserving cached summaries.  Returns the resulting snapshot.
+    /// Re-scan worktrees across ALL projects and overlay into the registry,
+    /// tagging each view with its owning project's name and concatenating in
+    /// project order (projects vec order, then per-project list order).
+    /// Preserves cached summaries.  Returns the resulting snapshot.
     async fn rebuild_registry(&self) -> Vec<ipc::WorktreeView> {
-        let list = match self.manager.list() {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::warn!("daemon: worktree list failed: {e}");
-                Vec::new()
-            }
+        // Collect (project_name, worktree-list) per project, in project order.
+        let listed: Vec<(String, Vec<crate::worktree::model::Worktree>)> = {
+            let projects = self.projects.lock().await;
+            projects
+                .iter()
+                .map(|p| {
+                    let list = match p.manager.list() {
+                        Ok(l) => l,
+                        Err(e) => {
+                            tracing::warn!(
+                                project = %p.name,
+                                "daemon: worktree list failed: {e}"
+                            );
+                            Vec::new()
+                        }
+                    };
+                    (p.name.clone(), list)
+                })
+                .collect()
         };
+
         let mut reg = self.registry.lock().await;
         let mut next: HashMap<PathBuf, ipc::WorktreeView> = HashMap::new();
-        for wt in &list {
-            let summary = reg.summaries.get(&wt.path).cloned();
-            next.insert(
-                wt.path.clone(),
-                ipc::WorktreeView::from_worktree(wt, summary),
-            );
+        let mut project_of: HashMap<PathBuf, String> = HashMap::new();
+        let mut order: Vec<PathBuf> = Vec::new();
+
+        for (project_name, list) in &listed {
+            for wt in list {
+                let summary = reg.summaries.get(&wt.path).cloned();
+                next.insert(
+                    wt.path.clone(),
+                    ipc::WorktreeView::from_worktree(wt, project_name.clone(), summary),
+                );
+                project_of.insert(wt.path.clone(), project_name.clone());
+                order.push(wt.path.clone());
+            }
         }
+
         reg.worktrees = next;
+        reg.project_of = project_of;
+        reg.order = order;
         // Drop summaries for worktrees that no longer exist.
         let live: std::collections::HashSet<PathBuf> = reg.worktrees.keys().cloned().collect();
         reg.summaries.retain(|p, _| live.contains(p));
@@ -264,31 +364,44 @@ async fn serve() -> Result<()> {
 
     // Construct Shared.
     let config = Config::load();
-    let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let project_cfg = ProjectConfig::load(&repo_root);
-    let (backend, backend_name) = select_backend(project_cfg.clone());
-    tracing::info!("daemon: agent backend = {backend_name}");
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+    // Auto-register the launch cwd if it is a git repo and not already present.
+    if projects::is_git_repo(&cwd) {
+        match projects::add(&cwd) {
+            Ok(p) => tracing::info!(project = %p.name, "daemon: auto-registered cwd project"),
+            Err(e) => tracing::warn!("daemon: failed to auto-register cwd: {e}"),
+        }
+    } else {
+        tracing::info!("daemon: launch cwd is not a git repo — not auto-registering");
+    }
+
+    // Build ProjectRuntimes from the persisted registry.
+    let registry_file = projects::load();
+    let runtimes: Vec<ProjectRuntime> = registry_file
+        .projects
+        .iter()
+        .map(ProjectRuntime::from_project)
+        .collect();
+    tracing::info!(count = runtimes.len(), "daemon: managing projects");
+
     let gh: Arc<dyn GhRunner> = Arc::new(RealGh {
         bin: config.gh_bin.clone(),
     });
-    let manager = WorktreeManager::new(repo_root.clone());
-    let registry = Registry::from_manager(&manager);
     let (events, _initial_rx) = broadcast::channel::<SupervisorMsg>(BROADCAST_CAP);
     let watch_set = Arc::new(Mutex::new(Vec::<WatchItem>::new()));
 
     let shared = Arc::new(Shared {
-        registry: Mutex::new(registry),
-        backend,
+        projects: Mutex::new(runtimes),
+        registry: Mutex::new(Registry::empty()),
         gh,
-        manager,
-        repo_root,
         config,
-        project_config: project_cfg,
         events,
         watch_set,
     });
 
-    // Seed the watch-set from worktrees that already carry a PR number.
+    // Build the initial registry across all projects + seed the watch-set.
+    shared.rebuild_registry().await;
     shared.rebuild_watch_set().await;
 
     // Spawn the watcher.  It emits AppEvents into `watch_event_tx`; the daemon
@@ -297,7 +410,6 @@ async fn serve() -> Result<()> {
     let (watcher_shutdown_tx, watcher_shutdown_rx) = tokio::sync::watch::channel(false);
     let watcher_handle = spawn_watcher(
         Arc::clone(&shared.gh),
-        shared.repo_root.clone(),
         watch_event_tx,
         Arc::clone(&shared.watch_set),
         WatcherConfig {
@@ -632,10 +744,14 @@ async fn handle_client_msg(shared: &Arc<Shared>, msg: ClientMsg) {
             set_pr_number(shared, &worktree_path, pr).await;
         }
         ClientMsg::NewWorktree {
+            project,
             prompt_slug,
             prompt_body,
         } => {
-            new_worktree(shared, prompt_slug, prompt_body).await;
+            new_worktree(shared, project, prompt_slug, prompt_body).await;
+        }
+        ClientMsg::AddProject { path } => {
+            add_project(shared, &path).await;
         }
         ClientMsg::SetWorktreeName {
             worktree_path,
@@ -664,7 +780,17 @@ async fn run_prompt(shared: Arc<Shared>, worktree_path: PathBuf, prompt: String)
         .set_status(&worktree_path, WorktreeStatus::Running, None)
         .await;
 
-    let backend = Arc::clone(&shared.backend);
+    let Some(backend) = shared.backend_for(&worktree_path).await else {
+        tracing::warn!(
+            worktree = %worktree_path.display(),
+            "daemon: no owning project backend for run_prompt"
+        );
+        shared.broadcast(SupervisorMsg::Error {
+            worktree_path: Some(worktree_path.clone()),
+            message: "no owning project for this worktree".to_string(),
+        });
+        return;
+    };
     let task_shared = Arc::clone(&shared);
     let path = worktree_path.clone();
 
@@ -690,11 +816,17 @@ async fn run_prompt(shared: Arc<Shared>, worktree_path: PathBuf, prompt: String)
 /// Continue the most recent session (auto-continue on merge) — mirrors
 /// `App::run_agent_continue`.
 fn run_continue_session(shared: Arc<Shared>, worktree_path: PathBuf) {
-    let backend = Arc::clone(&shared.backend);
     let prompt = shared.config.auto_continue_prompt.clone();
     let path = worktree_path.clone();
 
     tokio::spawn(async move {
+        let Some(backend) = shared.backend_for(&path).await else {
+            tracing::warn!(
+                worktree = %path.display(),
+                "daemon: no owning project backend for continue session"
+            );
+            return;
+        };
         // Mark Running + clear summary.
         {
             let mut reg = shared.registry.lock().await;
@@ -820,14 +952,21 @@ async fn set_auto_continue(shared: &Arc<Shared>, path: &Path, enabled: bool) {
             view.auto_continue_on_merge = enabled;
         }
     }
-    match state::load(&shared.repo_root) {
-        Ok(mut st) => {
-            st.set_auto_continue(path, enabled);
-            if let Err(e) = state::save(&shared.repo_root, &st) {
-                tracing::warn!("daemon: failed to persist auto_continue: {e}");
+    if let Some(root) = shared.project_root_for(path).await {
+        match state::load(&root) {
+            Ok(mut st) => {
+                st.set_auto_continue(path, enabled);
+                if let Err(e) = state::save(&root, &st) {
+                    tracing::warn!("daemon: failed to persist auto_continue: {e}");
+                }
             }
+            Err(e) => tracing::warn!("daemon: failed to load state for auto_continue: {e}"),
         }
-        Err(e) => tracing::warn!("daemon: failed to load state for auto_continue: {e}"),
+    } else {
+        tracing::warn!(
+            "daemon: no owning project for {} (auto_continue)",
+            path.display()
+        );
     }
     let snapshot = {
         let reg = shared.registry.lock().await;
@@ -846,14 +985,21 @@ async fn set_pr_number(shared: &Arc<Shared>, path: &Path, pr: Option<u64>) {
             view.pr_number = pr;
         }
     }
-    match state::load(&shared.repo_root) {
-        Ok(mut st) => {
-            st.set_pr_number(path, pr);
-            if let Err(e) = state::save(&shared.repo_root, &st) {
-                tracing::warn!("daemon: failed to persist pr_number: {e}");
+    if let Some(root) = shared.project_root_for(path).await {
+        match state::load(&root) {
+            Ok(mut st) => {
+                st.set_pr_number(path, pr);
+                if let Err(e) = state::save(&root, &st) {
+                    tracing::warn!("daemon: failed to persist pr_number: {e}");
+                }
             }
+            Err(e) => tracing::warn!("daemon: failed to load state for pr_number: {e}"),
         }
-        Err(e) => tracing::warn!("daemon: failed to load state for pr_number: {e}"),
+    } else {
+        tracing::warn!(
+            "daemon: no owning project for {} (pr_number)",
+            path.display()
+        );
     }
     shared.rebuild_watch_set().await;
     let snapshot = {
@@ -871,10 +1017,28 @@ async fn set_pr_number(shared: &Arc<Shared>, path: &Path, pr: Option<u64>) {
 /// the agent on the new worktree (same path as `RunPrompt`).
 async fn new_worktree(
     shared: &Arc<Shared>,
+    project: String,
     prompt_slug: Option<String>,
     prompt_body: Option<String>,
 ) {
-    let base = shared.project_config.worktrees_base(&shared.repo_root);
+    // Resolve the target project's base dir + manager up-front (clone what we
+    // need so we don't hold the projects lock across git/state I/O).
+    let resolved: Option<(PathBuf, PathBuf)> = {
+        let projects = shared.projects.lock().await;
+        projects
+            .iter()
+            .find(|p| p.name == project)
+            .map(|p| (p.root.clone(), p.project_config.worktrees_base(&p.root)))
+    };
+    let Some((root, base)) = resolved else {
+        tracing::warn!("daemon: NewWorktree for unknown project {project}");
+        shared.broadcast(SupervisorMsg::Error {
+            worktree_path: None,
+            message: format!("unknown project: {project}"),
+        });
+        return;
+    };
+
     if let Err(e) = std::fs::create_dir_all(&base) {
         tracing::warn!("daemon: cannot create worktrees base {:?}: {e}", base);
         shared.broadcast(SupervisorMsg::Error {
@@ -885,7 +1049,10 @@ async fn new_worktree(
     }
     let path = base.join(uuid::Uuid::new_v4().to_string());
 
-    let created = match shared.manager.create_detached(&path) {
+    // Create the detached worktree using a fresh manager bound to this project's
+    // root (manager is cheap; avoids holding the projects lock across git I/O).
+    let manager = WorktreeManager::new(root.clone());
+    let created = match manager.create_detached(&path) {
         Ok(wt) => wt,
         Err(e) => {
             tracing::warn!("daemon: create detached worktree failed: {e}");
@@ -898,14 +1065,15 @@ async fn new_worktree(
     };
     let canonical = created.path.clone();
 
-    // Record the prompt slug onto the persisted state (name stays "Unnamed").
+    // Record the prompt slug onto the project's persisted state (name stays
+    // "Unnamed").
     if prompt_slug.is_some() {
-        match state::load(&shared.repo_root) {
+        match state::load(&root) {
             Ok(mut st) => {
                 if let Some(w) = st.worktrees.iter_mut().find(|w| w.path == canonical) {
                     w.prompt_slug = prompt_slug.clone();
                 }
-                if let Err(e) = state::save(&shared.repo_root, &st) {
+                if let Err(e) = state::save(&root, &st) {
                     tracing::warn!("daemon: failed to persist new worktree prompt_slug: {e}");
                 }
             }
@@ -927,6 +1095,38 @@ async fn new_worktree(
     }
 }
 
+/// `AddProject` — validate + register the git repo at `path`, build a
+/// `ProjectRuntime`, push it into `Shared.projects`, rebuild the registry +
+/// watch-set, and broadcast a Snapshot.  On failure broadcast an Error.
+async fn add_project(shared: &Arc<Shared>, path: &Path) {
+    match projects::add(path) {
+        Ok(project) => {
+            // Skip if this project is already managed (dedupe by canonical path).
+            let already = {
+                let runtimes = shared.projects.lock().await;
+                runtimes.iter().any(|p| p.root == project.path)
+            };
+            if !already {
+                let runtime = ProjectRuntime::from_project(&project);
+                shared.projects.lock().await.push(runtime);
+            }
+            tracing::info!(project = %project.name, "daemon: added project");
+            let snapshot = shared.rebuild_registry().await;
+            shared.rebuild_watch_set().await;
+            shared.broadcast(SupervisorMsg::Snapshot {
+                worktrees: snapshot,
+            });
+        }
+        Err(e) => {
+            tracing::warn!("daemon: add project failed: {e}");
+            shared.broadcast(SupervisorMsg::Error {
+                worktree_path: None,
+                message: format!("{e}"),
+            });
+        }
+    }
+}
+
 /// `SetWorktreeName` — update the supervisor name dictionary (registry + state),
 /// then broadcast a fresh Snapshot.
 async fn set_worktree_name(shared: &Arc<Shared>, path: &Path, name: String) {
@@ -936,14 +1136,18 @@ async fn set_worktree_name(shared: &Arc<Shared>, path: &Path, name: String) {
             view.name = name.clone();
         }
     }
-    match state::load(&shared.repo_root) {
-        Ok(mut st) => {
-            st.set_name(path, name);
-            if let Err(e) = state::save(&shared.repo_root, &st) {
-                tracing::warn!("daemon: failed to persist worktree name: {e}");
+    if let Some(root) = shared.project_root_for(path).await {
+        match state::load(&root) {
+            Ok(mut st) => {
+                st.set_name(path, name);
+                if let Err(e) = state::save(&root, &st) {
+                    tracing::warn!("daemon: failed to persist worktree name: {e}");
+                }
             }
+            Err(e) => tracing::warn!("daemon: failed to load state for name update: {e}"),
         }
-        Err(e) => tracing::warn!("daemon: failed to load state for name update: {e}"),
+    } else {
+        tracing::warn!("daemon: no owning project for {} (name)", path.display());
     }
     let snapshot = {
         let reg = shared.registry.lock().await;
@@ -956,7 +1160,16 @@ async fn set_worktree_name(shared: &Arc<Shared>, path: &Path, name: String) {
 
 /// `RemoveWorktree` — remove via the manager, refresh registry, broadcast.
 async fn remove_worktree(shared: &Arc<Shared>, path: &Path, force: bool) {
-    match shared.manager.remove(path, force) {
+    let Some(root) = shared.project_root_for(path).await else {
+        tracing::warn!("daemon: no owning project for {} (remove)", path.display());
+        shared.broadcast(SupervisorMsg::Error {
+            worktree_path: Some(path.to_path_buf()),
+            message: "no owning project for this worktree".to_string(),
+        });
+        return;
+    };
+    let manager = WorktreeManager::new(root);
+    match manager.remove(path, force) {
         Ok(()) => {
             let snapshot = shared.rebuild_registry().await;
             shared.rebuild_watch_set().await;
@@ -1164,34 +1377,63 @@ mod tests {
         (dir, root)
     }
 
-    /// Build a `Shared` over a temp repo with a fast MockBackend + MockGh.
-    fn make_shared(root: PathBuf, gh: Arc<dyn GhRunner>) -> Arc<Shared> {
-        let manager = WorktreeManager::new(root.clone());
-        let registry = Registry::from_manager(&manager);
-        let (events, _rx) = broadcast::channel::<SupervisorMsg>(BROADCAST_CAP);
-        Arc::new(Shared {
-            registry: Mutex::new(registry),
+    /// Build a `ProjectRuntime` over a temp repo with a fast MockBackend.
+    fn make_runtime(name: &str, root: PathBuf) -> ProjectRuntime {
+        ProjectRuntime {
+            name: name.to_string(),
+            root: root.clone(),
+            manager: WorktreeManager::new(root),
+            project_config: ProjectConfig::default(),
             backend: Arc::new(MockBackend {
                 delay: Duration::from_millis(5),
             }),
-            gh,
-            manager,
-            repo_root: root,
-            config: Config::default(),
-            project_config: ProjectConfig::default(),
-            events,
-            watch_set: Arc::new(Mutex::new(Vec::new())),
-        })
+            backend_name: "Mock",
+        }
     }
 
-    /// Seed a single worktree directly into the registry + state for tests that
-    /// don't want to spin a real `git worktree add`.
+    /// Build a `Shared` over one or more temp-repo projects with a MockGh.
+    /// The registry is built across all supplied projects.
+    async fn make_shared_with(projects: Vec<ProjectRuntime>, gh: Arc<dyn GhRunner>) -> Arc<Shared> {
+        let (events, _rx) = broadcast::channel::<SupervisorMsg>(BROADCAST_CAP);
+        let shared = Arc::new(Shared {
+            projects: Mutex::new(projects),
+            registry: Mutex::new(Registry::empty()),
+            gh,
+            config: Config::default(),
+            events,
+            watch_set: Arc::new(Mutex::new(Vec::new())),
+        });
+        shared.rebuild_registry().await;
+        shared
+    }
+
+    /// Convenience: single-project `Shared` named "proj" over `root`.
+    async fn make_shared(root: PathBuf, gh: Arc<dyn GhRunner>) -> Arc<Shared> {
+        make_shared_with(vec![make_runtime("proj", root)], gh).await
+    }
+
+    /// The root of the first managed project (used by seed-based tests).
+    async fn primary_root(shared: &Arc<Shared>) -> PathBuf {
+        shared.projects.lock().await[0].root.clone()
+    }
+
+    /// The name of the first managed project.
+    async fn primary_name(shared: &Arc<Shared>) -> String {
+        shared.projects.lock().await[0].name.clone()
+    }
+
+    /// Seed a single worktree directly into the registry + the owning project's
+    /// state for tests that don't want to spin a real `git worktree add`.  The
+    /// worktree is tagged with the first project and registered in `project_of`
+    /// so state-write resolution finds the right repo.
     async fn seed_worktree(
         shared: &Arc<Shared>,
         path: &Path,
         auto_continue: bool,
         pr: Option<u64>,
     ) {
+        let project_name = primary_name(shared).await;
+        let root = primary_root(shared).await;
         let wt = crate::worktree::model::Worktree {
             path: path.to_path_buf(),
             name: "Unnamed".to_string(),
@@ -1203,12 +1445,19 @@ mod tests {
         };
         {
             let mut reg = shared.registry.lock().await;
-            reg.worktrees
-                .insert(path.to_path_buf(), ipc::WorktreeView::from(&wt));
+            reg.worktrees.insert(
+                path.to_path_buf(),
+                ipc::WorktreeView::from_worktree(&wt, project_name.clone(), None),
+            );
+            reg.project_of
+                .insert(path.to_path_buf(), project_name.clone());
+            if !reg.order.iter().any(|p| p == path) {
+                reg.order.push(path.to_path_buf());
+            }
         }
-        let mut st = state::load(&shared.repo_root).expect("load state");
+        let mut st = state::load(&root).expect("load state");
         st.upsert_worktree(wt);
-        state::save(&shared.repo_root, &st).expect("save state");
+        state::save(&root, &st).expect("save state");
     }
 
     // -- RunPrompt ------------------------------------------------------------
@@ -1217,7 +1466,7 @@ mod tests {
     async fn run_prompt_sets_running_then_needs_review() {
         let (_dir, root) = make_temp_repo();
         let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
-        let shared = make_shared(root, gh);
+        let shared = make_shared(root, gh).await;
 
         let path = PathBuf::from("/tmp/run-prompt-wt");
         seed_worktree(&shared, &path, false, None).await;
@@ -1275,7 +1524,7 @@ mod tests {
     async fn set_auto_continue_persists_and_reflects() {
         let (_dir, root) = make_temp_repo();
         let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
-        let shared = make_shared(root.clone(), gh);
+        let shared = make_shared(root.clone(), gh).await;
 
         let path = PathBuf::from("/tmp/ac-wt");
         seed_worktree(&shared, &path, false, None).await;
@@ -1311,7 +1560,7 @@ mod tests {
     async fn set_pr_number_updates_watch_set() {
         let (_dir, root) = make_temp_repo();
         let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
-        let shared = make_shared(root, gh);
+        let shared = make_shared(root, gh).await;
 
         let path = PathBuf::from("/tmp/pr-wt");
         seed_worktree(&shared, &path, false, None).await;
@@ -1342,11 +1591,10 @@ mod tests {
         let (_dir, root) = make_temp_repo();
         let wt_dir = tempfile::tempdir().expect("wt tempdir");
         let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
-        let shared = make_shared(root.clone(), gh);
+        let shared = make_shared(root.clone(), gh).await;
 
-        // Create a real worktree on disk via the manager.
-        shared
-            .manager
+        // Create a real worktree on disk via a manager bound to the project root.
+        WorktreeManager::new(root.clone())
             .create(Some("slug".to_string()), "feat-x", wt_dir.path())
             .expect("create worktree");
         let canonical = wt_dir.path().canonicalize().expect("canonicalize");
@@ -1367,11 +1615,12 @@ mod tests {
     async fn new_worktree_blank_creates_detached_unnamed_under_base() {
         let (_dir, root) = make_temp_repo();
         let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
-        let shared = make_shared(root.clone(), gh);
+        let shared = make_shared(root.clone(), gh).await;
 
         handle_client_msg(
             &shared,
             ClientMsg::NewWorktree {
+                project: "proj".to_string(),
                 prompt_slug: None,
                 prompt_body: None,
             },
@@ -1406,13 +1655,14 @@ mod tests {
     async fn new_worktree_with_prompt_drives_agent_to_running() {
         let (_dir, root) = make_temp_repo();
         let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
-        let shared = make_shared(root.clone(), gh);
+        let shared = make_shared(root.clone(), gh).await;
 
         let mut sub = shared.events.subscribe();
 
         handle_client_msg(
             &shared,
             ClientMsg::NewWorktree {
+                project: "proj".to_string(),
                 prompt_slug: Some("refactor".to_string()),
                 prompt_body: Some("do the refactor".to_string()),
             },
@@ -1448,7 +1698,7 @@ mod tests {
     async fn set_worktree_name_updates_registry_and_state() {
         let (_dir, root) = make_temp_repo();
         let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
-        let shared = make_shared(root.clone(), gh);
+        let shared = make_shared(root.clone(), gh).await;
 
         let path = PathBuf::from("/tmp/name-wt");
         seed_worktree(&shared, &path, false, None).await;
@@ -1479,7 +1729,7 @@ mod tests {
     async fn watcher_pr_merged_triggers_continue_for_auto_worktree() {
         let (_dir, root) = make_temp_repo();
         let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
-        let shared = make_shared(root, gh);
+        let shared = make_shared(root, gh).await;
 
         let path = PathBuf::from("/tmp/auto-merge-wt");
         seed_worktree(&shared, &path, /* auto_continue */ true, Some(5)).await;
@@ -1527,7 +1777,7 @@ mod tests {
     async fn watcher_pr_merged_no_continue_when_flag_off() {
         let (_dir, root) = make_temp_repo();
         let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
-        let shared = make_shared(root, gh);
+        let shared = make_shared(root, gh).await;
 
         let path = PathBuf::from("/tmp/no-auto-wt");
         seed_worktree(&shared, &path, /* auto_continue */ false, Some(9)).await;
@@ -1547,5 +1797,189 @@ mod tests {
             reg.worktrees.get(&path).map(|v| v.status.clone()),
             Some(WorktreeStatus::PRMerged)
         );
+    }
+
+    // -- Multi-project --------------------------------------------------------
+
+    #[tokio::test]
+    async fn rebuild_registry_tags_and_orders_by_project() {
+        let (_d1, root1) = make_temp_repo();
+        let (_d2, root2) = make_temp_repo();
+        let wt1 = tempfile::tempdir().expect("wt1");
+        let wt2 = tempfile::tempdir().expect("wt2");
+        let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
+
+        // Create a worktree in each project's repo.
+        WorktreeManager::new(root1.clone())
+            .create(None, "feat-a", wt1.path())
+            .expect("create in p1");
+        WorktreeManager::new(root2.clone())
+            .create(None, "feat-b", wt2.path())
+            .expect("create in p2");
+
+        let shared = make_shared_with(
+            vec![
+                make_runtime("alpha", root1.clone()),
+                make_runtime("beta", root2.clone()),
+            ],
+            gh,
+        )
+        .await;
+
+        let snapshot = shared.rebuild_registry().await;
+
+        // Each created worktree is tagged with the right project.
+        let c1 = wt1.path().canonicalize().unwrap();
+        let c2 = wt2.path().canonicalize().unwrap();
+        let v1 = snapshot.iter().find(|v| v.path == c1).expect("wt1 present");
+        let v2 = snapshot.iter().find(|v| v.path == c2).expect("wt2 present");
+        assert_eq!(v1.project, "alpha");
+        assert_eq!(v2.project, "beta");
+
+        // Ordering: all of alpha's worktrees come before all of beta's.
+        let first_beta = snapshot.iter().position(|v| v.project == "beta").unwrap();
+        let last_alpha = snapshot.iter().rposition(|v| v.project == "alpha").unwrap();
+        assert!(last_alpha < first_beta, "alpha must precede beta in order");
+    }
+
+    #[tokio::test]
+    async fn state_write_goes_to_owning_project() {
+        let (_d1, root1) = make_temp_repo();
+        let (_d2, root2) = make_temp_repo();
+        let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
+        let shared = make_shared_with(
+            vec![
+                make_runtime("alpha", root1.clone()),
+                make_runtime("beta", root2.clone()),
+            ],
+            gh,
+        )
+        .await;
+
+        // Seed a worktree owned by "beta" (second project).
+        let path = PathBuf::from("/tmp/beta-owned-wt");
+        let wt = crate::worktree::model::Worktree {
+            path: path.clone(),
+            name: "Unnamed".to_string(),
+            branch: "feat".to_string(),
+            prompt_slug: None,
+            pr_number: None,
+            auto_continue_on_merge: false,
+            status: WorktreeStatus::Idle,
+        };
+        {
+            let mut reg = shared.registry.lock().await;
+            reg.worktrees.insert(
+                path.clone(),
+                ipc::WorktreeView::from_worktree(&wt, "beta".to_string(), None),
+            );
+            reg.project_of.insert(path.clone(), "beta".to_string());
+            reg.order.push(path.clone());
+        }
+        // Pre-seed beta's state so set_name has an entry to update.
+        let mut st = state::load(&root2).expect("load beta state");
+        st.upsert_worktree(wt);
+        state::save(&root2, &st).expect("save beta state");
+
+        handle_client_msg(
+            &shared,
+            ClientMsg::SetWorktreeName {
+                worktree_path: path.clone(),
+                name: "renamed".to_string(),
+            },
+        )
+        .await;
+
+        // The rename lands in beta's state.toml, NOT alpha's.
+        let beta = state::load(&root2).expect("load beta");
+        assert_eq!(
+            beta.worktrees.iter().find(|w| w.path == path).unwrap().name,
+            "renamed"
+        );
+        let alpha = state::load(&root1).expect("load alpha");
+        assert!(
+            alpha.worktrees.iter().all(|w| w.path != path),
+            "alpha state must not contain beta's worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_worktree_creates_under_named_project() {
+        let (_d1, root1) = make_temp_repo();
+        let (_d2, root2) = make_temp_repo();
+        let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
+        let shared = make_shared_with(
+            vec![
+                make_runtime("alpha", root1.clone()),
+                make_runtime("beta", root2.clone()),
+            ],
+            gh,
+        )
+        .await;
+
+        handle_client_msg(
+            &shared,
+            ClientMsg::NewWorktree {
+                project: "beta".to_string(),
+                prompt_slug: None,
+                prompt_body: None,
+            },
+        )
+        .await;
+
+        // The new worktree lives under beta's base + is tagged "beta".
+        let beta_base = root2
+            .join(".karazhan")
+            .join("worktrees")
+            .canonicalize()
+            .unwrap_or_else(|_| root2.join(".karazhan").join("worktrees"));
+        let reg = shared.registry.lock().await;
+        let created: Vec<_> = reg
+            .worktrees
+            .values()
+            .filter(|v| v.path.starts_with(&beta_base))
+            .collect();
+        assert_eq!(created.len(), 1, "exactly one new worktree under beta");
+        assert_eq!(created[0].project, "beta");
+    }
+
+    #[tokio::test]
+    async fn add_project_rejects_non_git_path() {
+        let (_d1, root1) = make_temp_repo();
+        let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
+        let shared = make_shared_with(vec![make_runtime("alpha", root1)], gh).await;
+
+        let plain = tempfile::tempdir().expect("plain dir");
+        let mut sub = shared.events.subscribe();
+
+        handle_client_msg(
+            &shared,
+            ClientMsg::AddProject {
+                path: plain.path().to_path_buf(),
+            },
+        )
+        .await;
+
+        // Expect an Error broadcast (not a Snapshot).
+        let msg = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("timeout")
+            .expect("recv");
+        match msg {
+            SupervisorMsg::Error {
+                worktree_path,
+                message,
+            } => {
+                assert!(worktree_path.is_none());
+                assert!(
+                    message.contains("not a git repository") || message.contains("git"),
+                    "unexpected error message: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // The project count is unchanged (still just alpha).
+        assert_eq!(shared.projects.lock().await.len(), 1);
     }
 }

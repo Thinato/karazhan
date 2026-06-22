@@ -5,6 +5,7 @@ mod config;
 pub mod daemon;
 pub mod ipc;
 mod project_config;
+mod projects;
 mod watcher;
 
 // TODO Phase 1
