@@ -1,0 +1,6 @@
+2026-06-22T12:07:30.098652Z  INFO karazhan: karazhan starting up
+2026-06-22T12:07:30.098919Z  INFO karazhan: config loaded poll_interval_secs=30 claude_bin=claude gh_bin=gh
+2026-06-22T12:07:30.116923Z  INFO karazhan::client: client: attached to supervisor supervisor_pid=70928
+2026-06-22T12:07:37.295692Z  INFO karazhan::app: entered grid view (1 worktrees)
+2026-06-22T12:07:42.726877Z  INFO karazhan::app: quit requested via 'q'
+2026-06-22T12:07:42.727062Z  INFO karazhan: karazhan shutting down
