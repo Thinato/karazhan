@@ -1,8 +1,14 @@
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use futures::StreamExt;
+use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use std::path::PathBuf;
+use std::io::Stdout;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
 use crate::client::SupervisorClient;
@@ -90,6 +96,9 @@ pub struct App {
     config: Config,
     /// Whether the help overlay is currently shown.
     show_help: bool,
+    /// Path of a prompt file queued to open in `$EDITOR` (set by the `e` key,
+    /// drained by the run loop so the editor runs outside the event stream).
+    pending_edit: Option<PathBuf>,
 }
 
 impl App {
@@ -116,6 +125,7 @@ impl App {
             client,
             config,
             show_help: false,
+            pending_edit: None,
         }
     }
 
@@ -124,13 +134,7 @@ impl App {
         self.status_message = Some(msg.into());
     }
 
-    pub async fn run<B: ratatui::backend::Backend>(
-        mut self,
-        terminal: &mut Terminal<B>,
-    ) -> Result<()>
-    where
-        B::Error: Send + Sync + 'static,
-    {
+    pub async fn run(mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         let mut crossterm_events = EventStream::new();
 
         while self.running {
@@ -191,11 +195,74 @@ impl App {
                     }
                 }
             }
+
+            // Open the external editor outside the select! so the EventStream's
+            // stdin reader does not compete with the editor for terminal input.
+            // The stream is dropped before launching and recreated afterwards.
+            if let Some(path) = self.pending_edit.take() {
+                drop(crossterm_events);
+                self.run_editor(terminal, &path).await;
+                crossterm_events = EventStream::new();
+            }
         }
 
         // Clean quit: just drop the client (closing the socket).  The daemon
         // keeps running — agent sessions and the watcher survive.
         Ok(())
+    }
+
+    /// Suspend the TUI, run `$EDITOR <path>` against the terminal, then restore
+    /// the TUI and reload the prompt library.  Falls back to `$VISUAL`.
+    async fn run_editor(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>, path: &Path) {
+        let editor = std::env::var("EDITOR")
+            .or_else(|_| std::env::var("VISUAL"))
+            .unwrap_or_default();
+        let editor = editor.trim();
+        if editor.is_empty() {
+            self.library.status = Some("set $EDITOR to edit prompts".to_string());
+            return;
+        }
+
+        // $EDITOR may carry arguments (e.g. "code -w"); the program is the first
+        // whitespace-separated token, the rest are leading args before the path.
+        let mut parts = editor.split_whitespace();
+        let program = parts.next().unwrap_or(editor);
+        let extra_args: Vec<&str> = parts.collect();
+
+        // Leave the alternate screen + raw mode so the editor owns the terminal.
+        let _ = disable_raw_mode();
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+
+        let status = tokio::process::Command::new(program)
+            .args(&extra_args)
+            .arg(path)
+            .status()
+            .await;
+
+        // Re-enter the TUI.  The editor left the terminal in an unknown state
+        // and ratatui caches the pre-edit frame, so a plain clear() can leave
+        // stale cells.  Rebuild the Terminal from a fresh backend so its buffers
+        // are empty and sized to the current screen, then force a full repaint.
+        let _ = enable_raw_mode();
+        let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+        if let Ok(new_terminal) = Terminal::new(CrosstermBackend::new(std::io::stdout())) {
+            *terminal = new_terminal;
+        }
+        let _ = terminal.clear();
+
+        match status {
+            Ok(s) if s.success() => {
+                self.library.reload_keep_selection();
+                self.library.status = Some("prompt saved".to_string());
+            }
+            Ok(s) => {
+                self.library.reload_keep_selection();
+                self.library.status = Some(format!("editor exited with status {s}"));
+            }
+            Err(e) => {
+                self.library.status = Some(format!("could not launch editor '{program}': {e}"));
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -273,6 +340,10 @@ impl App {
                 KeyCode::Char('k') | KeyCode::Up => self.library.move_up(),
                 KeyCode::Char('/') => self.library.enter_filter(),
                 KeyCode::Char('n') | KeyCode::Char('a') => self.library.enter_new_prompt(),
+                KeyCode::Char('e') => match self.library.selected_prompt_path() {
+                    Some(path) => self.pending_edit = Some(path),
+                    None => self.library.status = Some("no prompt selected".to_string()),
+                },
                 _ => {}
             },
             LibraryMode::Filter => match code {

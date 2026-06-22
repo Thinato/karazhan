@@ -75,6 +75,35 @@ impl LibraryView {
         self.apply_filter();
     }
 
+    /// Filesystem path of the currently selected prompt, if any.
+    pub fn selected_prompt_path(&self) -> Option<std::path::PathBuf> {
+        let filtered_idx = self.list_state.selected()?;
+        let prompt_idx = *self.filtered.get(filtered_idx)?;
+        let slug = &self.all_prompts.get(prompt_idx)?.slug;
+        Some(self.store.path_for(slug))
+    }
+
+    /// Reload from disk after an external edit, keeping the selection pinned to
+    /// the same prompt slug when it still exists.
+    pub fn reload_keep_selection(&mut self) {
+        let prev_slug = self
+            .list_state
+            .selected()
+            .and_then(|fi| self.filtered.get(fi))
+            .and_then(|&pi| self.all_prompts.get(pi))
+            .map(|p| p.slug.clone());
+
+        self.reload();
+
+        if let Some(slug) = prev_slug {
+            if let Some(pi) = self.all_prompts.iter().position(|p| p.slug == slug) {
+                if let Some(fi) = self.filtered.iter().position(|&i| i == pi) {
+                    self.list_state.select(Some(fi));
+                }
+            }
+        }
+    }
+
     fn apply_filter(&mut self) {
         let query = if self.mode == LibraryMode::Filter {
             self.input.as_str()
@@ -271,7 +300,7 @@ impl LibraryView {
                 let status = self
                     .status
                     .as_deref()
-                    .unwrap_or("j/k: move  /: filter  n: new  q: quit");
+                    .unwrap_or("j/k: move  /: filter  n: new  e: edit  q: quit");
                 status.to_string()
             }
             LibraryMode::Filter => {
@@ -295,5 +324,52 @@ impl LibraryView {
             .alignment(Alignment::Left);
 
         frame.render_widget(bottom, chunks[1]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store_with(slugs: &[&str]) -> (tempfile::TempDir, PromptStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = PromptStore::new(dir.path());
+        for slug in slugs {
+            store
+                .save(&Prompt {
+                    slug: (*slug).to_string(),
+                    title: (*slug).to_string(),
+                    tags: vec![],
+                    vars: vec![],
+                    body: format!("body of {slug}"),
+                })
+                .expect("save");
+        }
+        (dir, store)
+    }
+
+    #[test]
+    fn selected_prompt_path_points_at_selection_file() {
+        let (_dir, store) = store_with(&["alpha"]);
+        let expected = store.path_for("alpha");
+        let view = LibraryView::new(store);
+        assert_eq!(view.selected_prompt_path(), Some(expected));
+    }
+
+    #[test]
+    fn selected_prompt_path_none_when_empty() {
+        let (_dir, store) = store_with(&[]);
+        let view = LibraryView::new(store);
+        assert_eq!(view.selected_prompt_path(), None);
+    }
+
+    #[test]
+    fn reload_keep_selection_stays_on_same_slug() {
+        let (_dir, store) = store_with(&["alpha", "beta", "gamma"]);
+        let mut view = LibraryView::new(store);
+        // Pin selection to whatever slug is currently selected.
+        let before = view.selected_prompt_path().expect("a selection");
+        view.reload_keep_selection();
+        assert_eq!(view.selected_prompt_path(), Some(before));
     }
 }

@@ -63,6 +63,7 @@ fn help_lines() -> Vec<Line<'static>> {
         kv("k / ↑   ", "move selection up", key, desc),
         kv("/       ", "enter filter mode (type to search)", key, desc),
         kv("n / a   ", "create a new prompt", key, desc),
+        kv("e       ", "edit selected prompt in $EDITOR", key, desc),
         Line::from(""),
         Line::from(Span::styled(
             "  (filter mode)  Esc: clear filter  Backspace: delete char",
