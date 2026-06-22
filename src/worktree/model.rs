@@ -16,12 +16,21 @@ pub enum WorktreeStatus {
     Error,
 }
 
+/// Default human-facing name for a worktree (used when state.toml has no
+/// `name` field — e.g. pre-existing worktrees from before names were added).
+pub fn default_name() -> String {
+    "Unnamed".into()
+}
+
 /// A git worktree tracked by Karazhan.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Worktree {
     /// Absolute path to the worktree on disk.
     pub path: PathBuf,
+    /// Human-facing name (supervisor-managed dictionary; defaults to "Unnamed").
+    #[serde(default = "default_name")]
+    pub name: String,
     /// Git branch checked out in this worktree.
     pub branch: String,
     /// Slug of the prompt last used against this worktree, if any.
@@ -41,6 +50,7 @@ impl Worktree {
     pub fn from_git(path: PathBuf, branch: String) -> Self {
         Self {
             path,
+            name: default_name(),
             branch,
             prompt_slug: None,
             pr_number: None,

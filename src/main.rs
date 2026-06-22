@@ -4,6 +4,7 @@ mod commands;
 mod config;
 pub mod daemon;
 pub mod ipc;
+mod project_config;
 mod watcher;
 
 // TODO Phase 1
@@ -39,6 +40,11 @@ struct Args {
     /// Path to the project directory (defaults to current dir)
     #[arg(short, long)]
     project: Option<PathBuf>,
+
+    /// Cleanly stop the running karazhan supervisor daemon and exit (does not
+    /// start the TUI).
+    #[arg(long)]
+    stop_daemon: bool,
 }
 
 /// RAII guard that owns terminal raw mode + alternate screen.
@@ -97,11 +103,37 @@ fn main() -> Result<()> {
         return daemon::run_supervisor();
     }
 
+    // Stop-daemon branch: cleanly stop any running supervisor and exit without
+    // starting the TUI.  Handled before the main runtime/TUI setup.
+    if std::env::args().any(|a| a == "--stop-daemon") {
+        return stop_daemon();
+    }
+
     // Otherwise build the client runtime and run the existing async TUI logic.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     runtime.block_on(run_client())
+}
+
+/// Cleanly stop the running supervisor daemon (the `--stop-daemon` flag).
+///
+/// Reports the PID it stopped, or that no daemon was running, then exits.
+fn stop_daemon() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let sock_path = crate::ipc::resolve_socket_path();
+        let pidfile = crate::ipc::pidfile_path(&sock_path);
+        let pid = crate::ipc::read_pidfile(&pidfile);
+        crate::client::stop_running_daemon().await?;
+        match pid {
+            Some(p) => println!("stopped karazhan daemon (pid {p})"),
+            None => println!("no running daemon"),
+        }
+        Ok(())
+    })
 }
 
 async fn run_client() -> Result<()> {

@@ -90,6 +90,14 @@ impl State {
         self.worktrees.retain(|w| w.path != path);
     }
 
+    /// Update the human-facing name for a worktree identified by `path`.
+    /// No-op if not found.
+    pub fn set_name(&mut self, path: &Path, name: impl Into<String>) {
+        if let Some(w) = self.worktrees.iter_mut().find(|w| w.path == path) {
+            w.name = name.into();
+        }
+    }
+
     /// Update the status for a worktree identified by `path`.  No-op if not found.
     pub fn set_status(&mut self, path: &Path, status: WorktreeStatus) {
         if let Some(w) = self.worktrees.iter_mut().find(|w| w.path == path) {
@@ -130,6 +138,7 @@ mod tests {
     fn make_worktree(path: impl Into<PathBuf>, branch: &str) -> Worktree {
         Worktree {
             path: path.into(),
+            name: "Unnamed".to_string(),
             branch: branch.to_string(),
             prompt_slug: Some("my-prompt".to_string()),
             pr_number: Some(42),
@@ -161,6 +170,41 @@ mod tests {
     }
 
     #[test]
+    fn set_name_persists_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+
+        let path = PathBuf::from("/tmp/wt-name");
+        let mut state = State::default();
+        state.upsert_worktree(make_worktree(&path, "feature-a"));
+        state.set_name(&path, "shiny-name");
+        save(repo_root, &state).expect("save");
+
+        let loaded = load(repo_root).expect("load");
+        assert_eq!(loaded.worktrees[0].name, "shiny-name");
+    }
+
+    #[test]
+    fn missing_name_defaults_to_unnamed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+        let karazhan_dir = repo_root.join(".karazhan");
+        std::fs::create_dir_all(&karazhan_dir).expect("mkdir");
+
+        // A state.toml entry that predates the `name` field (no `name` key).
+        let toml = "[[worktrees]]\n\
+                    path = \"/tmp/legacy-wt\"\n\
+                    branch = \"legacy\"\n\
+                    auto_continue_on_merge = false\n\
+                    status = \"idle\"\n";
+        std::fs::write(karazhan_dir.join("state.toml"), toml).expect("write");
+
+        let loaded = load(repo_root).expect("load");
+        assert_eq!(loaded.worktrees.len(), 1);
+        assert_eq!(loaded.worktrees[0].name, "Unnamed");
+    }
+
+    #[test]
     fn missing_file_returns_empty_state() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = load(dir.path()).expect("load");
@@ -174,6 +218,7 @@ mod tests {
         state.upsert_worktree(make_worktree(&path, "branch-1"));
         state.upsert_worktree(Worktree {
             path: path.clone(),
+            name: "Unnamed".to_string(),
             branch: "branch-2".to_string(),
             prompt_slug: None,
             pr_number: None,

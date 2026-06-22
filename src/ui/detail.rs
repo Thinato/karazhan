@@ -105,6 +105,7 @@ fn build_detail_lines(
     let path_str = wt.path.display().to_string();
 
     let mut lines = vec![
+        kv_line("name        ", &wt.name, key_style, val_style),
         kv_line("path        ", &path_str, key_style, val_style),
         kv_line("branch      ", &wt.branch, key_style, val_style),
     ];

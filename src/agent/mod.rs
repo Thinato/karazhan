@@ -6,13 +6,14 @@
 //! an optional short last-line summary.
 //!
 //! Concrete backends:
-//! - [`claude_code::ClaudeCodeBackend`] — spawns the real `claude` headless CLI.
+//! - [`configured::ConfiguredBackend`] — spawns the agent defined by the
+//!   project-scoped [`crate::project_config::AgentConfig`].
 //! - [`mock::MockBackend`] — simulates a session for tests / offline dev.
 //!
 //! The [`session`] runner bridges a spawned process's piped stdout into status
 //! updates.
 
-pub mod claude_code;
+pub mod configured;
 pub mod mock;
 pub mod session;
 

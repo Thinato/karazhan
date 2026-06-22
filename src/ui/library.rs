@@ -75,6 +75,15 @@ impl LibraryView {
         self.apply_filter();
     }
 
+    /// All library prompts as `(slug, title, body)` tuples, used to build the
+    /// new-worktree modal choices.  Order matches the loaded prompt order.
+    pub fn all_prompt_choices(&self) -> Vec<(String, String, String)> {
+        self.all_prompts
+            .iter()
+            .map(|p| (p.slug.clone(), p.title.clone(), p.body.clone()))
+            .collect()
+    }
+
     /// Filesystem path of the currently selected prompt, if any.
     pub fn selected_prompt_path(&self) -> Option<std::path::PathBuf> {
         let filtered_idx = self.list_state.selected()?;

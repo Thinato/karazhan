@@ -4,3 +4,9 @@
 # karazhan runtime logs
 .karazhan/logs/
 
+# per-user project config (committed example lives at .karazhan/config.example.toml)
+.karazhan/config.toml
+
+# detached worktrees created via the "new worktree" modal (working copies)
+.karazhan/worktrees/
+

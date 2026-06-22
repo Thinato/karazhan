@@ -134,9 +134,18 @@ impl GridView {
         };
 
         // Build inner label lines.
-        // Line 1: branch name (truncated to inner width = CELL_W - 2 borders - 2 padding).
+        // Line 1: worktree name (preferred over branch) + short 8-char dir suffix.
         let inner_w = (CELL_W.saturating_sub(4)) as usize;
-        let branch_label = truncate(&wt.branch, inner_w);
+        let dir_suffix: String = wt
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().chars().take(8).collect())
+            .unwrap_or_default();
+        let name_label = if dir_suffix.is_empty() {
+            truncate(&wt.name, inner_w)
+        } else {
+            truncate(&format!("{} {}", wt.name, dir_suffix), inner_w)
+        };
 
         // Line 2: prompt slug + PR number (combined, truncated).
         let mut meta_parts: Vec<String> = Vec::new();
@@ -185,7 +194,7 @@ impl GridView {
 
         // Render the text lines inside the border.
         let lines: Vec<Line> = vec![
-            Line::from(Span::styled(branch_label, label_style)),
+            Line::from(Span::styled(name_label, label_style)),
             Line::from(Span::styled(meta_label, label_style)),
             Line::from(Span::styled(status_tag, status_style)),
         ];

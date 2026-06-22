@@ -22,7 +22,35 @@ use crate::worktree::model::{Worktree, WorktreeStatus};
 
 // ── Protocol version ─────────────────────────────────────────────────────────
 
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Wire-format protocol version.
+///
+/// RULE: `PROTOCOL_VERSION` MUST be incremented whenever ANY wire-format item
+/// changes — adding, removing, reordering, or retyping a field/variant in any
+/// of:
+///   - [`WorktreeView`]
+///   - [`ClientMsg`]
+///   - [`SupervisorMsg`]
+///   - [`HandshakeReq`]
+///   - [`HandshakeResp`]
+///   - [`BuiltinKind`]
+///   - [`WorktreeStatus`] serialization (defined in `worktree::model`)
+///   - the framing (length prefix / bincode config in this module)
+///
+/// The daemon survives client rebuilds by design, so a version that is NOT
+/// bumped after a layout change lets an old daemon and a new client both claim
+/// version `N`, agree, then fail to decode each other's bodies (the original
+/// `bincode decode error: UnexpectedEnd` bug). Bump this, every time.
+///
+/// FROZEN HANDSHAKE GUARANTEE: [`HandshakeReq`] (`protocol: u32`,
+/// `client_pid: u32`) is a fixed-size 2×u32 record and its layout is FROZEN —
+/// keep it exactly two `u32`s so any daemon, of any version, can always decode
+/// the request. [`HandshakeResp`]'s variant ORDER is likewise FROZEN/append-only:
+/// `Ok` MUST stay variant index 0 and `ProtocolMismatch` MUST stay variant
+/// index 1. This guarantees an old daemon and a new client can always exchange
+/// the handshake request and a `ProtocolMismatch` reply even when every other
+/// wire-format item has changed. Do NOT reorder these two; only append new
+/// variants after `ProtocolMismatch`.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Maximum frame body size accepted by `read_frame_async` (64 MiB).
 const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
@@ -33,6 +61,8 @@ const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct WorktreeView {
     pub path: PathBuf,
+    /// Human-facing name (supervisor-managed dictionary).
+    pub name: String,
     pub branch: String,
     pub prompt_slug: Option<String>,
     pub pr_number: Option<u64>,
@@ -47,6 +77,7 @@ impl WorktreeView {
     pub fn from_worktree(wt: &Worktree, last_summary: Option<String>) -> Self {
         Self {
             path: wt.path.clone(),
+            name: wt.name.clone(),
             branch: wt.branch.clone(),
             prompt_slug: wt.prompt_slug.clone(),
             pr_number: wt.pr_number,
@@ -73,12 +104,20 @@ pub enum BuiltinKind {
 
 // ── Handshake ─────────────────────────────────────────────────────────────────
 
+/// FROZEN: fixed-size 2×u32 record. Do NOT add, remove, reorder, or retype
+/// these fields — every daemon version must be able to decode this request.
+/// See the `PROTOCOL_VERSION` doc comment.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct HandshakeReq {
     pub protocol: u32,
     pub client_pid: u32,
 }
 
+/// FROZEN variant ORDER (append-only): `Ok` is variant index 0,
+/// `ProtocolMismatch` is variant index 1. Do NOT reorder — an old daemon and a
+/// new client must always be able to exchange a `ProtocolMismatch` reply.
+/// New variants may only be appended after `ProtocolMismatch`.
+/// See the `PROTOCOL_VERSION` doc comment.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum HandshakeResp {
     Ok {
@@ -113,10 +152,20 @@ pub enum ClientMsg {
         worktree_path: PathBuf,
         pr: Option<u64>,
     },
-    CreateWorktree {
+    /// Create a fresh detached worktree.  The daemon generates the UUID
+    /// directory under the configured base and runs `git worktree add
+    /// --detach`.  If `prompt_body` is `Some`, the daemon also runs that prompt
+    /// body on the new worktree (the client resolves the body from its library
+    /// since the daemon has no prompt access).  `prompt_slug` is recorded as
+    /// metadata when present.
+    NewWorktree {
         prompt_slug: Option<String>,
-        branch: String,
-        path: PathBuf,
+        prompt_body: Option<String>,
+    },
+    /// Rename a worktree (updates the supervisor name dictionary in state.toml).
+    SetWorktreeName {
+        worktree_path: PathBuf,
+        name: String,
     },
     RemoveWorktree {
         path: PathBuf,
@@ -244,6 +293,15 @@ pub fn logfile_path(sock: &Path) -> PathBuf {
         .join("supervisor.log")
 }
 
+/// Read and parse a pidfile into a PID.
+///
+/// Returns `None` if the file is missing, empty, or does not contain a valid
+/// positive integer (garbage tolerated — never panics).
+pub fn read_pidfile(pidfile: &Path) -> Option<i32> {
+    let contents = std::fs::read_to_string(pidfile).ok()?;
+    contents.trim().parse::<i32>().ok().filter(|&p| p > 0)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -265,6 +323,7 @@ mod tests {
     fn worktree_view_round_trip() {
         let wv = WorktreeView {
             path: PathBuf::from("/repo/feature"),
+            name: "my-worktree".into(),
             branch: "feature/x".into(),
             prompt_slug: Some("refactor".into()),
             pr_number: Some(42),
@@ -291,6 +350,7 @@ mod tests {
             supervisor_pid: 999,
             worktrees: vec![WorktreeView {
                 path: PathBuf::from("/a"),
+                name: "Unnamed".into(),
                 branch: "main".into(),
                 prompt_slug: None,
                 pr_number: None,
@@ -304,6 +364,64 @@ mod tests {
     #[test]
     fn handshake_resp_mismatch_round_trip() {
         rt(&HandshakeResp::ProtocolMismatch { supervisor: 2 });
+    }
+
+    // ── Protocol version + frozen wire format ─────────────────────────────────
+
+    #[test]
+    fn protocol_version_is_two() {
+        assert_eq!(PROTOCOL_VERSION, 2);
+    }
+
+    /// Locks the FROZEN variant order of `HandshakeResp`: the first body byte is
+    /// the bincode varint enum tag, which MUST be 0 for `Ok` and 1 for
+    /// `ProtocolMismatch`. A future reorder breaks this test on purpose.
+    #[test]
+    fn handshake_resp_variant_tags_are_frozen() {
+        let ok = encode(&HandshakeResp::Ok {
+            supervisor_pid: 1,
+            worktrees: vec![],
+        })
+        .expect("encode ok");
+        assert_eq!(ok[0], 0, "HandshakeResp::Ok must stay variant index 0");
+
+        let mismatch =
+            encode(&HandshakeResp::ProtocolMismatch { supervisor: 9 }).expect("encode mismatch");
+        assert_eq!(
+            mismatch[0], 1,
+            "HandshakeResp::ProtocolMismatch must stay variant index 1"
+        );
+    }
+
+    // ── pidfile parse ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn read_pidfile_round_trips_a_pid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("supervisor.pid");
+        std::fs::write(&pidfile, "12345\n").expect("write pidfile");
+        assert_eq!(read_pidfile(&pidfile), Some(12345));
+    }
+
+    #[test]
+    fn read_pidfile_missing_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("does-not-exist.pid");
+        assert_eq!(read_pidfile(&pidfile), None);
+    }
+
+    #[test]
+    fn read_pidfile_garbage_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("supervisor.pid");
+        std::fs::write(&pidfile, "not a pid").expect("write pidfile");
+        assert_eq!(read_pidfile(&pidfile), None);
+
+        std::fs::write(&pidfile, "").expect("write empty");
+        assert_eq!(read_pidfile(&pidfile), None);
+
+        std::fs::write(&pidfile, "-7").expect("write negative");
+        assert_eq!(read_pidfile(&pidfile), None);
     }
 
     // ── ClientMsg variants ────────────────────────────────────────────────────
@@ -362,11 +480,26 @@ mod tests {
     }
 
     #[test]
-    fn client_msg_create_worktree() {
-        rt(&ClientMsg::CreateWorktree {
-            prompt_slug: Some("new-feat".into()),
-            branch: "feat/new".into(),
-            path: PathBuf::from("/repo/feat-new"),
+    fn client_msg_new_worktree_blank() {
+        rt(&ClientMsg::NewWorktree {
+            prompt_slug: None,
+            prompt_body: None,
+        });
+    }
+
+    #[test]
+    fn client_msg_new_worktree_with_prompt() {
+        rt(&ClientMsg::NewWorktree {
+            prompt_slug: Some("refactor".into()),
+            prompt_body: Some("refactor the parser".into()),
+        });
+    }
+
+    #[test]
+    fn client_msg_set_worktree_name() {
+        rt(&ClientMsg::SetWorktreeName {
+            worktree_path: PathBuf::from("/repo/wt"),
+            name: "shiny".into(),
         });
     }
 
@@ -547,6 +680,7 @@ mod tests {
     fn worktree_view_from_worktree() {
         let wt = Worktree {
             path: PathBuf::from("/repo/feat"),
+            name: "feat-name".into(),
             branch: "feat/y".into(),
             prompt_slug: Some("tidy".into()),
             pr_number: Some(3),
@@ -555,6 +689,7 @@ mod tests {
         };
         let view = WorktreeView::from_worktree(&wt, Some("summary here".into()));
         assert_eq!(view.path, wt.path);
+        assert_eq!(view.name, wt.name);
         assert_eq!(view.branch, wt.branch);
         assert_eq!(view.status, WorktreeStatus::CIFailing);
         assert_eq!(view.last_summary, Some("summary here".into()));

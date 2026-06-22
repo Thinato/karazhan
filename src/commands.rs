@@ -47,6 +47,10 @@ pub enum CommandId {
     CheckCi,
     /// Toggle auto-continue on PR merge for the selection (Grid; same as `a`).
     ToggleAutoContinue,
+    /// Create a new worktree, blank or from a prompt (Grid; same as `n`).
+    NewWorktree,
+    /// Rename the selected worktree (Grid; same as `N`).
+    RenameWorktree,
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +165,20 @@ pub const ALL_COMMANDS: &[CommandSpec] = &[
         title: "Toggle Auto-Continue",
         description: "Toggle auto-continue on PR merge",
         keybind: "a",
+        context: CommandContext::Grid,
+    },
+    CommandSpec {
+        id: CommandId::NewWorktree,
+        title: "New worktree",
+        description: "create a worktree (blank or from a prompt)",
+        keybind: "n",
+        context: CommandContext::Grid,
+    },
+    CommandSpec {
+        id: CommandId::RenameWorktree,
+        title: "Rename worktree",
+        description: "rename the selected worktree",
+        keybind: "N",
         context: CommandContext::Grid,
     },
 ];
@@ -298,6 +316,120 @@ impl Palette {
 }
 
 // ---------------------------------------------------------------------------
+// New-worktree modal
+// ---------------------------------------------------------------------------
+
+/// Rank a lowercased `text` against a lowercased `query`.  Lower is better;
+/// `None` means no match.  Mirrors the palette's title ranking:
+///   0 = prefix, 1 = substring, 2 = subsequence.
+fn rank_text(text: &str, query: &str) -> Option<u8> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    if text.starts_with(query) {
+        Some(0)
+    } else if text.contains(query) {
+        Some(1)
+    } else if is_subsequence(query, text) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// One selectable option in the new-worktree modal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorktreeChoice {
+    /// Create a detached worktree with no prompt run.
+    Blank,
+    /// Create a detached worktree and run this prompt's body on it.
+    Prompt {
+        slug: String,
+        title: String,
+        body: String,
+    },
+}
+
+impl WorktreeChoice {
+    /// The label shown in the modal list.
+    fn label(&self) -> &str {
+        match self {
+            WorktreeChoice::Blank => "blank worktree",
+            WorktreeChoice::Prompt { title, .. } => title,
+        }
+    }
+}
+
+/// New-worktree modal state (key `n` in Grid view).
+///
+/// Lists "blank worktree" first, then one row per library prompt (by title).
+/// Type-to-filter mirrors the command palette.
+pub struct NewWorktreeModal {
+    /// The current filter query (raw, as typed).
+    pub query: String,
+    /// All options; index 0 is always [`WorktreeChoice::Blank`].
+    pub options: Vec<WorktreeChoice>,
+    /// Indices into `options`, ranked by the current query.
+    pub filtered: Vec<usize>,
+    /// Cursor position within `filtered`.
+    pub cursor: usize,
+}
+
+impl NewWorktreeModal {
+    /// Build a modal from the library's prompt choices: `(slug, title, body)`.
+    /// "blank worktree" is always the first option.
+    pub fn new(prompt_choices: Vec<(String, String, String)>) -> Self {
+        let mut options = vec![WorktreeChoice::Blank];
+        options.extend(
+            prompt_choices
+                .into_iter()
+                .map(|(slug, title, body)| WorktreeChoice::Prompt { slug, title, body }),
+        );
+        let filtered: Vec<usize> = (0..options.len()).collect();
+        Self {
+            query: String::new(),
+            options,
+            filtered,
+            cursor: 0,
+        }
+    }
+
+    /// Recompute `filtered` for the current query and reset the cursor.
+    /// "blank worktree" matches an empty query and the literal "blank".
+    pub fn refilter(&mut self) {
+        let query = self.query.to_lowercase();
+        let mut ranked: Vec<(usize, u8)> = self
+            .options
+            .iter()
+            .enumerate()
+            .filter_map(|(i, choice)| {
+                rank_text(&choice.label().to_lowercase(), &query).map(|r| (i, r))
+            })
+            .collect();
+        ranked.sort_by_key(|&(_, r)| r);
+        self.filtered = ranked.into_iter().map(|(i, _)| i).collect();
+        self.cursor = 0;
+    }
+
+    /// Move the cursor by `delta`, clamped to `[0, filtered.len() - 1]`.
+    pub fn move_cursor(&mut self, delta: i32) {
+        if self.filtered.is_empty() {
+            self.cursor = 0;
+            return;
+        }
+        let max = self.filtered.len() as i32 - 1;
+        let next = (self.cursor as i32 + delta).clamp(0, max);
+        self.cursor = next as usize;
+    }
+
+    /// The currently highlighted choice, if any.
+    pub fn selected(&self) -> Option<&WorktreeChoice> {
+        let opt_idx = *self.filtered.get(self.cursor)?;
+        self.options.get(opt_idx)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -323,13 +455,15 @@ mod tests {
             AddressPrComments,
             CheckCi,
             ToggleAutoContinue,
+            NewWorktree,
+            RenameWorktree,
         ];
         // Exhaustive match: a new variant forces a compile error here.
         for id in all {
             match id {
                 SwitchView | ToggleHelp | Quit | StopDaemon | NewPrompt | EditPrompt
                 | FilterPrompts | RefreshWorktrees | RunCustomPrompt | AddressPrComments
-                | CheckCi | ToggleAutoContinue => {}
+                | CheckCi | ToggleAutoContinue | NewWorktree | RenameWorktree => {}
             }
         }
         all.to_vec()
@@ -473,5 +607,75 @@ mod tests {
         p.query = "zzzzznomatch".to_string();
         p.refilter();
         assert_eq!(p.selected(), None);
+    }
+
+    // ── NewWorktreeModal ──────────────────────────────────────────────────────
+
+    fn modal_with(prompts: &[(&str, &str)]) -> NewWorktreeModal {
+        let choices: Vec<(String, String, String)> = prompts
+            .iter()
+            .map(|(slug, title)| {
+                (
+                    (*slug).to_string(),
+                    (*title).to_string(),
+                    format!("body of {slug}"),
+                )
+            })
+            .collect();
+        NewWorktreeModal::new(choices)
+    }
+
+    #[test]
+    fn modal_blank_always_first_and_present() {
+        let m = modal_with(&[("refactor", "Refactor parser")]);
+        assert_eq!(m.options[0], WorktreeChoice::Blank);
+        assert_eq!(m.options.len(), 2);
+        // Empty query keeps everything, blank first.
+        assert_eq!(m.selected(), Some(&WorktreeChoice::Blank));
+    }
+
+    #[test]
+    fn modal_filters_by_title() {
+        let mut m = modal_with(&[("refactor", "Refactor parser"), ("docs", "Write docs")]);
+        m.query = "docs".to_string();
+        m.refilter();
+        let sel = m.selected().expect("a match");
+        match sel {
+            WorktreeChoice::Prompt { slug, .. } => assert_eq!(slug, "docs"),
+            other => panic!("expected docs prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn modal_blank_matches_literal_blank_query() {
+        let mut m = modal_with(&[("refactor", "Refactor parser")]);
+        m.query = "blank".to_string();
+        m.refilter();
+        assert_eq!(m.selected(), Some(&WorktreeChoice::Blank));
+    }
+
+    #[test]
+    fn modal_selecting_prompt_choice() {
+        let mut m = modal_with(&[("refactor", "Refactor parser")]);
+        m.query = "refactor".to_string();
+        m.refilter();
+        m.move_cursor(0);
+        let sel = m.selected().expect("match");
+        match sel {
+            WorktreeChoice::Prompt { slug, title, body } => {
+                assert_eq!(slug, "refactor");
+                assert_eq!(title, "Refactor parser");
+                assert_eq!(body, "body of refactor");
+            }
+            other => panic!("expected prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn modal_no_match_selects_none() {
+        let mut m = modal_with(&[("refactor", "Refactor parser")]);
+        m.query = "zzzznope".to_string();
+        m.refilter();
+        assert_eq!(m.selected(), None);
     }
 }

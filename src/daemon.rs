@@ -34,7 +34,7 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 
 use crate::agent::session::{run_session, StatusUpdate};
 use crate::agent::{
-    agent_status_to_worktree_status, claude_code::ClaudeCodeBackend, mock::MockBackend,
+    agent_status_to_worktree_status, configured::ConfiguredBackend, mock::MockBackend,
     AgentBackend, AgentStatus,
 };
 use crate::app::AppEvent;
@@ -43,6 +43,7 @@ use crate::github::commands::{build_address_pr_comments_prompt, build_check_ci_p
 use crate::github::pr::pr_for_current_branch;
 use crate::github::{GhRunner, RealGh};
 use crate::ipc::{self, BuiltinKind, ClientMsg, HandshakeReq, HandshakeResp, SupervisorMsg};
+use crate::project_config::ProjectConfig;
 use crate::watcher::{spawn_watcher, WatchItem, WatcherConfig};
 use crate::worktree::{state, WorktreeManager, WorktreeStatus};
 
@@ -103,6 +104,7 @@ pub struct Shared {
     pub manager: WorktreeManager,
     pub repo_root: PathBuf,
     pub config: Config,
+    pub project_config: ProjectConfig,
     pub events: broadcast::Sender<SupervisorMsg>,
     pub watch_set: Arc<Mutex<Vec<WatchItem>>>,
 }
@@ -231,12 +233,28 @@ async fn serve() -> Result<()> {
 
     tracing::info!(pid = std::process::id(), "supervisor daemon starting");
 
+    // Boot guard: refuse to start (and refuse to steal the socket) if another
+    // daemon is already alive.  We test the pidfile's PID with signal 0 — if it
+    // is still running, a healthy daemon owns the socket, so we exit cleanly
+    // WITHOUT touching the socket or pidfile.
+    if let Some(pid) = ipc::read_pidfile(&pidfile) {
+        if pid_is_alive(pid) && pid != std::process::id() as i32 {
+            tracing::warn!(
+                existing_pid = pid,
+                "daemon: another supervisor is already running — exiting without binding"
+            );
+            // Flush tracing before exit.
+            drop(_tracing_guard);
+            std::process::exit(0);
+        }
+    }
+
     // Write the pidfile.
     if let Err(e) = std::fs::write(&pidfile, std::process::id().to_string()) {
         tracing::warn!("daemon: failed to write pidfile {}: {e}", pidfile.display());
     }
 
-    // Remove a stale socket file, then bind.
+    // Remove a stale socket file (no live daemon owns it), then bind.
     if sock_path.exists() {
         let _ = std::fs::remove_file(&sock_path);
     }
@@ -247,7 +265,8 @@ async fn serve() -> Result<()> {
     // Construct Shared.
     let config = Config::load();
     let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let (backend, backend_name) = select_backend(&config.claude_bin);
+    let project_cfg = ProjectConfig::load(&repo_root);
+    let (backend, backend_name) = select_backend(project_cfg.clone());
     tracing::info!("daemon: agent backend = {backend_name}");
     let gh: Arc<dyn GhRunner> = Arc::new(RealGh {
         bin: config.gh_bin.clone(),
@@ -264,6 +283,7 @@ async fn serve() -> Result<()> {
         manager,
         repo_root,
         config,
+        project_config: project_cfg,
         events,
         watch_set,
     });
@@ -289,6 +309,13 @@ async fn serve() -> Result<()> {
     // Shutdown signalling: a ClientMsg::Shutdown handler sets this; the select
     // loop observes it, aborts the watcher, flushes, and exits the process.
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+
+    // OS signal streams for clean stop (SIGTERM from `--stop-daemon` /
+    // `kill <pid>`, SIGINT from Ctrl-C if attached to a terminal).
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to install SIGTERM handler")?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("failed to install SIGINT handler")?;
 
     loop {
         tokio::select! {
@@ -317,18 +344,72 @@ async fn serve() -> Result<()> {
 
             // Shutdown requested by a client.
             _ = shutdown_rx.recv() => {
-                tracing::info!("daemon: shutdown requested — stopping");
-                let _ = watcher_shutdown_tx.send(true);
-                watcher_handle.abort();
-                // Best-effort cleanup of socket + pidfile.
-                let _ = std::fs::remove_file(&sock_path);
-                let _ = std::fs::remove_file(&pidfile);
-                // Flush tracing by dropping the guard, then exit.
-                drop(_tracing_guard);
-                std::process::exit(0);
+                graceful_shutdown(
+                    "client request",
+                    &watcher_shutdown_tx,
+                    &watcher_handle,
+                    &sock_path,
+                    &pidfile,
+                    _tracing_guard,
+                );
+            }
+
+            // SIGTERM → clean stop.
+            _ = sigterm.recv() => {
+                graceful_shutdown(
+                    "SIGTERM",
+                    &watcher_shutdown_tx,
+                    &watcher_handle,
+                    &sock_path,
+                    &pidfile,
+                    _tracing_guard,
+                );
+            }
+
+            // SIGINT → clean stop.
+            _ = sigint.recv() => {
+                graceful_shutdown(
+                    "SIGINT",
+                    &watcher_shutdown_tx,
+                    &watcher_handle,
+                    &sock_path,
+                    &pidfile,
+                    _tracing_guard,
+                );
             }
         }
     }
+}
+
+/// Test whether `pid` is alive by sending signal 0 (`kill(pid, None)`), which
+/// performs permission/existence checks without delivering a signal.
+fn pid_is_alive(pid: i32) -> bool {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+}
+
+/// Perform the daemon's graceful shutdown and terminate the process.
+///
+/// Single reusable routine for every shutdown trigger (client `Shutdown`,
+/// SIGTERM, SIGINT): signal the watcher to stop, abort its task, remove the
+/// socket + pidfile, flush tracing by consuming the guard, then `exit(0)`.
+/// Diverges (`-> !`) so `select!` arms need no fallthrough.
+fn graceful_shutdown(
+    reason: &str,
+    watcher_shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    watcher_handle: &tokio::task::JoinHandle<()>,
+    sock_path: &Path,
+    pidfile: &Path,
+    tracing_guard: tracing_appender::non_blocking::WorkerGuard,
+) -> ! {
+    tracing::info!("daemon: shutdown requested ({reason}) — stopping");
+    let _ = watcher_shutdown_tx.send(true);
+    watcher_handle.abort();
+    // Best-effort cleanup of socket + pidfile.
+    let _ = std::fs::remove_file(sock_path);
+    let _ = std::fs::remove_file(pidfile);
+    // Flush tracing by dropping the guard, then exit.
+    drop(tracing_guard);
+    std::process::exit(0);
 }
 
 /// Initialise tracing to a single (non-rolling) logfile for the daemon.
@@ -550,12 +631,17 @@ async fn handle_client_msg(shared: &Arc<Shared>, msg: ClientMsg) {
         ClientMsg::SetPrNumber { worktree_path, pr } => {
             set_pr_number(shared, &worktree_path, pr).await;
         }
-        ClientMsg::CreateWorktree {
+        ClientMsg::NewWorktree {
             prompt_slug,
-            branch,
-            path,
+            prompt_body,
         } => {
-            create_worktree(shared, prompt_slug, branch, path).await;
+            new_worktree(shared, prompt_slug, prompt_body).await;
+        }
+        ClientMsg::SetWorktreeName {
+            worktree_path,
+            name,
+        } => {
+            set_worktree_name(shared, &worktree_path, name).await;
         }
         ClientMsg::RemoveWorktree { path, force } => {
             remove_worktree(shared, &path, force).await;
@@ -779,29 +865,93 @@ async fn set_pr_number(shared: &Arc<Shared>, path: &Path, pr: Option<u64>) {
     });
 }
 
-/// `CreateWorktree` — create via the manager, refresh registry, broadcast.
-async fn create_worktree(
+/// `NewWorktree` — generate a fresh UUID directory under the configured base,
+/// create a detached worktree there, record the prompt slug + name, refresh the
+/// registry, and broadcast.  When `prompt_body` is `Some`, additionally drive
+/// the agent on the new worktree (same path as `RunPrompt`).
+async fn new_worktree(
     shared: &Arc<Shared>,
     prompt_slug: Option<String>,
-    branch: String,
-    path: PathBuf,
+    prompt_body: Option<String>,
 ) {
-    match shared.manager.create(prompt_slug, &branch, &path) {
-        Ok(_) => {
-            let snapshot = shared.rebuild_registry().await;
-            shared.rebuild_watch_set().await;
-            shared.broadcast(SupervisorMsg::Snapshot {
-                worktrees: snapshot,
-            });
-        }
+    let base = shared.project_config.worktrees_base(&shared.repo_root);
+    if let Err(e) = std::fs::create_dir_all(&base) {
+        tracing::warn!("daemon: cannot create worktrees base {:?}: {e}", base);
+        shared.broadcast(SupervisorMsg::Error {
+            worktree_path: None,
+            message: format!("cannot create worktrees base {}: {e}", base.display()),
+        });
+        return;
+    }
+    let path = base.join(uuid::Uuid::new_v4().to_string());
+
+    let created = match shared.manager.create_detached(&path) {
+        Ok(wt) => wt,
         Err(e) => {
-            tracing::warn!("daemon: create worktree failed: {e}");
+            tracing::warn!("daemon: create detached worktree failed: {e}");
             shared.broadcast(SupervisorMsg::Error {
                 worktree_path: None,
                 message: format!("{e}"),
             });
+            return;
+        }
+    };
+    let canonical = created.path.clone();
+
+    // Record the prompt slug onto the persisted state (name stays "Unnamed").
+    if prompt_slug.is_some() {
+        match state::load(&shared.repo_root) {
+            Ok(mut st) => {
+                if let Some(w) = st.worktrees.iter_mut().find(|w| w.path == canonical) {
+                    w.prompt_slug = prompt_slug.clone();
+                }
+                if let Err(e) = state::save(&shared.repo_root, &st) {
+                    tracing::warn!("daemon: failed to persist new worktree prompt_slug: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("daemon: failed to load state for new worktree: {e}"),
         }
     }
+
+    let snapshot = shared.rebuild_registry().await;
+    shared.rebuild_watch_set().await;
+    shared.broadcast(SupervisorMsg::Snapshot {
+        worktrees: snapshot,
+    });
+
+    // Optionally run the prompt body on the freshly-created worktree.
+    if let Some(body) = prompt_body {
+        if !body.trim().is_empty() {
+            run_prompt(Arc::clone(shared), canonical, body).await;
+        }
+    }
+}
+
+/// `SetWorktreeName` — update the supervisor name dictionary (registry + state),
+/// then broadcast a fresh Snapshot.
+async fn set_worktree_name(shared: &Arc<Shared>, path: &Path, name: String) {
+    {
+        let mut reg = shared.registry.lock().await;
+        if let Some(view) = reg.worktrees.get_mut(path) {
+            view.name = name.clone();
+        }
+    }
+    match state::load(&shared.repo_root) {
+        Ok(mut st) => {
+            st.set_name(path, name);
+            if let Err(e) = state::save(&shared.repo_root, &st) {
+                tracing::warn!("daemon: failed to persist worktree name: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("daemon: failed to load state for name update: {e}"),
+    }
+    let snapshot = {
+        let reg = shared.registry.lock().await;
+        reg.snapshot()
+    };
+    shared.broadcast(SupervisorMsg::Snapshot {
+        worktrees: snapshot,
+    });
 }
 
 /// `RemoveWorktree` — remove via the manager, refresh registry, broadcast.
@@ -825,29 +975,34 @@ async fn remove_worktree(shared: &Arc<Shared>, path: &Path, force: bool) {
 }
 
 // ---------------------------------------------------------------------------
-// Backend selection (mirrors app.rs)
+// Backend selection
 // ---------------------------------------------------------------------------
 
-/// Choose the active agent backend at startup: real `claude` if on PATH, else
-/// the offline mock.
-fn select_backend(claude_bin: &str) -> (Arc<dyn AgentBackend>, &'static str) {
-    if claude_on_path(claude_bin) {
-        tracing::info!("daemon: agent backend ClaudeCodeBackend ({claude_bin} found on PATH)");
+/// Choose the active agent backend at startup.
+///
+/// Uses the project config's `agent.command`.  If that command is runnable
+/// (found on PATH via `--version` probe), returns a [`ConfiguredBackend`];
+/// otherwise falls back to [`MockBackend`] with a warning.
+fn select_backend(project_cfg: ProjectConfig) -> (Arc<dyn AgentBackend>, &'static str) {
+    let command = &project_cfg.agent.command;
+    if command_on_path(command) {
+        tracing::info!("daemon: agent backend ConfiguredBackend ({command} found on PATH)");
         (
-            Arc::new(ClaudeCodeBackend {
-                bin: claude_bin.to_string(),
+            Arc::new(ConfiguredBackend {
+                agent: project_cfg.agent,
             }),
-            "ClaudeCode",
+            "Configured",
         )
     } else {
-        tracing::warn!("daemon: agent backend MockBackend ({claude_bin} not found on PATH)");
+        tracing::warn!("daemon: agent backend MockBackend ({command} not found on PATH)");
         (Arc::new(MockBackend::new()), "Mock")
     }
 }
 
-fn claude_on_path(bin: &str) -> bool {
+/// Best-effort check: run `<command> --version` and see if it exits cleanly.
+fn command_on_path(command: &str) -> bool {
     use std::process::Command;
-    Command::new(bin)
+    Command::new(command)
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1023,6 +1178,7 @@ mod tests {
             manager,
             repo_root: root,
             config: Config::default(),
+            project_config: ProjectConfig::default(),
             events,
             watch_set: Arc::new(Mutex::new(Vec::new())),
         })
@@ -1038,6 +1194,7 @@ mod tests {
     ) {
         let wt = crate::worktree::model::Worktree {
             path: path.to_path_buf(),
+            name: "Unnamed".to_string(),
             branch: "feat".to_string(),
             prompt_slug: None,
             pr_number: pr,
@@ -1201,6 +1358,118 @@ mod tests {
             reg.worktrees.contains_key(&canonical),
             "refresh should pick up the created worktree; got {:?}",
             reg.worktrees.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // -- NewWorktree ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn new_worktree_blank_creates_detached_unnamed_under_base() {
+        let (_dir, root) = make_temp_repo();
+        let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
+        let shared = make_shared(root.clone(), gh);
+
+        handle_client_msg(
+            &shared,
+            ClientMsg::NewWorktree {
+                prompt_slug: None,
+                prompt_body: None,
+            },
+        )
+        .await;
+
+        let base = root.join(".karazhan").join("worktrees");
+        let reg = shared.registry.lock().await;
+        let created: Vec<_> = reg
+            .worktrees
+            .values()
+            .filter(|v| {
+                v.path
+                    .starts_with(base.canonicalize().unwrap_or(base.clone()))
+            })
+            .collect();
+        assert_eq!(created.len(), 1, "exactly one new worktree under the base");
+        let wt = created[0];
+        assert_eq!(wt.name, "Unnamed");
+        assert_eq!(wt.branch, "HEAD");
+        assert!(wt.prompt_slug.is_none());
+
+        // The directory name is a parseable UUID v4.
+        let dir_name = wt.path.file_name().unwrap().to_string_lossy();
+        assert!(
+            uuid::Uuid::parse_str(&dir_name).is_ok(),
+            "dir name should be a uuid, got {dir_name}"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_worktree_with_prompt_drives_agent_to_running() {
+        let (_dir, root) = make_temp_repo();
+        let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
+        let shared = make_shared(root.clone(), gh);
+
+        let mut sub = shared.events.subscribe();
+
+        handle_client_msg(
+            &shared,
+            ClientMsg::NewWorktree {
+                prompt_slug: Some("refactor".to_string()),
+                prompt_body: Some("do the refactor".to_string()),
+            },
+        )
+        .await;
+
+        // Expect: the Snapshot after creation, then a Running StatusChanged.
+        let mut saw_running = false;
+        for _ in 0..6 {
+            match tokio::time::timeout(Duration::from_secs(2), sub.recv()).await {
+                Ok(Ok(SupervisorMsg::StatusChanged {
+                    status: WorktreeStatus::Running,
+                    ..
+                })) => {
+                    saw_running = true;
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(saw_running, "expected Running status from the new worktree");
+
+        // The prompt slug is recorded on the new worktree.
+        let reg = shared.registry.lock().await;
+        let slug = reg.worktrees.values().find_map(|v| v.prompt_slug.clone());
+        assert_eq!(slug.as_deref(), Some("refactor"));
+    }
+
+    // -- SetWorktreeName ------------------------------------------------------
+
+    #[tokio::test]
+    async fn set_worktree_name_updates_registry_and_state() {
+        let (_dir, root) = make_temp_repo();
+        let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
+        let shared = make_shared(root.clone(), gh);
+
+        let path = PathBuf::from("/tmp/name-wt");
+        seed_worktree(&shared, &path, false, None).await;
+
+        handle_client_msg(
+            &shared,
+            ClientMsg::SetWorktreeName {
+                worktree_path: path.clone(),
+                name: "renamed".to_string(),
+            },
+        )
+        .await;
+
+        {
+            let reg = shared.registry.lock().await;
+            assert_eq!(reg.worktrees.get(&path).unwrap().name, "renamed");
+        }
+        let st = state::load(&root).expect("load");
+        assert_eq!(
+            st.worktrees.iter().find(|w| w.path == path).unwrap().name,
+            "renamed"
         );
     }
 

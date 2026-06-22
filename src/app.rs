@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
 use crate::client::SupervisorClient;
-use crate::commands::{self, CommandId, Palette};
+use crate::commands::{self, CommandId, NewWorktreeModal, Palette, WorktreeChoice};
 use crate::config::Config;
 use crate::ipc::{BuiltinKind, ClientMsg, WorktreeView};
 use crate::prompts::PromptStore;
@@ -74,6 +74,8 @@ pub enum GridMode {
     Normal,
     /// Typing a free-text prompt to run against the selected worktree.
     PromptInput,
+    /// Typing a new name for the selected worktree.
+    NameInput,
 }
 
 pub struct App {
@@ -102,6 +104,8 @@ pub struct App {
     pending_edit: Option<PathBuf>,
     /// Command palette modal; `Some` while open (Ctrl-P).  Intercepts all keys.
     palette: Option<Palette>,
+    /// New-worktree modal; `Some` while open (`n` in Grid).  Intercepts all keys.
+    new_worktree: Option<NewWorktreeModal>,
 }
 
 impl App {
@@ -130,6 +134,7 @@ impl App {
             show_help: false,
             pending_edit: None,
             palette: None,
+            new_worktree: None,
         }
     }
 
@@ -180,6 +185,11 @@ impl App {
                 // Render the command palette on top of everything else.
                 if let Some(palette) = &self.palette {
                     crate::ui::palette::render_palette(frame, area, palette);
+                }
+
+                // Render the new-worktree modal last (above palette/help).
+                if let Some(modal) = &self.new_worktree {
+                    crate::ui::palette::render_new_worktree(frame, area, modal);
                 }
             })?;
 
@@ -279,6 +289,12 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn build_status_text(&self) -> String {
+        if self.grid_mode == GridMode::NameInput {
+            return format!(
+                "[daemon]  rename worktree: {}█  Enter: save  Esc: cancel",
+                self.prompt_input
+            );
+        }
         if let Some(ref msg) = self.status_message {
             return format!("[daemon]  {msg}");
         }
@@ -304,6 +320,12 @@ impl App {
             // Command palette: while open it intercepts ALL keys.
             if self.palette.is_some() {
                 self.handle_palette_key(code, modifiers).await;
+                return;
+            }
+
+            // New-worktree modal: while open it intercepts ALL keys.
+            if self.new_worktree.is_some() {
+                self.handle_new_worktree_key(code, modifiers).await;
                 return;
             }
 
@@ -406,6 +428,75 @@ impl App {
         }
     }
 
+    /// Handle a key while the new-worktree modal is open.  Mirrors the palette:
+    /// navigation, query editing, create (Enter), cancel (Esc).
+    async fn handle_new_worktree_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+
+        if ctrl {
+            match code {
+                KeyCode::Char('n') => {
+                    if let Some(m) = self.new_worktree.as_mut() {
+                        m.move_cursor(1);
+                    }
+                    return;
+                }
+                KeyCode::Char('p') => {
+                    if let Some(m) = self.new_worktree.as_mut() {
+                        m.move_cursor(-1);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        match code {
+            KeyCode::Esc => {
+                self.new_worktree = None;
+            }
+            KeyCode::Down => {
+                if let Some(m) = self.new_worktree.as_mut() {
+                    m.move_cursor(1);
+                }
+            }
+            KeyCode::Up => {
+                if let Some(m) = self.new_worktree.as_mut() {
+                    m.move_cursor(-1);
+                }
+            }
+            KeyCode::Enter => {
+                let choice = self.new_worktree.take().and_then(|m| m.selected().cloned());
+                if let Some(choice) = choice {
+                    let (prompt_slug, prompt_body) = match choice {
+                        WorktreeChoice::Blank => (None, None),
+                        WorktreeChoice::Prompt { slug, body, .. } => (Some(slug), Some(body)),
+                    };
+                    self.client
+                        .send(ClientMsg::NewWorktree {
+                            prompt_slug,
+                            prompt_body,
+                        })
+                        .await;
+                    self.set_status("creating worktree…");
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(m) = self.new_worktree.as_mut() {
+                    m.query.pop();
+                    m.refilter();
+                }
+            }
+            KeyCode::Char(ch) if !ctrl => {
+                if let Some(m) = self.new_worktree.as_mut() {
+                    m.query.push(ch);
+                    m.refilter();
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Run a command.  Single implementation per command, shared by both the
     /// palette and the inline key handlers.
     ///
@@ -473,6 +564,21 @@ impl App {
                 self.view = View::Grid;
                 self.send_toggle_auto_continue().await;
             }
+            CommandId::NewWorktree => {
+                self.view = View::Grid;
+                let mut modal = NewWorktreeModal::new(self.library.all_prompt_choices());
+                modal.refilter();
+                self.new_worktree = Some(modal);
+            }
+            CommandId::RenameWorktree => {
+                self.view = View::Grid;
+                if self.selected_worktree_path().is_some() {
+                    self.grid_mode = GridMode::NameInput;
+                    self.prompt_input.clear();
+                } else {
+                    self.set_status("no worktree selected");
+                }
+            }
         }
     }
 
@@ -536,6 +642,29 @@ impl App {
     // -----------------------------------------------------------------------
 
     async fn handle_grid_key(&mut self, code: KeyCode) {
+        // Name-input sub-mode intercepts all keys first.
+        if self.grid_mode == GridMode::NameInput {
+            match code {
+                KeyCode::Esc => {
+                    self.grid_mode = GridMode::Normal;
+                    self.prompt_input.clear();
+                }
+                KeyCode::Enter => {
+                    let name = std::mem::take(&mut self.prompt_input);
+                    self.grid_mode = GridMode::Normal;
+                    if !name.trim().is_empty() {
+                        self.send_set_worktree_name(name).await;
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.prompt_input.pop();
+                }
+                KeyCode::Char(ch) => self.prompt_input.push(ch),
+                _ => {}
+            }
+            return;
+        }
+
         // Prompt-input sub-mode intercepts all keys first.
         if self.grid_mode == GridMode::PromptInput {
             match code {
@@ -628,6 +757,16 @@ impl App {
                 self.execute_command(CommandId::ToggleAutoContinue).await;
             }
 
+            KeyCode::Char('n') => {
+                self.grid.clear_pending_count();
+                self.execute_command(CommandId::NewWorktree).await;
+            }
+
+            KeyCode::Char('N') => {
+                self.grid.clear_pending_count();
+                self.execute_command(CommandId::RenameWorktree).await;
+            }
+
             // Shift-Q stops the daemon entirely (sessions + watcher), then quits.
             KeyCode::Char('Q') => {
                 self.grid.clear_pending_count();
@@ -671,6 +810,19 @@ impl App {
             .send(ClientMsg::RunBuiltin {
                 worktree_path,
                 kind,
+            })
+            .await;
+    }
+
+    async fn send_set_worktree_name(&mut self, name: String) {
+        let Some(wt) = self.worktrees.get(self.grid.selected) else {
+            return;
+        };
+        let worktree_path = wt.path.clone();
+        self.client
+            .send(ClientMsg::SetWorktreeName {
+                worktree_path,
+                name,
             })
             .await;
     }

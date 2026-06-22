@@ -104,6 +104,8 @@ fn help_lines() -> Vec<Line<'static>> {
             desc,
         ),
         kv("a       ", "toggle auto-continue on PR merge", key, desc),
+        kv("n       ", "new worktree (blank or from prompt)", key, desc),
+        kv("N       ", "rename worktree", key, desc),
         kv("r       ", "refresh worktree list", key, desc),
         kv(
             "Q       ",

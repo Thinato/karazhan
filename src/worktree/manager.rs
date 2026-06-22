@@ -83,8 +83,63 @@ impl WorktreeManager {
 
         let worktree = Worktree {
             path: canonical_path,
+            name: super::model::default_name(),
             branch: branch.to_string(),
             prompt_slug,
+            pr_number: None,
+            auto_continue_on_merge: false,
+            status: super::model::WorktreeStatus::Idle,
+        };
+
+        // Persist to state.
+        let mut st = state::load(&self.repo_root)?;
+        st.upsert_worktree(worktree.clone());
+        state::save(&self.repo_root, &st)?;
+
+        Ok(worktree)
+    }
+
+    // -----------------------------------------------------------------------
+    // create_detached
+    // -----------------------------------------------------------------------
+
+    /// Create a new *detached* git worktree at `path` (no branch).
+    ///
+    /// Runs `git worktree add --detach <path>`, creating the parent directory
+    /// first if needed.  On success the worktree is registered in
+    /// `.karazhan/state.toml` with name "Unnamed", no prompt slug, the parsed
+    /// branch label (detached → "HEAD"), and `Idle` status.
+    pub fn create_detached(&self, path: &Path) -> Result<Worktree> {
+        // Ensure the parent directory exists; git refuses if it is missing.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create worktree parent dir {:?}", parent))?;
+        }
+
+        let output = Command::new("git")
+            .args(["worktree", "add", "--detach"])
+            .arg(path)
+            .current_dir(&self.repo_root)
+            .output()
+            .context("failed to run git worktree add --detach")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("git worktree add --detach failed: {stderr}");
+        }
+
+        // Canonicalize now that the directory exists (matches `create`).
+        let canonical_path = path
+            .canonicalize()
+            .with_context(|| format!("cannot canonicalize worktree path {:?}", path))?;
+
+        let worktree = Worktree {
+            path: canonical_path,
+            name: super::model::default_name(),
+            // Detached worktrees have no branch; the porcelain parser reports
+            // "HEAD" for these, so mirror that here for consistency.
+            branch: "HEAD".to_string(),
+            prompt_slug: None,
             pr_number: None,
             auto_continue_on_merge: false,
             status: super::model::WorktreeStatus::Idle,
@@ -131,6 +186,7 @@ impl WorktreeManager {
         // Overlay persisted metadata onto live worktrees.
         for wt in &mut live {
             if let Some(persisted) = st.worktrees.iter().find(|p| p.path == wt.path) {
+                wt.name = persisted.name.clone();
                 wt.prompt_slug = persisted.prompt_slug.clone();
                 wt.pr_number = persisted.pr_number;
                 wt.auto_continue_on_merge = persisted.auto_continue_on_merge;
@@ -347,6 +403,37 @@ mod tests {
             "new worktree should appear in list; got: {:?}",
             list.iter().map(|w| &w.path).collect::<Vec<_>>()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // create_detached
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn create_detached_appears_in_list_detached() {
+        let (_dir, root) = make_temp_repo();
+        // Place the detached worktree under a not-yet-existing subdir so we also
+        // exercise the create_dir_all parent path.
+        let base = tempfile::tempdir().expect("base tempdir");
+        let wt_path = base.path().join("nested").join("uuid-dir");
+
+        let mgr = WorktreeManager::new(&root);
+        let wt = mgr.create_detached(&wt_path).expect("create_detached");
+
+        assert_eq!(wt.name, "Unnamed");
+        assert_eq!(wt.prompt_slug, None);
+        assert_eq!(wt.branch, "HEAD");
+        assert!(wt_path.exists(), "detached worktree dir should exist");
+
+        let canonical_wt = wt_path.canonicalize().expect("canonicalize");
+        let list = mgr.list().expect("list");
+        let found = list
+            .iter()
+            .find(|w| w.path == canonical_wt)
+            .expect("detached worktree should appear in list");
+        // A detached worktree carries the "HEAD" branch label from porcelain.
+        assert_eq!(found.branch, "HEAD");
+        assert_eq!(found.name, "Unnamed");
     }
 
     // -----------------------------------------------------------------------
