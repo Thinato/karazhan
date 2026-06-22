@@ -73,10 +73,11 @@ fn install_panic_hook() {
 }
 
 fn init_tracing() -> Result<tracing_appender::non_blocking::WorkerGuard> {
-    // Write logs to .karazhan/karazhan.log (rolling daily) so tracing output
-    // never corrupts the TUI on stdout/stderr.
-    std::fs::create_dir_all(".karazhan")?;
-    let file_appender = rolling::daily(".karazhan", "karazhan.log");
+    // Write logs to .karazhan/logs/karazhan.log (rolling daily) so tracing
+    // output never corrupts the TUI on stdout/stderr.  Kept in a `logs/`
+    // subdir so users can gitignore just `.karazhan/logs/`.
+    std::fs::create_dir_all(".karazhan/logs")?;
+    let file_appender = rolling::daily(".karazhan/logs", "karazhan.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     tracing_subscriber::registry()

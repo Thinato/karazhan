@@ -1,3 +1,6 @@
 .omc
 /target
 
+# karazhan runtime logs
+.karazhan/logs/
+
