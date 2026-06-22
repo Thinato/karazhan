@@ -50,7 +50,13 @@ impl SupervisorClient {
 /// consumes.  Pure (no I/O) so it can be unit-tested.
 pub fn supervisor_msg_to_app_event(msg: SupervisorMsg) -> AppEvent {
     match msg {
-        SupervisorMsg::Snapshot { worktrees } => AppEvent::Snapshot { worktrees },
+        SupervisorMsg::Snapshot {
+            projects,
+            worktrees,
+        } => AppEvent::Snapshot {
+            projects,
+            worktrees,
+        },
         SupervisorMsg::StatusChanged {
             worktree_path,
             status,
@@ -89,8 +95,19 @@ pub async fn connect(event_tx: mpsc::Sender<AppEvent>) -> Result<SupervisorClien
             read_half,
             write_half,
             supervisor_pid,
+            projects,
             worktrees,
-        } => finish_connect(event_tx, read_half, write_half, supervisor_pid, worktrees).await,
+        } => {
+            finish_connect(
+                event_tx,
+                read_half,
+                write_half,
+                supervisor_pid,
+                projects,
+                worktrees,
+            )
+            .await
+        }
         HandshakeOutcome::Mismatch => {
             // Stale daemon (or undecodable handshake): stop it, respawn, retry once.
             stop_running_daemon().await?;
@@ -101,9 +118,18 @@ pub async fn connect(event_tx: mpsc::Sender<AppEvent>) -> Result<SupervisorClien
                     read_half,
                     write_half,
                     supervisor_pid,
+                    projects,
                     worktrees,
                 } => {
-                    finish_connect(event_tx, read_half, write_half, supervisor_pid, worktrees).await
+                    finish_connect(
+                        event_tx,
+                        read_half,
+                        write_half,
+                        supervisor_pid,
+                        projects,
+                        worktrees,
+                    )
+                    .await
                 }
                 HandshakeOutcome::Mismatch => bail!(
                     "protocol mismatch persisted after restarting the daemon: client speaks \
@@ -121,6 +147,7 @@ enum HandshakeOutcome {
         read_half: tokio::net::unix::OwnedReadHalf,
         write_half: tokio::net::unix::OwnedWriteHalf,
         supervisor_pid: u32,
+        projects: Vec<String>,
         worktrees: Vec<ipc::WorktreeView>,
     },
     /// Version mismatch OR an undecodable handshake reply (treat the same):
@@ -167,11 +194,13 @@ async fn connect_once(sock_path: &std::path::Path) -> Result<HandshakeOutcome> {
     match ipc::read_frame_async::<_, HandshakeResp>(&mut read_half).await {
         Ok(HandshakeResp::Ok {
             supervisor_pid,
+            projects,
             worktrees,
         }) => Ok(HandshakeOutcome::Ok {
             read_half,
             write_half,
             supervisor_pid,
+            projects,
             worktrees,
         }),
         Ok(HandshakeResp::ProtocolMismatch { supervisor }) => {
@@ -198,10 +227,16 @@ async fn finish_connect(
     mut read_half: tokio::net::unix::OwnedReadHalf,
     mut write_half: tokio::net::unix::OwnedWriteHalf,
     supervisor_pid: u32,
+    projects: Vec<String>,
     worktrees: Vec<ipc::WorktreeView>,
 ) -> Result<SupervisorClient> {
     // Seed the UI with current state immediately.
-    let _ = event_tx.send(AppEvent::Snapshot { worktrees }).await;
+    let _ = event_tx
+        .send(AppEvent::Snapshot {
+            projects,
+            worktrees,
+        })
+        .await;
 
     tracing::info!(supervisor_pid, "client: attached to supervisor");
 
@@ -329,11 +364,19 @@ mod tests {
             status: WorktreeStatus::Idle,
             last_summary: None,
         }];
+        let projects = vec!["proj".to_string(), "empty".to_string()];
         let event = supervisor_msg_to_app_event(SupervisorMsg::Snapshot {
+            projects: projects.clone(),
             worktrees: views.clone(),
         });
         match event {
-            AppEvent::Snapshot { worktrees } => assert_eq!(worktrees, views),
+            AppEvent::Snapshot {
+                projects: got_projects,
+                worktrees,
+            } => {
+                assert_eq!(got_projects, projects);
+                assert_eq!(worktrees, views);
+            }
             other => panic!("expected Snapshot, got {other:?}"),
         }
     }

@@ -7,9 +7,17 @@
 # if you want live per-worktree status (otherwise status stays coarse).
 
 # Base directory for worktrees created via the "new worktree" modal (key `n`).
-# Each new worktree gets a fresh UUID directory under this base. A relative
-# path is resolved against the repo root. Defaults to .karazhan/worktrees.
-# worktrees_dir = ".karazhan/worktrees"
+# Each new worktree is placed at <base>/<owner>/<project>/<uuid>/, where
+# <owner> is parsed from remote.origin.url (falls back to "local") and
+# <project> is the registry name of this repo.
+#
+# Default (unset): $XDG_DATA_HOME/karazhan/worktrees/<owner>/<project>/<uuid>/
+#                  (fallback: ~/.local/share/karazhan/worktrees/...)
+#
+# An explicit worktrees_dir is still namespaced by <owner>/<project>/<uuid>
+# underneath — the layout is consistent either way.
+# A relative path is resolved against the repo root; absolute used as-is.
+# worktrees_dir = "/some/path/outside/the/repo"
 
 [agent]
 command = "claude"

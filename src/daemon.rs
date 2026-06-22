@@ -148,6 +148,16 @@ impl Shared {
         let _ = self.events.send(msg);
     }
 
+    /// Broadcast a full `Snapshot` of `worktrees` tagged with the current ordered
+    /// project-name list (so clients can render zero-worktree projects too).
+    async fn broadcast_snapshot(&self, worktrees: Vec<ipc::WorktreeView>) {
+        let projects = self.project_names().await;
+        self.broadcast(SupervisorMsg::Snapshot {
+            projects,
+            worktrees,
+        });
+    }
+
     /// Resolve the owning project's root for a worktree `path`.
     ///
     /// First consults the registry's `project_of` map; falls back to matching
@@ -245,6 +255,17 @@ impl Shared {
         };
         let mut guard = self.watch_set.lock().await;
         *guard = items;
+    }
+
+    /// The ordered list of managed project names, in the same order the daemon
+    /// uses for the registry/grid grouping (the `projects` vec order).
+    async fn project_names(&self) -> Vec<String> {
+        self.projects
+            .lock()
+            .await
+            .iter()
+            .map(|p| p.name.clone())
+            .collect()
     }
 
     /// Re-scan worktrees across ALL projects and overlay into the registry,
@@ -647,6 +668,7 @@ async fn handle_conn(
         return Ok(());
     }
 
+    let projects = shared.project_names().await;
     let snapshot = {
         let reg = shared.registry.lock().await;
         reg.snapshot()
@@ -655,6 +677,7 @@ async fn handle_conn(
         &mut write_half,
         &HandshakeResp::Ok {
             supervisor_pid: std::process::id(),
+            projects,
             worktrees: snapshot,
         },
     )
@@ -718,9 +741,7 @@ async fn handle_client_msg(shared: &Arc<Shared>, msg: ClientMsg) {
         ClientMsg::Refresh => {
             let snapshot = shared.rebuild_registry().await;
             shared.rebuild_watch_set().await;
-            shared.broadcast(SupervisorMsg::Snapshot {
-                worktrees: snapshot,
-            });
+            shared.broadcast_snapshot(snapshot).await;
         }
         ClientMsg::RunPrompt {
             worktree_path,
@@ -972,9 +993,7 @@ async fn set_auto_continue(shared: &Arc<Shared>, path: &Path, enabled: bool) {
         let reg = shared.registry.lock().await;
         reg.snapshot()
     };
-    shared.broadcast(SupervisorMsg::Snapshot {
-        worktrees: snapshot,
-    });
+    shared.broadcast_snapshot(snapshot).await;
 }
 
 /// `SetPrNumber` — update registry + persist + refresh watch-set + Snapshot.
@@ -1006,15 +1025,14 @@ async fn set_pr_number(shared: &Arc<Shared>, path: &Path, pr: Option<u64>) {
         let reg = shared.registry.lock().await;
         reg.snapshot()
     };
-    shared.broadcast(SupervisorMsg::Snapshot {
-        worktrees: snapshot,
-    });
+    shared.broadcast_snapshot(snapshot).await;
 }
 
 /// `NewWorktree` — generate a fresh UUID directory under the configured base,
-/// create a detached worktree there, record the prompt slug + name, refresh the
-/// registry, and broadcast.  When `prompt_body` is `Some`, additionally drive
-/// the agent on the new worktree (same path as `RunPrompt`).
+/// namespaced as `<base>/<owner>/<project>/<uuid>`, create a detached worktree
+/// there, record the prompt slug + name, refresh the registry, and broadcast.
+/// When `prompt_body` is `Some`, additionally drive the agent on the new
+/// worktree (same path as `RunPrompt`).
 async fn new_worktree(
     shared: &Arc<Shared>,
     project: String,
@@ -1039,15 +1057,21 @@ async fn new_worktree(
         return;
     };
 
-    if let Err(e) = std::fs::create_dir_all(&base) {
-        tracing::warn!("daemon: cannot create worktrees base {:?}: {e}", base);
+    // Build `<base>/<owner>/<project>/<uuid>` — consistent whether the base
+    // comes from the XDG default or an explicit `worktrees_dir` override.
+    let owner = projects::git_owner(&root);
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let path = base.join(&owner).join(&project).join(&uuid);
+    let parent = path.parent().expect("path always has a parent");
+
+    if let Err(e) = std::fs::create_dir_all(parent) {
+        tracing::warn!("daemon: cannot create worktrees dir {:?}: {e}", parent);
         shared.broadcast(SupervisorMsg::Error {
             worktree_path: None,
-            message: format!("cannot create worktrees base {}: {e}", base.display()),
+            message: format!("cannot create worktrees dir {}: {e}", parent.display()),
         });
         return;
     }
-    let path = base.join(uuid::Uuid::new_v4().to_string());
 
     // Create the detached worktree using a fresh manager bound to this project's
     // root (manager is cheap; avoids holding the projects lock across git I/O).
@@ -1083,9 +1107,7 @@ async fn new_worktree(
 
     let snapshot = shared.rebuild_registry().await;
     shared.rebuild_watch_set().await;
-    shared.broadcast(SupervisorMsg::Snapshot {
-        worktrees: snapshot,
-    });
+    shared.broadcast_snapshot(snapshot).await;
 
     // Optionally run the prompt body on the freshly-created worktree.
     if let Some(body) = prompt_body {
@@ -1113,9 +1135,7 @@ async fn add_project(shared: &Arc<Shared>, path: &Path) {
             tracing::info!(project = %project.name, "daemon: added project");
             let snapshot = shared.rebuild_registry().await;
             shared.rebuild_watch_set().await;
-            shared.broadcast(SupervisorMsg::Snapshot {
-                worktrees: snapshot,
-            });
+            shared.broadcast_snapshot(snapshot).await;
         }
         Err(e) => {
             tracing::warn!("daemon: add project failed: {e}");
@@ -1153,9 +1173,7 @@ async fn set_worktree_name(shared: &Arc<Shared>, path: &Path, name: String) {
         let reg = shared.registry.lock().await;
         reg.snapshot()
     };
-    shared.broadcast(SupervisorMsg::Snapshot {
-        worktrees: snapshot,
-    });
+    shared.broadcast_snapshot(snapshot).await;
 }
 
 /// `RemoveWorktree` — remove via the manager, refresh registry, broadcast.
@@ -1173,9 +1191,7 @@ async fn remove_worktree(shared: &Arc<Shared>, path: &Path, force: bool) {
         Ok(()) => {
             let snapshot = shared.rebuild_registry().await;
             shared.rebuild_watch_set().await;
-            shared.broadcast(SupervisorMsg::Snapshot {
-                worktrees: snapshot,
-            });
+            shared.broadcast_snapshot(snapshot).await;
         }
         Err(e) => {
             tracing::warn!("daemon: remove worktree failed: {e}");
@@ -1627,27 +1643,28 @@ mod tests {
         )
         .await;
 
-        let base = root.join(".karazhan").join("worktrees");
         let reg = shared.registry.lock().await;
+        // Filter for the newly-created detached worktree (path contains /local/proj/).
         let created: Vec<_> = reg
             .worktrees
             .values()
-            .filter(|v| {
-                v.path
-                    .starts_with(base.canonicalize().unwrap_or(base.clone()))
-            })
+            .filter(|v| v.path.to_string_lossy().contains("/local/proj/"))
             .collect();
-        assert_eq!(created.len(), 1, "exactly one new worktree under the base");
+        assert_eq!(
+            created.len(),
+            1,
+            "exactly one new detached worktree under /local/proj/"
+        );
         let wt = created[0];
         assert_eq!(wt.name, "Unnamed");
         assert_eq!(wt.branch, "HEAD");
         assert!(wt.prompt_slug.is_none());
 
-        // The directory name is a parseable UUID v4.
+        // The leaf directory name is a parseable UUID v4.
         let dir_name = wt.path.file_name().unwrap().to_string_lossy();
         assert!(
             uuid::Uuid::parse_str(&dir_name).is_ok(),
-            "dir name should be a uuid, got {dir_name}"
+            "leaf dir name should be a uuid, got {dir_name}"
         );
     }
 
@@ -1927,20 +1944,73 @@ mod tests {
         )
         .await;
 
-        // The new worktree lives under beta's base + is tagged "beta".
-        let beta_base = root2
-            .join(".karazhan")
-            .join("worktrees")
-            .canonicalize()
-            .unwrap_or_else(|_| root2.join(".karazhan").join("worktrees"));
+        // The new worktree is tagged "beta" and the path contains /local/beta/
+        // (no remote → owner = "local", project = "beta").
         let reg = shared.registry.lock().await;
         let created: Vec<_> = reg
             .worktrees
             .values()
-            .filter(|v| v.path.starts_with(&beta_base))
+            .filter(|v| v.path.to_string_lossy().contains("/local/beta/"))
             .collect();
-        assert_eq!(created.len(), 1, "exactly one new worktree under beta");
+        assert_eq!(
+            created.len(),
+            1,
+            "exactly one new worktree under /local/beta/"
+        );
         assert_eq!(created[0].project, "beta");
+    }
+
+    // -- NewWorktree path shape with a real remote ----------------------------
+
+    #[tokio::test]
+    async fn new_worktree_path_contains_owner_project_uuid() {
+        let (_dir, root) = make_temp_repo();
+        // Add a fake remote so git_owner can parse it.
+        let status = std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:TestOrg/testrepo.git",
+            ])
+            .current_dir(&root)
+            .status()
+            .expect("git remote add");
+        assert!(status.success());
+
+        let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
+        let shared = make_shared(root.clone(), gh).await;
+
+        handle_client_msg(
+            &shared,
+            ClientMsg::NewWorktree {
+                project: "proj".to_string(),
+                prompt_slug: None,
+                prompt_body: None,
+            },
+        )
+        .await;
+
+        let reg = shared.registry.lock().await;
+        // Filter for the new detached worktree — path contains /TestOrg/proj/.
+        let created: Vec<_> = reg
+            .worktrees
+            .values()
+            .filter(|v| v.path.to_string_lossy().contains("/TestOrg/proj/"))
+            .collect();
+        assert_eq!(
+            created.len(),
+            1,
+            "exactly one new worktree under /TestOrg/proj/"
+        );
+        let wt = created[0];
+
+        // UUID leaf.
+        let uuid_part = wt.path.file_name().unwrap().to_string_lossy();
+        assert!(
+            uuid::Uuid::parse_str(&uuid_part).is_ok(),
+            "leaf should be a UUID, got {uuid_part}"
+        );
     }
 
     #[tokio::test]

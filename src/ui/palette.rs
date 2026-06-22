@@ -11,7 +11,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::commands::{spec, NewWorktreeModal, Palette};
+use crate::commands::{spec, NewWorktreeModal, NewWorktreePhase, Palette};
 
 /// Render the command palette over `area`.
 pub fn render_palette(frame: &mut Frame, area: Rect, palette: &Palette) {
@@ -117,16 +117,14 @@ pub fn render_palette(frame: &mut Frame, area: Rect, palette: &Palette) {
 
 /// Render the new-worktree modal over `area`.  Mirrors [`render_palette`]:
 /// centered rounded block, query line, scrollable list, footer hint.  The
-/// block title shows the target `project` when known.
-pub fn render_new_worktree(
-    frame: &mut Frame,
-    area: Rect,
-    modal: &NewWorktreeModal,
-    project: Option<&str>,
-) {
+/// title + footer + list adapt to the modal's current phase (project picker vs
+/// choice picker); the modal itself owns the filtered rows.
+pub fn render_new_worktree(frame: &mut Frame, area: Rect, modal: &NewWorktreeModal) {
+    let rows_data = modal.filtered_rows();
+
     // ---- Popup geometry ----
     let width = 72u16.min(area.width.saturating_sub(2)).max(1);
-    let rows = modal.filtered.len() as u16;
+    let rows = rows_data.len() as u16;
     let height = (rows + 5).clamp(7, 24).min(area.height.max(1));
 
     let x = area.x + (area.width.saturating_sub(width)) / 2;
@@ -136,10 +134,20 @@ pub fn render_new_worktree(
 
     frame.render_widget(Clear, popup);
 
-    let title = match project {
-        Some(p) => format!(" New worktree in {p} "),
-        None => " New worktree ".to_string(),
+    let (title, footer_hint) = match modal.phase() {
+        NewWorktreePhase::PickProject => (
+            " New worktree — pick project ".to_string(),
+            "type to filter · ↑↓/C-n C-p move · Enter select project · Esc cancel",
+        ),
+        NewWorktreePhase::PickChoice => {
+            let project = modal.selected_project().unwrap_or("?");
+            (
+                format!(" New worktree in {project} "),
+                "type to filter · Enter create · Esc back",
+            )
+        }
     };
+
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -170,28 +178,20 @@ pub fn render_new_worktree(
     ]));
 
     let list_capacity = (inner.height as usize).saturating_sub(2);
-    let total = modal.filtered.len();
-    let offset = if list_capacity == 0 || modal.cursor < list_capacity {
+    let total = rows_data.len();
+    let cursor = rows_data.iter().position(|(_, sel)| *sel).unwrap_or(0);
+    let offset = if list_capacity == 0 || cursor < list_capacity {
         0
     } else {
-        modal.cursor + 1 - list_capacity
+        cursor + 1 - list_capacity
     };
 
     let end = (offset + list_capacity).min(total);
-    for row in offset..end {
-        let opt_idx = modal.filtered[row];
-        let choice = &modal.options[opt_idx];
-        let selected = row == modal.cursor;
+    for (label, selected) in rows_data[offset..end].iter() {
+        let prefix = if *selected { "▸ " } else { "  " };
+        let text = truncate(&format!("{prefix}{label}"), inner_w);
 
-        let prefix = if selected { "▸ " } else { "  " };
-        let raw = format!(
-            "{prefix}{label}",
-            prefix = prefix,
-            label = choice_label(choice)
-        );
-        let text = truncate(&raw, inner_w);
-
-        let style = if selected {
+        let style = if *selected {
             Style::default()
                 .bg(Color::DarkGray)
                 .fg(Color::Yellow)
@@ -206,7 +206,7 @@ pub fn render_new_worktree(
         lines.push(Line::from(""));
     }
 
-    let footer = truncate("type to filter · Enter create · Esc cancel", inner_w);
+    let footer = truncate(footer_hint, inner_w);
     lines.push(Line::from(Span::styled(
         footer,
         Style::default().fg(Color::DarkGray),
@@ -270,15 +270,6 @@ pub fn render_add_project(frame: &mut Frame, area: Rect, input: &str) {
     )));
 
     frame.render_widget(Paragraph::new(lines), inner);
-}
-
-/// Label for a worktree choice row.
-fn choice_label(choice: &crate::commands::WorktreeChoice) -> String {
-    use crate::commands::WorktreeChoice;
-    match choice {
-        WorktreeChoice::Blank => "blank worktree".to_string(),
-        WorktreeChoice::Prompt { title, .. } => title.clone(),
-    }
 }
 
 /// Truncate a string to at most `max` columns, appending `…` if truncated.

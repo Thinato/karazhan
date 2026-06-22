@@ -369,52 +369,122 @@ impl WorktreeChoice {
     }
 }
 
+/// Which phase the two-phase new-worktree modal is currently in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewWorktreePhase {
+    /// Pick which project the new worktree goes in (only when >1 project).
+    PickProject,
+    /// Pick the blank/prompt choice for the (already-selected) project.
+    PickChoice,
+}
+
 /// New-worktree modal state (key `n` in Grid view).
 ///
-/// Lists "blank worktree" first, then one row per library prompt (by title).
-/// Type-to-filter mirrors the command palette.
+/// Two phases: first pick a project (skipped when there is exactly one), then
+/// pick "blank worktree" (always first) or a library prompt (by title).  The
+/// query/cursor/filter machinery applies to whichever phase's list is active.
 pub struct NewWorktreeModal {
-    /// The current filter query (raw, as typed).
+    /// The current filter query (raw, as typed).  Reset when switching phases.
     pub query: String,
-    /// All options; index 0 is always [`WorktreeChoice::Blank`].
-    pub options: Vec<WorktreeChoice>,
-    /// Indices into `options`, ranked by the current query.
-    pub filtered: Vec<usize>,
     /// Cursor position within `filtered`.
     pub cursor: usize,
+    /// Indices into the active phase's list, ranked by the current query.
+    pub filtered: Vec<usize>,
+    /// Current phase.
+    phase: NewWorktreePhase,
+    /// Whether a project step exists (true when >1 project was supplied).  When
+    /// false, Esc in PickChoice closes instead of going back.
+    has_project_step: bool,
+    /// Available project names (PickProject list source).
+    projects: Vec<String>,
+    /// The chosen project (preselected when exactly one project).
+    selected_project: Option<String>,
+    /// Choice options; index 0 is always [`WorktreeChoice::Blank`].
+    options: Vec<WorktreeChoice>,
 }
 
 impl NewWorktreeModal {
-    /// Build a modal from the library's prompt choices: `(slug, title, body)`.
-    /// "blank worktree" is always the first option.
-    pub fn new(prompt_choices: Vec<(String, String, String)>) -> Self {
+    /// Build a modal from the available `projects` and the library's prompt
+    /// choices `(slug, title, body)`.  "blank worktree" is always the first
+    /// choice.  With exactly one project the modal starts in `PickChoice` with
+    /// that project preselected; with more than one it starts in `PickProject`.
+    /// Callers must guard against an empty `projects` list (the command should
+    /// not open the modal at all in that case).
+    pub fn new(projects: Vec<String>, prompt_choices: Vec<(String, String, String)>) -> Self {
         let mut options = vec![WorktreeChoice::Blank];
         options.extend(
             prompt_choices
                 .into_iter()
                 .map(|(slug, title, body)| WorktreeChoice::Prompt { slug, title, body }),
         );
-        let filtered: Vec<usize> = (0..options.len()).collect();
-        Self {
+
+        let single = projects.len() == 1;
+        let (phase, selected_project) = if single {
+            (NewWorktreePhase::PickChoice, projects.first().cloned())
+        } else {
+            (NewWorktreePhase::PickProject, None)
+        };
+
+        let mut modal = Self {
             query: String::new(),
-            options,
-            filtered,
             cursor: 0,
-        }
+            filtered: Vec::new(),
+            phase,
+            has_project_step: !single,
+            projects,
+            selected_project,
+            options,
+        };
+        modal.refilter();
+        modal
     }
 
-    /// Recompute `filtered` for the current query and reset the cursor.
-    /// "blank worktree" matches an empty query and the literal "blank".
-    pub fn refilter(&mut self) {
-        let query = self.query.to_lowercase();
-        let mut ranked: Vec<(usize, u8)> = self
-            .options
+    /// The current phase.
+    pub fn phase(&self) -> NewWorktreePhase {
+        self.phase
+    }
+
+    /// The selected project, once chosen (always `Some` in `PickChoice`).
+    pub fn selected_project(&self) -> Option<&str> {
+        self.selected_project.as_deref()
+    }
+
+    /// The labels of the active phase's filtered rows, in display order, with a
+    /// flag marking the highlighted row.  Used by the renderer.
+    pub fn filtered_rows(&self) -> Vec<(String, bool)> {
+        self.filtered
             .iter()
             .enumerate()
-            .filter_map(|(i, choice)| {
-                rank_text(&choice.label().to_lowercase(), &query).map(|r| (i, r))
+            .filter_map(|(row, &idx)| {
+                let label = match self.phase {
+                    NewWorktreePhase::PickProject => self.projects.get(idx).cloned()?,
+                    NewWorktreePhase::PickChoice => self.options.get(idx)?.label().to_string(),
+                };
+                Some((label, row == self.cursor))
             })
-            .collect();
+            .collect()
+    }
+
+    /// Recompute `filtered` for the active phase + current query, resetting the
+    /// cursor.  "blank worktree" matches an empty query and the literal "blank".
+    pub fn refilter(&mut self) {
+        let query = self.query.to_lowercase();
+        let mut ranked: Vec<(usize, u8)> = match self.phase {
+            NewWorktreePhase::PickProject => self
+                .projects
+                .iter()
+                .enumerate()
+                .filter_map(|(i, name)| rank_text(&name.to_lowercase(), &query).map(|r| (i, r)))
+                .collect(),
+            NewWorktreePhase::PickChoice => self
+                .options
+                .iter()
+                .enumerate()
+                .filter_map(|(i, choice)| {
+                    rank_text(&choice.label().to_lowercase(), &query).map(|r| (i, r))
+                })
+                .collect(),
+        };
         ranked.sort_by_key(|&(_, r)| r);
         self.filtered = ranked.into_iter().map(|(i, _)| i).collect();
         self.cursor = 0;
@@ -431,10 +501,50 @@ impl NewWorktreeModal {
         self.cursor = next as usize;
     }
 
-    /// The currently highlighted choice, if any.
-    pub fn selected(&self) -> Option<&WorktreeChoice> {
+    /// The highlighted project name in `PickProject`, if any.
+    pub fn selected_project_row(&self) -> Option<&str> {
+        let idx = *self.filtered.get(self.cursor)?;
+        self.projects.get(idx).map(String::as_str)
+    }
+
+    /// The currently highlighted choice in `PickChoice`, if any.
+    pub fn selected_choice(&self) -> Option<&WorktreeChoice> {
+        if self.phase != NewWorktreePhase::PickChoice {
+            return None;
+        }
         let opt_idx = *self.filtered.get(self.cursor)?;
         self.options.get(opt_idx)
+    }
+
+    /// Advance from `PickProject` to `PickChoice`, recording the highlighted
+    /// project.  No-op when already in `PickChoice` or no project is highlighted.
+    /// Returns `true` if it advanced.
+    pub fn advance_to_choice(&mut self) -> bool {
+        if self.phase != NewWorktreePhase::PickProject {
+            return false;
+        }
+        let Some(project) = self.selected_project_row().map(str::to_string) else {
+            return false;
+        };
+        self.selected_project = Some(project);
+        self.phase = NewWorktreePhase::PickChoice;
+        self.query.clear();
+        self.refilter();
+        true
+    }
+
+    /// Go back from `PickChoice` to `PickProject` (clearing the chosen project).
+    /// Returns `true` if it went back; `false` when there is no project step
+    /// (the caller should then close the modal).
+    pub fn back_to_project(&mut self) -> bool {
+        if !self.has_project_step || self.phase != NewWorktreePhase::PickChoice {
+            return false;
+        }
+        self.phase = NewWorktreePhase::PickProject;
+        self.selected_project = None;
+        self.query.clear();
+        self.refilter();
+        true
     }
 }
 
@@ -621,8 +731,19 @@ mod tests {
 
     // ── NewWorktreeModal ──────────────────────────────────────────────────────
 
+    /// Single-project modal (starts in PickChoice) over the given prompts.
     fn modal_with(prompts: &[(&str, &str)]) -> NewWorktreeModal {
-        let choices: Vec<(String, String, String)> = prompts
+        NewWorktreeModal::new(vec!["solo".to_string()], choices_of(prompts))
+    }
+
+    /// Multi-project modal (starts in PickProject) over the given prompts.
+    fn multi_modal(projects: &[&str], prompts: &[(&str, &str)]) -> NewWorktreeModal {
+        let projects = projects.iter().map(|p| (*p).to_string()).collect();
+        NewWorktreeModal::new(projects, choices_of(prompts))
+    }
+
+    fn choices_of(prompts: &[(&str, &str)]) -> Vec<(String, String, String)> {
+        prompts
             .iter()
             .map(|(slug, title)| {
                 (
@@ -631,37 +752,65 @@ mod tests {
                     format!("body of {slug}"),
                 )
             })
-            .collect();
-        NewWorktreeModal::new(choices)
+            .collect()
     }
 
     #[test]
-    fn modal_blank_always_first_and_present() {
+    fn modal_single_project_starts_in_pick_choice_preselected() {
         let m = modal_with(&[("refactor", "Refactor parser")]);
-        assert_eq!(m.options[0], WorktreeChoice::Blank);
-        assert_eq!(m.options.len(), 2);
+        assert_eq!(m.phase(), NewWorktreePhase::PickChoice);
+        assert_eq!(m.selected_project(), Some("solo"));
         // Empty query keeps everything, blank first.
-        assert_eq!(m.selected(), Some(&WorktreeChoice::Blank));
+        assert_eq!(m.selected_choice(), Some(&WorktreeChoice::Blank));
     }
 
     #[test]
-    fn modal_filters_by_title() {
+    fn modal_multi_project_starts_in_pick_project() {
+        let m = multi_modal(&["alpha", "beta"], &[("refactor", "Refactor parser")]);
+        assert_eq!(m.phase(), NewWorktreePhase::PickProject);
+        assert_eq!(m.selected_project(), None);
+        // PickChoice accessor is inert before a project is chosen.
+        assert_eq!(m.selected_choice(), None);
+        assert_eq!(m.selected_project_row(), Some("alpha"));
+    }
+
+    #[test]
+    fn modal_multi_project_enter_advances_and_sets_project() {
+        let mut m = multi_modal(&["alpha", "beta"], &[("refactor", "Refactor parser")]);
+        m.move_cursor(1); // highlight "beta"
+        assert_eq!(m.selected_project_row(), Some("beta"));
+        assert!(m.advance_to_choice());
+        assert_eq!(m.phase(), NewWorktreePhase::PickChoice);
+        assert_eq!(m.selected_project(), Some("beta"));
+        // Now choice list is active, blank first.
+        assert_eq!(m.selected_choice(), Some(&WorktreeChoice::Blank));
+    }
+
+    #[test]
+    fn modal_fuzzy_filter_in_project_phase() {
+        let mut m = multi_modal(&["karazhan", "imbuia"], &[]);
+        m.query = "imb".to_string();
+        m.refilter();
+        assert_eq!(m.selected_project_row(), Some("imbuia"));
+    }
+
+    #[test]
+    fn modal_filters_by_title_in_choice_phase() {
         let mut m = modal_with(&[("refactor", "Refactor parser"), ("docs", "Write docs")]);
         m.query = "docs".to_string();
         m.refilter();
-        let sel = m.selected().expect("a match");
-        match sel {
+        match m.selected_choice().expect("a match") {
             WorktreeChoice::Prompt { slug, .. } => assert_eq!(slug, "docs"),
             other => panic!("expected docs prompt, got {other:?}"),
         }
     }
 
     #[test]
-    fn modal_blank_matches_literal_blank_query() {
+    fn modal_blank_choice_matches_literal_blank_query() {
         let mut m = modal_with(&[("refactor", "Refactor parser")]);
         m.query = "blank".to_string();
         m.refilter();
-        assert_eq!(m.selected(), Some(&WorktreeChoice::Blank));
+        assert_eq!(m.selected_choice(), Some(&WorktreeChoice::Blank));
     }
 
     #[test]
@@ -669,9 +818,7 @@ mod tests {
         let mut m = modal_with(&[("refactor", "Refactor parser")]);
         m.query = "refactor".to_string();
         m.refilter();
-        m.move_cursor(0);
-        let sel = m.selected().expect("match");
-        match sel {
+        match m.selected_choice().expect("match") {
             WorktreeChoice::Prompt { slug, title, body } => {
                 assert_eq!(slug, "refactor");
                 assert_eq!(title, "Refactor parser");
@@ -686,6 +833,24 @@ mod tests {
         let mut m = modal_with(&[("refactor", "Refactor parser")]);
         m.query = "zzzznope".to_string();
         m.refilter();
-        assert_eq!(m.selected(), None);
+        assert_eq!(m.selected_choice(), None);
+    }
+
+    #[test]
+    fn modal_esc_back_from_choice_to_project() {
+        let mut m = multi_modal(&["alpha", "beta"], &[("refactor", "Refactor parser")]);
+        assert!(m.advance_to_choice());
+        assert_eq!(m.phase(), NewWorktreePhase::PickChoice);
+        assert!(m.back_to_project());
+        assert_eq!(m.phase(), NewWorktreePhase::PickProject);
+        assert_eq!(m.selected_project(), None);
+    }
+
+    #[test]
+    fn modal_single_project_has_no_back_step() {
+        let mut m = modal_with(&[("refactor", "Refactor parser")]);
+        // No project step → back_to_project is a no-op (caller closes instead).
+        assert!(!m.back_to_project());
+        assert_eq!(m.phase(), NewWorktreePhase::PickChoice);
     }
 }

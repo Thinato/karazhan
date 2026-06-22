@@ -1,1 +1,13 @@
-worktrees = []
+[[worktrees]]
+path = "/Users/paulolisecki/repos/thinato/karazhan/.karazhan/worktrees/9a100038-1539-43f1-808b-0767c90f264e"
+name = "Unnamed"
+branch = "HEAD"
+auto_continue_on_merge = false
+status = "idle"
+
+[[worktrees]]
+path = "/Users/paulolisecki/.local/share/karazhan/worktrees/Thinato/karazhan/b0c74715-a1f9-4405-8dea-850bc57f8731"
+name = "Unnamed"
+branch = "HEAD"
+auto_continue_on_merge = false
+status = "idle"

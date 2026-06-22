@@ -50,7 +50,7 @@ use crate::worktree::model::{Worktree, WorktreeStatus};
 /// the handshake request and a `ProtocolMismatch` reply even when every other
 /// wire-format item has changed. Do NOT reorder these two; only append new
 /// variants after `ProtocolMismatch`.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Maximum frame body size accepted by `read_frame_async` (64 MiB).
 const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
@@ -120,6 +120,8 @@ pub struct HandshakeReq {
 pub enum HandshakeResp {
     Ok {
         supervisor_pid: u32,
+        /// Ordered project names (same order the daemon uses for grid grouping).
+        projects: Vec<String>,
         worktrees: Vec<WorktreeView>,
     },
     ProtocolMismatch {
@@ -185,7 +187,11 @@ pub enum ClientMsg {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum SupervisorMsg {
     /// Full state snapshot (after Refresh / create / remove).
-    Snapshot { worktrees: Vec<WorktreeView> },
+    Snapshot {
+        /// Ordered project names (same order the daemon uses for grid grouping).
+        projects: Vec<String>,
+        worktrees: Vec<WorktreeView>,
+    },
     /// Incremental update for a single worktree.
     StatusChanged {
         worktree_path: PathBuf,
@@ -353,6 +359,7 @@ mod tests {
     fn handshake_resp_ok_round_trip() {
         rt(&HandshakeResp::Ok {
             supervisor_pid: 999,
+            projects: vec!["proj".into(), "empty-proj".into()],
             worktrees: vec![WorktreeView {
                 path: PathBuf::from("/a"),
                 project: "proj".into(),
@@ -375,8 +382,8 @@ mod tests {
     // ── Protocol version + frozen wire format ─────────────────────────────────
 
     #[test]
-    fn protocol_version_is_three() {
-        assert_eq!(PROTOCOL_VERSION, 3);
+    fn protocol_version_is_four() {
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     /// Locks the FROZEN variant order of `HandshakeResp`: the first body byte is
@@ -386,6 +393,7 @@ mod tests {
     fn handshake_resp_variant_tags_are_frozen() {
         let ok = encode(&HandshakeResp::Ok {
             supervisor_pid: 1,
+            projects: vec![],
             worktrees: vec![],
         })
         .expect("encode ok");
@@ -535,7 +543,10 @@ mod tests {
 
     #[test]
     fn supervisor_msg_snapshot() {
-        rt(&SupervisorMsg::Snapshot { worktrees: vec![] });
+        rt(&SupervisorMsg::Snapshot {
+            projects: vec!["alpha".into(), "beta".into()],
+            worktrees: vec![],
+        });
     }
 
     #[test]
@@ -595,7 +606,10 @@ mod tests {
         let (mut a, mut b) = duplex(4096);
 
         let msgs = vec![
-            SupervisorMsg::Snapshot { worktrees: vec![] },
+            SupervisorMsg::Snapshot {
+                projects: vec!["alpha".into()],
+                worktrees: vec![],
+            },
             SupervisorMsg::StatusChanged {
                 worktree_path: PathBuf::from("/wt"),
                 status: WorktreeStatus::Running,

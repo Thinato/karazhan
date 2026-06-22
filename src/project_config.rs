@@ -17,6 +17,30 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
+// XDG data directory resolution
+// ---------------------------------------------------------------------------
+
+/// Return the karazhan XDG data root:
+/// `$XDG_DATA_HOME/karazhan` or `$HOME/.local/share/karazhan`.
+///
+/// No new crate: mirrors the manual XDG pattern used in `config.rs` and
+/// `projects.rs`.  Returns `None` only when both env vars are unset/empty.
+pub fn karazhan_data_root() -> Option<PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return Some(PathBuf::from(xdg).join("karazhan"));
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    Some(
+        PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("karazhan"),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // AgentConfig
 // ---------------------------------------------------------------------------
 
@@ -116,12 +140,22 @@ impl ProjectConfig {
     ///
     /// - `worktrees_dir` set + absolute → used as-is.
     /// - `worktrees_dir` set + relative → resolved against `repo_root`.
-    /// - `worktrees_dir` unset → `<repo_root>/.karazhan/worktrees`.
+    /// - `worktrees_dir` unset → `$XDG_DATA_HOME/karazhan/worktrees`
+    ///   (fallback: `~/.local/share/karazhan/worktrees`).
+    ///
+    /// The final worktree path is always `<base>/<owner>/<project>/<uuid>`,
+    /// where `<owner>` and `<project>` are applied in `new_worktree` after
+    /// this function returns the base.
     pub fn worktrees_base(&self, repo_root: &Path) -> PathBuf {
         match &self.worktrees_dir {
             Some(dir) if dir.is_absolute() => dir.clone(),
             Some(dir) => repo_root.join(dir),
-            None => repo_root.join(".karazhan").join("worktrees"),
+            None => {
+                // Default: XDG data dir.
+                karazhan_data_root()
+                    .map(|r| r.join("worktrees"))
+                    .unwrap_or_else(|| repo_root.join(".karazhan").join("worktrees"))
+            }
         }
     }
 
@@ -287,13 +321,43 @@ continue_args = ["--resume", "--flag-b"]
     // -----------------------------------------------------------------------
 
     #[test]
-    fn worktrees_base_defaults_under_karazhan() {
+    fn worktrees_base_default_uses_xdg_data_home() {
+        // When XDG_DATA_HOME is set, the default base must be under it.
+        // Use a temp env var manipulation scoped to this test thread.
+        // SAFETY: single-threaded test, no other threads touching this var.
         let cfg = ProjectConfig::default();
         let root = Path::new("/repo");
-        assert_eq!(
-            cfg.worktrees_base(root),
-            Path::new("/repo/.karazhan/worktrees")
-        );
+
+        // Temporarily override env to get a deterministic path.
+        std::env::set_var("XDG_DATA_HOME", "/fake/xdg");
+        let base = cfg.worktrees_base(root);
+        std::env::remove_var("XDG_DATA_HOME");
+
+        assert_eq!(base, Path::new("/fake/xdg/karazhan/worktrees"));
+    }
+
+    #[test]
+    fn worktrees_base_default_falls_back_to_home_local_share() {
+        // Without XDG_DATA_HOME, falls back to $HOME/.local/share/karazhan/worktrees.
+        let cfg = ProjectConfig::default();
+        let root = Path::new("/repo");
+
+        // Save and temporarily clear XDG_DATA_HOME.
+        let saved = std::env::var("XDG_DATA_HOME").ok();
+        std::env::remove_var("XDG_DATA_HOME");
+        let home = std::env::var("HOME").expect("HOME must be set in test env");
+        let base = cfg.worktrees_base(root);
+        // Restore.
+        if let Some(v) = saved {
+            std::env::set_var("XDG_DATA_HOME", v);
+        }
+
+        let expected = PathBuf::from(&home)
+            .join(".local")
+            .join("share")
+            .join("karazhan")
+            .join("worktrees");
+        assert_eq!(base, expected);
     }
 
     #[test]
@@ -314,6 +378,22 @@ continue_args = ["--resume", "--flag-b"]
         };
         let root = Path::new("/repo");
         assert_eq!(cfg.worktrees_base(root), Path::new("/abs/wts"));
+    }
+
+    #[test]
+    fn worktrees_base_default_path_does_not_include_repo_root() {
+        // The default base must NOT be inside the repo root.
+        let cfg = ProjectConfig::default();
+        let root = Path::new("/my/project/repo");
+
+        std::env::set_var("XDG_DATA_HOME", "/fake/xdg");
+        let base = cfg.worktrees_base(root);
+        std::env::remove_var("XDG_DATA_HOME");
+
+        assert!(
+            !base.starts_with(root),
+            "default base {base:?} must not be inside repo root {root:?}"
+        );
     }
 
     #[test]

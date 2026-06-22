@@ -83,16 +83,24 @@ impl GridView {
     // Rendering
     // -----------------------------------------------------------------------
 
-    /// Render the worktree grid into `area`, GROUPED by project.
+    /// Render the worktree grid into `area`, GROUPED by the AUTHORITATIVE ordered
+    /// project list `projects` (so projects with ZERO worktrees still render a
+    /// header + divider).
     ///
-    /// Each project group is rendered as a header line (project name + a
-    /// horizontal divider rule) followed by that project's worktree squares
-    /// wrapping at `cols`.  Groups stack vertically in the daemon's project
-    /// order.  Selection uses a FLAT index over the concatenated worktree list
-    /// (same order as `worktrees`), so the highlight lands on the correct square
-    /// within its group.  A project with zero worktrees still shows its header.
-    pub fn render(&self, frame: &mut Frame, area: Rect, worktrees: &[WorktreeView]) {
-        if worktrees.is_empty() {
+    /// Each project group is a header line (project name + horizontal divider)
+    /// followed by that project's worktree squares wrapping at `cols`.  Groups
+    /// stack vertically in `projects` order.  Selection uses a FLAT index over
+    /// the worktrees concatenated IN `projects` ORDER, so the highlight lands on
+    /// the correct square within its group.  A zero-worktree project shows its
+    /// header plus a dim "(no worktrees)" line.
+    pub fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        projects: &[String],
+        worktrees: &[WorktreeView],
+    ) {
+        if projects.is_empty() {
             let msg = Paragraph::new(" No worktrees found.  Add a project with `A`.")
                 .style(Style::default().fg(Color::DarkGray));
             frame.render_widget(msg, area);
@@ -100,10 +108,11 @@ impl GridView {
         }
 
         let cols = Self::cols_for_width(area.width) as u16;
-        let groups = group_by_project(worktrees);
+        let groups = group_by_project(projects, worktrees);
 
         // `y` tracks the current vertical offset within `area`; `flat` tracks
-        // the running flat index across all groups (matches `worktrees` order).
+        // the running flat index across all groups (matches the project-ordered
+        // concatenation of `worktrees`).
         let mut y = area.y;
         let mut flat: usize = 0;
 
@@ -115,6 +124,17 @@ impl GridView {
             let header_area = Rect::new(area.x, y, area.width, 1);
             render_group_header(frame, header_area, &group.project);
             y += 1;
+
+            if group.worktrees.is_empty() {
+                // Dim placeholder line for a project with no worktrees.
+                if y < area.y + area.height {
+                    let note = Paragraph::new("   (no worktrees)")
+                        .style(Style::default().fg(Color::DarkGray));
+                    frame.render_widget(note, Rect::new(area.x, y, area.width, 1));
+                }
+                y += 1;
+                continue;
+            }
 
             // Worktree squares for this group, wrapping at `cols`.
             let group_rows = group.len().div_ceil(cols.max(1) as usize) as u16;
@@ -136,8 +156,7 @@ impl GridView {
                 flat += 1;
             }
 
-            // Advance past this group's cell rows (at least one blank row so
-            // empty groups still occupy space below their header).
+            // Advance past this group's cell rows.
             y += group_rows.max(1) * CELL_H;
         }
     }
@@ -252,41 +271,43 @@ impl ProjectGroup<'_> {
         self.worktrees.len()
     }
 
-    #[allow(dead_code)] // completeness for the grouping API (used in tests)
     pub fn is_empty(&self) -> bool {
         self.worktrees.is_empty()
     }
 }
 
-/// Group a flat `worktrees` slice into per-project groups, preserving the flat
-/// order (the daemon already concatenates in project order, so consecutive
-/// entries with the same project name form one group).  The concatenation of
-/// the groups' worktrees, in order, exactly reproduces the input — so a flat
-/// index maps to `(group, local index within that group)` by walking the
-/// groups and summing their lengths.
-pub fn group_by_project<'a>(worktrees: &'a [WorktreeView]) -> Vec<ProjectGroup<'a>> {
-    let mut groups: Vec<ProjectGroup<'a>> = Vec::new();
-    for wt in worktrees {
-        match groups.last_mut() {
-            Some(g) if g.project == wt.project => g.worktrees.push(wt),
-            _ => groups.push(ProjectGroup {
-                project: wt.project.clone(),
-                worktrees: vec![wt],
-            }),
-        }
-    }
-    groups
+/// Group `worktrees` into one [`ProjectGroup`] per name in the AUTHORITATIVE
+/// ordered `projects` list (so a project with zero worktrees still gets an
+/// empty group, in order).  Within each group the worktrees keep their relative
+/// order in `worktrees`.  Concatenating the groups' worktrees in order yields
+/// the project-ordered flat list a flat selection index runs over, so an index
+/// maps to `(group, local index)` by walking the groups and summing lengths.
+pub fn group_by_project<'a>(
+    projects: &[String],
+    worktrees: &'a [WorktreeView],
+) -> Vec<ProjectGroup<'a>> {
+    projects
+        .iter()
+        .map(|name| ProjectGroup {
+            project: name.clone(),
+            worktrees: worktrees.iter().filter(|wt| &wt.project == name).collect(),
+        })
+        .collect()
 }
 
 /// Map a flat selection index to `(project_name, local_index)` within its
 /// group, using the same grouping as [`group_by_project`].  Returns `None` if
 /// the index is out of range.
 #[allow(dead_code)] // pure helper exercised by unit tests; available for callers
-pub fn flat_to_group_local(worktrees: &[WorktreeView], flat: usize) -> Option<(String, usize)> {
-    let groups = group_by_project(worktrees);
+pub fn flat_to_group_local(
+    projects: &[String],
+    worktrees: &[WorktreeView],
+    flat: usize,
+) -> Option<(String, usize)> {
+    let groups = group_by_project(projects, worktrees);
     let mut base = 0usize;
     for g in &groups {
-        if flat < base + g.len() {
+        if !g.is_empty() && flat < base + g.len() {
             return Some((g.project.clone(), flat - base));
         }
         base += g.len();
@@ -381,60 +402,89 @@ mod tests {
         }
     }
 
+    fn names(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn group_by_project_preserves_order_and_runs() {
-        let wts = vec![
-            wv("alpha", "a1"),
-            wv("alpha", "a2"),
-            wv("beta", "b1"),
-            wv("alpha", "a3"), // a fresh "alpha" run (not merged with the first)
-        ];
-        let groups = group_by_project(&wts);
-        assert_eq!(groups.len(), 3);
+    fn group_by_project_follows_project_order() {
+        let projects = names(&["alpha", "beta"]);
+        let wts = vec![wv("alpha", "a1"), wv("alpha", "a2"), wv("beta", "b1")];
+        let groups = group_by_project(&projects, &wts);
+        assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].project, "alpha");
         assert_eq!(groups[0].len(), 2);
         assert_eq!(groups[1].project, "beta");
         assert_eq!(groups[1].len(), 1);
-        assert_eq!(groups[2].project, "alpha");
-        assert_eq!(groups[2].len(), 1);
         assert!(!groups[0].is_empty());
     }
 
     #[test]
+    fn group_by_project_includes_empty_project() {
+        // "beta" has no worktrees but still gets a (empty) group, in order.
+        let projects = names(&["alpha", "beta", "gamma"]);
+        let wts = vec![wv("alpha", "a1"), wv("gamma", "g1")];
+        let groups = group_by_project(&projects, &wts);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].project, "alpha");
+        assert_eq!(groups[0].len(), 1);
+        assert_eq!(groups[1].project, "beta");
+        assert!(groups[1].is_empty());
+        assert_eq!(groups[2].project, "gamma");
+        assert_eq!(groups[2].len(), 1);
+    }
+
+    #[test]
     fn group_by_project_single_project() {
+        let projects = names(&["solo"]);
         let wts = vec![wv("solo", "x"), wv("solo", "y")];
-        let groups = group_by_project(&wts);
+        let groups = group_by_project(&projects, &wts);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 2);
     }
 
     #[test]
-    fn group_by_project_empty() {
+    fn group_by_project_no_projects() {
+        let projects: Vec<String> = vec![];
         let wts: Vec<WorktreeView> = vec![];
-        assert!(group_by_project(&wts).is_empty());
+        assert!(group_by_project(&projects, &wts).is_empty());
     }
 
     #[test]
-    fn flat_index_maps_to_group_local() {
+    fn flat_index_maps_to_group_local_with_empty_in_middle() {
+        // "beta" (empty) sits between alpha and gamma; the flat index skips it.
+        let projects = names(&["alpha", "beta", "gamma"]);
         let wts = vec![
             wv("alpha", "a1"), // flat 0 -> (alpha, 0)
             wv("alpha", "a2"), // flat 1 -> (alpha, 1)
-            wv("beta", "b1"),  // flat 2 -> (beta, 0)
-            wv("beta", "b2"),  // flat 3 -> (beta, 1)
-            wv("beta", "b3"),  // flat 4 -> (beta, 2)
+            wv("gamma", "g1"), // flat 2 -> (gamma, 0)
+            wv("gamma", "g2"), // flat 3 -> (gamma, 1)
         ];
-        assert_eq!(flat_to_group_local(&wts, 0), Some(("alpha".to_string(), 0)));
-        assert_eq!(flat_to_group_local(&wts, 1), Some(("alpha".to_string(), 1)));
-        assert_eq!(flat_to_group_local(&wts, 2), Some(("beta".to_string(), 0)));
-        assert_eq!(flat_to_group_local(&wts, 4), Some(("beta".to_string(), 2)));
+        assert_eq!(
+            flat_to_group_local(&projects, &wts, 0),
+            Some(("alpha".to_string(), 0))
+        );
+        assert_eq!(
+            flat_to_group_local(&projects, &wts, 1),
+            Some(("alpha".to_string(), 1))
+        );
+        assert_eq!(
+            flat_to_group_local(&projects, &wts, 2),
+            Some(("gamma".to_string(), 0))
+        );
+        assert_eq!(
+            flat_to_group_local(&projects, &wts, 3),
+            Some(("gamma".to_string(), 1))
+        );
         // Out of range.
-        assert_eq!(flat_to_group_local(&wts, 5), None);
+        assert_eq!(flat_to_group_local(&projects, &wts, 4), None);
     }
 
     #[test]
-    fn flat_concatenation_reproduces_input() {
+    fn flat_concatenation_reproduces_project_ordered_input() {
+        let projects = names(&["alpha", "beta"]);
         let wts = vec![wv("alpha", "a1"), wv("beta", "b1"), wv("beta", "b2")];
-        let groups = group_by_project(&wts);
+        let groups = group_by_project(&projects, &wts);
         let flat: Vec<&WorktreeView> = groups
             .iter()
             .flat_map(|g| g.worktrees.iter().copied())

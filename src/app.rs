@@ -29,6 +29,8 @@ pub enum AppEvent {
     Quit,
     /// Full state snapshot from the daemon (handshake / Refresh / create / remove).
     Snapshot {
+        /// Ordered project names (drives grid grouping + the project picker).
+        projects: Vec<String>,
         worktrees: Vec<WorktreeView>,
     },
     /// Incremental status update for a single worktree from the daemon.
@@ -89,6 +91,10 @@ pub struct App {
     detail: DetailView,
     /// Local cache of worktree views pushed by the daemon.
     worktrees: Vec<WorktreeView>,
+    /// Authoritative ordered project-name list pushed by the daemon.  Drives
+    /// grid grouping (so zero-worktree projects still get a header) and the
+    /// new-worktree modal's project picker.
+    projects: Vec<String>,
     /// Transient status message shown in the status line.
     /// Persists until replaced or explicitly cleared.
     status_message: Option<String>,
@@ -104,12 +110,9 @@ pub struct App {
     pending_edit: Option<PathBuf>,
     /// Command palette modal; `Some` while open (Ctrl-P).  Intercepts all keys.
     palette: Option<Palette>,
-    /// New-worktree modal; `Some` while open (`n` in Grid).  Intercepts all keys.
+    /// New-worktree modal; `Some` while open (`n` in Grid).  Intercepts all
+    /// keys.  The modal itself owns project + choice selection.
     new_worktree: Option<NewWorktreeModal>,
-    /// Target project for the open new-worktree modal.  v1: the project of the
-    /// currently-selected worktree, else the first project.  (Explicit project
-    /// selection in the modal can come later.)
-    new_worktree_project: Option<String>,
     /// Add-project path input overlay; `Some` while open (`A`).  Holds the
     /// in-progress path string (prefilled with the cwd).  Intercepts all keys.
     add_project_input: Option<String>,
@@ -135,6 +138,7 @@ impl App {
             prompt_input: String::new(),
             detail: DetailView::new(),
             worktrees: Vec::new(),
+            projects: Vec::new(),
             status_message: None,
             client,
             config,
@@ -142,7 +146,6 @@ impl App {
             pending_edit: None,
             palette: None,
             new_worktree: None,
-            new_worktree_project: None,
             add_project_input: None,
         }
     }
@@ -163,7 +166,8 @@ impl App {
                     View::Grid => {
                         let (grid_area, detail_area) = split_grid_detail(area);
 
-                        self.grid.render(frame, grid_area, &self.worktrees);
+                        self.grid
+                            .render(frame, grid_area, &self.projects, &self.worktrees);
 
                         let selected_wt = self.worktrees.get(self.grid.selected);
                         let summary = selected_wt.and_then(|wt| wt.last_summary.as_deref());
@@ -198,12 +202,7 @@ impl App {
 
                 // Render the new-worktree modal last (above palette/help).
                 if let Some(modal) = &self.new_worktree {
-                    crate::ui::palette::render_new_worktree(
-                        frame,
-                        area,
-                        modal,
-                        self.new_worktree_project.as_deref(),
-                    );
+                    crate::ui::palette::render_new_worktree(frame, area, modal);
                 }
 
                 // Render the add-project path input on top of everything.
@@ -478,8 +477,16 @@ impl App {
 
         match code {
             KeyCode::Esc => {
-                self.new_worktree = None;
-                self.new_worktree_project = None;
+                // Esc in PickChoice (with a project step) goes back to the
+                // project picker; otherwise it closes the modal.
+                let went_back = self
+                    .new_worktree
+                    .as_mut()
+                    .map(|m| m.back_to_project())
+                    .unwrap_or(false);
+                if !went_back {
+                    self.new_worktree = None;
+                }
             }
             KeyCode::Down => {
                 if let Some(m) = self.new_worktree.as_mut() {
@@ -492,22 +499,7 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                let choice = self.new_worktree.take().and_then(|m| m.selected().cloned());
-                let project = self.new_worktree_project.take();
-                if let (Some(choice), Some(project)) = (choice, project) {
-                    let (prompt_slug, prompt_body) = match choice {
-                        WorktreeChoice::Blank => (None, None),
-                        WorktreeChoice::Prompt { slug, body, .. } => (Some(slug), Some(body)),
-                    };
-                    self.client
-                        .send(ClientMsg::NewWorktree {
-                            project,
-                            prompt_slug,
-                            prompt_body,
-                        })
-                        .await;
-                    self.set_status("creating worktree…");
-                }
+                self.new_worktree_enter().await;
             }
             KeyCode::Backspace => {
                 if let Some(m) = self.new_worktree.as_mut() {
@@ -522,6 +514,45 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Handle `Enter` in the new-worktree modal: in `PickProject` advance to the
+    /// choice phase; in `PickChoice` send `NewWorktree` and close.
+    async fn new_worktree_enter(&mut self) {
+        use commands::NewWorktreePhase;
+
+        let phase = match self.new_worktree.as_ref() {
+            Some(m) => m.phase(),
+            None => return,
+        };
+
+        match phase {
+            NewWorktreePhase::PickProject => {
+                if let Some(m) = self.new_worktree.as_mut() {
+                    m.advance_to_choice();
+                }
+            }
+            NewWorktreePhase::PickChoice => {
+                let modal = self.new_worktree.take();
+                let Some(modal) = modal else { return };
+                let project = modal.selected_project().map(str::to_string);
+                let choice = modal.selected_choice().cloned();
+                if let (Some(project), Some(choice)) = (project, choice) {
+                    let (prompt_slug, prompt_body) = match choice {
+                        WorktreeChoice::Blank => (None, None),
+                        WorktreeChoice::Prompt { slug, body, .. } => (Some(slug), Some(body)),
+                    };
+                    self.client
+                        .send(ClientMsg::NewWorktree {
+                            project,
+                            prompt_slug,
+                            prompt_body,
+                        })
+                        .await;
+                    self.set_status("creating worktree…");
+                }
+            }
         }
     }
 
@@ -631,17 +662,16 @@ impl App {
             }
             CommandId::NewWorktree => {
                 self.view = View::Grid;
-                // Target project: the selected worktree's project, else the
-                // first project in the daemon's order.  (v1: explicit project
-                // selection in the modal can come later.)
-                match self.target_project() {
-                    Some(project) => {
-                        let mut modal = NewWorktreeModal::new(self.library.all_prompt_choices());
-                        modal.refilter();
-                        self.new_worktree = Some(modal);
-                        self.new_worktree_project = Some(project);
-                    }
-                    None => self.set_status("add a project first (A)"),
+                if self.projects.is_empty() {
+                    self.set_status("add a project first (A)");
+                } else {
+                    // The modal owns project + choice selection.  With one
+                    // project it opens straight to the choice list; with more it
+                    // opens the project picker first.
+                    self.new_worktree = Some(NewWorktreeModal::new(
+                        self.projects.clone(),
+                        self.library.all_prompt_choices(),
+                    ));
                 }
             }
             CommandId::AddProject => {
@@ -667,16 +697,6 @@ impl App {
         self.worktrees
             .get(self.grid.selected)
             .map(|wt| wt.path.clone())
-    }
-
-    /// The project to target for a new worktree: the selected worktree's
-    /// project, else the first project present in the worktree list.  `None`
-    /// only when there are no worktrees at all (i.e. no projects).
-    fn target_project(&self) -> Option<String> {
-        if let Some(wt) = self.worktrees.get(self.grid.selected) {
-            return Some(wt.project.clone());
-        }
-        self.worktrees.first().map(|wt| wt.project.clone())
     }
 
     // -----------------------------------------------------------------------
@@ -949,7 +969,11 @@ impl App {
                 self.running = false;
             }
             AppEvent::Tick => {}
-            AppEvent::Snapshot { worktrees } => {
+            AppEvent::Snapshot {
+                projects,
+                worktrees,
+            } => {
+                self.projects = projects;
                 self.worktrees = worktrees;
                 self.grid.selected = clamp_selection(self.grid.selected, self.worktrees.len());
             }
