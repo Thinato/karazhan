@@ -6,6 +6,7 @@
 pub mod ci;
 pub mod commands;
 pub mod pr;
+pub mod pr_status;
 
 use std::path::Path;
 

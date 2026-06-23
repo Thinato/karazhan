@@ -24,6 +24,11 @@ use super::{AgentStatus, SessionHandle};
 /// Maximum length of the summary string surfaced to the UI.
 const SUMMARY_MAX: usize = 120;
 
+/// Maximum number of stderr lines to retain for error reporting.
+const STDERR_MAX_LINES: usize = 100;
+/// Maximum total bytes of stderr to retain (older lines are dropped first).
+const STDERR_MAX_BYTES: usize = 8 * 1024;
+
 /// Mutable state threaded through the line parser.
 ///
 /// Kept separate from any process so the parser is a pure function testable
@@ -139,9 +144,14 @@ fn truncate_summary(s: &str) -> String {
 /// Drive a spawned process's stdout to completion, sending [`StatusUpdate`]s
 /// through `tx`.
 ///
-/// Reads stdout line-by-line, parsing stream-json into coarse status. On
-/// process exit: emits [`AgentStatus::Done`] on success or [`AgentStatus::Error`]
-/// on non-zero exit (unless the stream already produced a terminal status).
+/// Reads stdout line-by-line, parsing stream-json into coarse status. stderr is
+/// drained concurrently (via a spawned task) so a full stderr pipe never stalls
+/// the child; the last [`STDERR_MAX_LINES`] / [`STDERR_MAX_BYTES`] are retained.
+///
+/// On process exit: emits [`AgentStatus::Done`] on success or
+/// [`AgentStatus::Error`] on non-zero exit (unless the stream already produced a
+/// terminal status).  On failure the captured stderr tail is appended to the
+/// error message and logged to the daemon log via `tracing::error!`.
 ///
 /// stdout/stderr are NEVER written to the terminal — only logged via `tracing`
 /// and reflected as status, so the TUI is never corrupted.
@@ -173,6 +183,15 @@ pub async fn run_session(mut handle: SessionHandle, tx: mpsc::Sender<StatusUpdat
         })
         .await;
 
+    // Drain stderr concurrently so a full pipe never blocks the child.
+    // The task accumulates lines into a bounded ring-buffer and joins below.
+    let stderr_task = if let Some(stderr) = child.stderr.take() {
+        let wt = worktree_path.clone();
+        Some(tokio::spawn(async move { drain_stderr(stderr, &wt).await }))
+    } else {
+        None
+    };
+
     if let Some(stdout) = child.stdout.take() {
         let mut reader = BufReader::new(stdout).lines();
         loop {
@@ -198,8 +217,17 @@ pub async fn run_session(mut handle: SessionHandle, tx: mpsc::Sender<StatusUpdat
         }
     }
 
-    // Await process exit and reconcile final status.
+    // Collect the captured stderr tail (the task finishes quickly once the
+    // child's stderr pipe closes, which happens after wait()).
     let exit = child.wait().await;
+
+    let stderr_tail = if let Some(task) = stderr_task {
+        task.await.unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    // Await process exit and reconcile final status.
     let final_status = match exit {
         Ok(status) if status.success() => {
             // If the stream already gave a terminal status, keep it.
@@ -212,10 +240,29 @@ pub async fn run_session(mut handle: SessionHandle, tx: mpsc::Sender<StatusUpdat
             // Non-zero exit overrides anything but an already-reported error.
             match state.status {
                 AgentStatus::Error(_) => state.status.clone(),
-                _ => AgentStatus::Error(format!("agent exited with status {status}")),
+                _ => {
+                    let msg = build_exit_error(
+                        format!("agent exited with status {status}"),
+                        &stderr_tail,
+                    );
+                    tracing::error!(
+                        worktree = %worktree_path.display(),
+                        stderr_tail = %stderr_tail,
+                        "agent process failed: {msg}"
+                    );
+                    AgentStatus::Error(msg)
+                }
             }
         }
-        Err(e) => AgentStatus::Error(format!("failed to await agent process: {e}")),
+        Err(e) => {
+            let msg = build_exit_error(format!("failed to await agent process: {e}"), &stderr_tail);
+            tracing::error!(
+                worktree = %worktree_path.display(),
+                stderr_tail = %stderr_tail,
+                "agent wait failed: {msg}"
+            );
+            AgentStatus::Error(msg)
+        }
     };
 
     let _ = tx
@@ -227,6 +274,66 @@ pub async fn run_session(mut handle: SessionHandle, tx: mpsc::Sender<StatusUpdat
         .await;
 
     Ok(())
+}
+
+/// Drain a child's stderr pipe, logging each line at `debug` and accumulating a
+/// bounded tail (at most [`STDERR_MAX_LINES`] lines / [`STDERR_MAX_BYTES`] bytes).
+///
+/// Returns the captured tail as a single string (lines joined by `\n`), ready to
+/// be appended to an error message.
+async fn drain_stderr(
+    stderr: impl tokio::io::AsyncRead + Unpin,
+    worktree_path: &std::path::Path,
+) -> String {
+    let mut reader = BufReader::new(stderr).lines();
+    let mut lines: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut total_bytes: usize = 0;
+
+    loop {
+        match reader.next_line().await {
+            Ok(Some(line)) => {
+                tracing::debug!(worktree = %worktree_path.display(), "agent stderr: {line}");
+                total_bytes += line.len() + 1; // +1 for newline
+                lines.push_back(line);
+
+                // Evict oldest lines to stay within caps.
+                while lines.len() > STDERR_MAX_LINES || total_bytes > STDERR_MAX_BYTES {
+                    if let Some(evicted) = lines.pop_front() {
+                        total_bytes = total_bytes.saturating_sub(evicted.len() + 1);
+                    } else {
+                        break;
+                    }
+                }
+            }
+            Ok(None) => break, // EOF
+            Err(e) => {
+                tracing::debug!("error reading agent stderr: {e}");
+                break;
+            }
+        }
+    }
+
+    lines.into_iter().collect::<Vec<_>>().join("\n")
+}
+
+/// Compose an error message from a base reason and an optional stderr tail.
+///
+/// If `stderr_tail` is non-empty, it is appended (truncated to keep the total
+/// under a sane UI length) so the daemon log and the client toast both show the
+/// real failure output without extra lookups.
+fn build_exit_error(base: String, stderr_tail: &str) -> String {
+    let stderr_tail = stderr_tail.trim();
+    if stderr_tail.is_empty() {
+        return base;
+    }
+    // Truncate the tail to at most SUMMARY_MAX chars so it stays legible.
+    let tail: String = if stderr_tail.chars().count() > SUMMARY_MAX {
+        let t: String = stderr_tail.chars().take(SUMMARY_MAX).collect();
+        format!("{t}…")
+    } else {
+        stderr_tail.to_string()
+    };
+    format!("{base}\nstderr: {tail}")
 }
 
 /// Drive a [`SimPlan`] (mock backend): emit `Running`, sleep, emit final.
@@ -313,6 +420,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn nonzero_exit_maps_to_error() {
         // Spawn a benign process that exits non-zero (never the real `claude`).
         let mut cmd = tokio::process::Command::new("sh");
@@ -345,6 +453,102 @@ mod tests {
             "expected Error, got {:?}",
             last.status
         );
+    }
+
+    /// Stderr written by a failing child is captured and surfaced in the Error
+    /// message (gap 1 fix).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn nonzero_exit_includes_stderr_in_error() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("echo boom 1>&2; exit 3")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = cmd.spawn().expect("spawn sh");
+
+        let handle = SessionHandle {
+            worktree_path: PathBuf::from("/tmp/stderr-test"),
+            child: Some(child),
+            sim: None,
+        };
+
+        let (tx, mut rx) = mpsc::channel::<StatusUpdate>(8);
+        run_session(handle, tx).await.expect("run_session");
+
+        // Collect all updates; the last one must be an Error containing "boom".
+        let mut last = rx.recv().await.expect("at least one update");
+        while let Some(u) = rx.recv().await {
+            last = u;
+        }
+        match &last.status {
+            AgentStatus::Error(msg) => {
+                assert!(
+                    msg.contains("boom"),
+                    "expected 'boom' in error message, got: {msg:?}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// A child that exits cleanly (zero) maps to Done, not Error.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn zero_exit_maps_to_done() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("exit 0")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = cmd.spawn().expect("spawn sh");
+
+        let handle = SessionHandle {
+            worktree_path: PathBuf::from("/tmp/success-test"),
+            child: Some(child),
+            sim: None,
+        };
+
+        let (tx, mut rx) = mpsc::channel::<StatusUpdate>(8);
+        run_session(handle, tx).await.expect("run_session");
+
+        let mut last = rx.recv().await.expect("at least one update");
+        while let Some(u) = rx.recv().await {
+            last = u;
+        }
+        assert_eq!(
+            last.status,
+            AgentStatus::Done,
+            "zero exit should be Done, got {:?}",
+            last.status
+        );
+    }
+
+    /// Pure helper: `build_exit_error` appends the stderr tail to the base message.
+    #[test]
+    fn build_exit_error_includes_stderr() {
+        let msg = build_exit_error(
+            "agent exited with status 1".to_string(),
+            "fatal: not a repo",
+        );
+        assert!(msg.contains("agent exited with status 1"));
+        assert!(msg.contains("fatal: not a repo"));
+    }
+
+    /// Pure helper: `build_exit_error` returns base unchanged when stderr is empty.
+    #[test]
+    fn build_exit_error_empty_stderr() {
+        let msg = build_exit_error("agent exited with status 1".to_string(), "");
+        assert_eq!(msg, "agent exited with status 1");
+        assert!(!msg.contains("stderr:"));
+    }
+
+    /// Pure helper: `build_exit_error` truncates a very long stderr tail.
+    #[test]
+    fn build_exit_error_truncates_long_stderr() {
+        let long_stderr = "x".repeat(SUMMARY_MAX + 50);
+        let msg = build_exit_error("base".to_string(), &long_stderr);
+        assert!(msg.contains("…"), "expected ellipsis for truncated tail");
     }
 
     #[test]

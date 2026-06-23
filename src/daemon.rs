@@ -46,6 +46,7 @@ use crate::ipc::{self, BuiltinKind, ClientMsg, HandshakeReq, HandshakeResp, Supe
 use crate::project_config::ProjectConfig;
 use crate::projects;
 use crate::watcher::{spawn_watcher, WatchItem, WatcherConfig};
+use crate::worktree::model::PrStatus;
 use crate::worktree::{state, WorktreeManager, WorktreeStatus};
 
 /// Capacity of the broadcast channel that fans `SupervisorMsg`s out to clients.
@@ -148,10 +149,24 @@ impl Shared {
         let _ = self.events.send(msg);
     }
 
+    /// Log **and** broadcast a `SupervisorMsg::Error`.
+    ///
+    /// Every daemon error goes to BOTH the daemon log file (via `tracing::error!`)
+    /// and the connected clients' status line (via broadcast).  Calling this
+    /// helper guarantees neither channel is missed — errors vanish from the client
+    /// toast when it clears but remain in `~/.cache/karazhan/supervisor.log`.
+    fn error(&self, worktree_path: Option<PathBuf>, message: String) {
+        tracing::error!(?worktree_path, %message, "daemon error");
+        self.broadcast(SupervisorMsg::Error {
+            worktree_path,
+            message,
+        });
+    }
+
     /// Broadcast a full `Snapshot` of `worktrees` tagged with the current ordered
-    /// project-name list (so clients can render zero-worktree projects too).
+    /// project list (so clients can render zero-worktree projects too).
     async fn broadcast_snapshot(&self, worktrees: Vec<ipc::WorktreeView>) {
-        let projects = self.project_names().await;
+        let projects = self.project_infos().await;
         self.broadcast(SupervisorMsg::Snapshot {
             projects,
             worktrees,
@@ -238,18 +253,70 @@ impl Shared {
         });
     }
 
-    /// Rebuild the shared watch-set from the registry (worktrees with a PR),
-    /// aggregating across ALL projects.
+    /// Update a worktree's `pr_status` (+ optional `pr_number`) in the registry
+    /// and the OWNING project's `state.toml`, then broadcast a fresh Snapshot.
+    ///
+    /// Polling is NOT user/agent activity, so `updated_at` is deliberately left
+    /// untouched.  Returns the PREVIOUS `pr_status` so the caller can detect the
+    /// transition edge (e.g. `…→Merged`) for auto-continue.
+    async fn set_pr_status(
+        &self,
+        path: &Path,
+        pr_status: PrStatus,
+        pr_number: Option<u64>,
+    ) -> Option<PrStatus> {
+        let prev = {
+            let mut reg = self.registry.lock().await;
+            if let Some(view) = reg.worktrees.get_mut(path) {
+                let prev = view.pr_status;
+                view.pr_status = pr_status;
+                if let Some(n) = pr_number {
+                    view.pr_number = Some(n);
+                }
+                Some(prev)
+            } else {
+                None
+            }
+        };
+
+        if let Some(root) = self.project_root_for(path).await {
+            match state::load(&root) {
+                Ok(mut st) => {
+                    st.set_pr_status(path, pr_status);
+                    if let Some(n) = pr_number {
+                        st.set_pr_number_no_touch(path, Some(n));
+                    }
+                    if let Err(e) = state::save(&root, &st) {
+                        tracing::warn!("daemon: failed to persist pr_status: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("daemon: failed to load state for pr_status: {e}"),
+            }
+        } else {
+            tracing::warn!(
+                "daemon: no owning project for {} (pr_status)",
+                path.display()
+            );
+        }
+
+        let snapshot = {
+            let reg = self.registry.lock().await;
+            reg.snapshot()
+        };
+        self.broadcast_snapshot(snapshot).await;
+
+        prev
+    }
+
+    /// Rebuild the shared watch-set from the registry: EVERY worktree across
+    /// ALL projects (PR discovery is by branch now, so no pr_number filter).
     async fn rebuild_watch_set(&self) {
         let items: Vec<WatchItem> = {
             let reg = self.registry.lock().await;
             reg.worktrees
                 .values()
-                .filter_map(|v| {
-                    v.pr_number.map(|pr| WatchItem {
-                        worktree_path: v.path.clone(),
-                        pr_number: pr,
-                    })
+                .map(|v| WatchItem {
+                    worktree_path: v.path.clone(),
                 })
                 .collect()
         };
@@ -257,14 +324,18 @@ impl Shared {
         *guard = items;
     }
 
-    /// The ordered list of managed project names, in the same order the daemon
-    /// uses for the registry/grid grouping (the `projects` vec order).
-    async fn project_names(&self) -> Vec<String> {
+    /// The ordered list of managed projects (name + root path), in the same
+    /// order the daemon uses for the registry/grid grouping (the `projects` vec
+    /// order).
+    async fn project_infos(&self) -> Vec<ipc::ProjectInfo> {
         self.projects
             .lock()
             .await
             .iter()
-            .map(|p| p.name.clone())
+            .map(|p| ipc::ProjectInfo {
+                name: p.name.clone(),
+                path: p.root.clone(),
+            })
             .collect()
     }
 
@@ -570,68 +641,51 @@ fn init_daemon_tracing(logfile: &Path) -> Result<tracing_appender::non_blocking:
 // ---------------------------------------------------------------------------
 
 /// Apply a watcher [`AppEvent`] to the daemon's registry + state, broadcasting
-/// any resulting status change.  This is the daemon-side replacement for the
-/// `PrMerged` / `CiStatusChanged` arms of `App::handle_app_event`.
+/// the resulting Snapshot.  This is the daemon-side handler for the watcher's
+/// `PrStatusChanged` events.
+///
+/// The PR status is a SEPARATE axis from the agent-activity [`WorktreeStatus`]
+/// (which the grid border still reflects), so this only touches `pr_status` /
+/// `pr_number` and never clobbers `status`.  Auto-continue fires on the
+/// `…→Merged` transition edge only (detected via the previous `pr_status`).
 async fn handle_watch_event(shared: &Arc<Shared>, event: AppEvent) {
     match event {
-        AppEvent::PrMerged { worktree_path, pr } => {
+        AppEvent::PrStatusChanged {
+            worktree_path,
+            pr_status,
+            pr_number,
+        } => {
             tracing::info!(
                 worktree = %worktree_path.display(),
-                pr,
-                "daemon: PR merged — setting status PRMerged"
+                ?pr_status,
+                ?pr_number,
+                "daemon: PR status changed"
             );
-            shared
-                .set_status(&worktree_path, WorktreeStatus::PRMerged, None)
+            let prev = shared
+                .set_pr_status(&worktree_path, pr_status, pr_number)
                 .await;
 
-            let auto_continue = {
-                let reg = shared.registry.lock().await;
-                reg.worktrees
-                    .get(&worktree_path)
-                    .map(|v| v.auto_continue_on_merge)
-                    .unwrap_or(false)
-            };
-
-            if auto_continue {
-                tracing::info!(
-                    worktree = %worktree_path.display(),
-                    "daemon: auto_continue_on_merge=true — starting continue session"
-                );
-                run_continue_session(Arc::clone(shared), worktree_path);
-            }
-        }
-        AppEvent::CiStatusChanged {
-            worktree_path,
-            all_passing,
-        } => {
-            if all_passing {
-                let was_failing = {
+            // Auto-continue ONLY on the transition edge into Merged (not every
+            // tick while it stays Merged), and only when the flag is set.
+            let merged_edge = pr_status == PrStatus::Merged && prev != Some(PrStatus::Merged);
+            if merged_edge {
+                let auto_continue = {
                     let reg = shared.registry.lock().await;
                     reg.worktrees
                         .get(&worktree_path)
-                        .map(|v| v.status == WorktreeStatus::CIFailing)
+                        .map(|v| v.auto_continue_on_merge)
                         .unwrap_or(false)
                 };
-                if was_failing {
+                if auto_continue {
                     tracing::info!(
                         worktree = %worktree_path.display(),
-                        "daemon: CI recovered — setting status Idle"
+                        "daemon: PR merged + auto_continue_on_merge=true — starting continue session"
                     );
-                    shared
-                        .set_status(&worktree_path, WorktreeStatus::Idle, None)
-                        .await;
+                    run_continue_session(Arc::clone(shared), worktree_path);
                 }
-            } else {
-                tracing::info!(
-                    worktree = %worktree_path.display(),
-                    "daemon: CI failing — setting status CIFailing"
-                );
-                shared
-                    .set_status(&worktree_path, WorktreeStatus::CIFailing, None)
-                    .await;
             }
         }
-        // The daemon never receives these from the watcher; ignore.
+        // The daemon never receives the other variants from the watcher; ignore.
         other => {
             tracing::trace!("daemon: ignoring non-watcher AppEvent: {other:?}");
         }
@@ -668,7 +722,7 @@ async fn handle_conn(
         return Ok(());
     }
 
-    let projects = shared.project_names().await;
+    let projects = shared.project_infos().await;
     let snapshot = {
         let reg = shared.registry.lock().await;
         reg.snapshot()
@@ -802,14 +856,10 @@ async fn run_prompt(shared: Arc<Shared>, worktree_path: PathBuf, prompt: String)
         .await;
 
     let Some(backend) = shared.backend_for(&worktree_path).await else {
-        tracing::warn!(
-            worktree = %worktree_path.display(),
-            "daemon: no owning project backend for run_prompt"
+        shared.error(
+            Some(worktree_path.clone()),
+            "no owning project for this worktree".to_string(),
         );
-        shared.broadcast(SupervisorMsg::Error {
-            worktree_path: Some(worktree_path.clone()),
-            message: "no owning project for this worktree".to_string(),
-        });
         return;
     };
     let task_shared = Arc::clone(&shared);
@@ -929,11 +979,7 @@ fn run_builtin(shared: Arc<Shared>, worktree_path: PathBuf, kind: BuiltinKind) {
         match result {
             Ok(prompt) => run_prompt(Arc::clone(&shared), worktree_path, prompt).await,
             Err(e) => {
-                tracing::warn!(worktree = %worktree_path.display(), "daemon: gh command error: {e}");
-                shared.broadcast(SupervisorMsg::Error {
-                    worktree_path: Some(worktree_path),
-                    message: format!("{e}"),
-                });
+                shared.error(Some(worktree_path), format!("gh command error: {e}"));
             }
         }
     });
@@ -1049,11 +1095,7 @@ async fn new_worktree(
             .map(|p| (p.root.clone(), p.project_config.worktrees_base(&p.root)))
     };
     let Some((root, base)) = resolved else {
-        tracing::warn!("daemon: NewWorktree for unknown project {project}");
-        shared.broadcast(SupervisorMsg::Error {
-            worktree_path: None,
-            message: format!("unknown project: {project}"),
-        });
+        shared.error(None, format!("unknown project: {project}"));
         return;
     };
 
@@ -1065,11 +1107,10 @@ async fn new_worktree(
     let parent = path.parent().expect("path always has a parent");
 
     if let Err(e) = std::fs::create_dir_all(parent) {
-        tracing::warn!("daemon: cannot create worktrees dir {:?}: {e}", parent);
-        shared.broadcast(SupervisorMsg::Error {
-            worktree_path: None,
-            message: format!("cannot create worktrees dir {}: {e}", parent.display()),
-        });
+        shared.error(
+            None,
+            format!("cannot create worktrees dir {}: {e}", parent.display()),
+        );
         return;
     }
 
@@ -1079,11 +1120,7 @@ async fn new_worktree(
     let created = match manager.create_detached(&path) {
         Ok(wt) => wt,
         Err(e) => {
-            tracing::warn!("daemon: create detached worktree failed: {e}");
-            shared.broadcast(SupervisorMsg::Error {
-                worktree_path: None,
-                message: format!("{e}"),
-            });
+            shared.error(None, format!("create detached worktree failed: {e}"));
             return;
         }
     };
@@ -1138,11 +1175,7 @@ async fn add_project(shared: &Arc<Shared>, path: &Path) {
             shared.broadcast_snapshot(snapshot).await;
         }
         Err(e) => {
-            tracing::warn!("daemon: add project failed: {e}");
-            shared.broadcast(SupervisorMsg::Error {
-                worktree_path: None,
-                message: format!("{e}"),
-            });
+            shared.error(None, format!("add project failed: {e}"));
         }
     }
 }
@@ -1176,31 +1209,63 @@ async fn set_worktree_name(shared: &Arc<Shared>, path: &Path, name: String) {
     shared.broadcast_snapshot(snapshot).await;
 }
 
-/// `RemoveWorktree` — remove via the manager, refresh registry, broadcast.
-async fn remove_worktree(shared: &Arc<Shared>, path: &Path, force: bool) {
+/// `RemoveWorktree` — remove via the manager (always force), drop state + registry,
+/// rebuild watch-set, and broadcast a fresh Snapshot.
+async fn remove_worktree(shared: &Arc<Shared>, path: &Path, _force: bool) {
     let Some(root) = shared.project_root_for(path).await else {
-        tracing::warn!("daemon: no owning project for {} (remove)", path.display());
-        shared.broadcast(SupervisorMsg::Error {
-            worktree_path: Some(path.to_path_buf()),
-            message: "no owning project for this worktree".to_string(),
-        });
+        shared.error(
+            Some(path.to_path_buf()),
+            "no owning project for this worktree".to_string(),
+        );
         return;
     };
-    let manager = WorktreeManager::new(root);
-    match manager.remove(path, force) {
+
+    // The manager handles git + fs removal (always force per the spec).
+    let manager = WorktreeManager::new(root.clone());
+    match manager.remove(path, true) {
         Ok(()) => {
-            let snapshot = shared.rebuild_registry().await;
-            shared.rebuild_watch_set().await;
-            shared.broadcast_snapshot(snapshot).await;
+            tracing::info!("daemon: worktree removed from disk: {}", path.display());
         }
         Err(e) => {
-            tracing::warn!("daemon: remove worktree failed: {e}");
-            shared.broadcast(SupervisorMsg::Error {
-                worktree_path: Some(path.to_path_buf()),
-                message: format!("{e}"),
-            });
+            shared.error(
+                Some(path.to_path_buf()),
+                format!("remove worktree failed: {e}"),
+            );
+            return;
         }
     }
+
+    // Drop the entry from the owning project's state.toml.  Use the canonical
+    // path if possible; fall back to the raw path so stale entries are pruned.
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    match state::load(&root) {
+        Ok(mut st) => {
+            st.remove_worktree(&canonical);
+            // Also try the raw path in case canonicalization diverged.
+            st.remove_worktree(path);
+            if let Err(e) = state::save(&root, &st) {
+                tracing::warn!("daemon: failed to persist worktree removal: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("daemon: failed to load state for removal: {e}"),
+    }
+
+    // Drop from in-memory registry maps so the snapshot is clean even before
+    // rebuild_registry() re-scans git.
+    {
+        let mut reg = shared.registry.lock().await;
+        reg.worktrees.remove(path);
+        reg.worktrees.remove(&canonical);
+        reg.project_of.remove(path);
+        reg.project_of.remove(&canonical);
+        reg.order.retain(|p| p != path && p != &canonical);
+        reg.summaries.remove(path);
+        reg.summaries.remove(&canonical);
+    }
+
+    let snapshot = shared.rebuild_registry().await;
+    shared.rebuild_watch_set().await;
+    shared.broadcast_snapshot(snapshot).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1450,6 +1515,7 @@ mod tests {
     ) {
         let project_name = primary_name(shared).await;
         let root = primary_root(shared).await;
+        let now = chrono::Utc::now();
         let wt = crate::worktree::model::Worktree {
             path: path.to_path_buf(),
             name: "Unnamed".to_string(),
@@ -1458,6 +1524,9 @@ mod tests {
             pr_number: pr,
             auto_continue_on_merge: auto_continue,
             status: WorktreeStatus::Idle,
+            pr_status: crate::worktree::model::PrStatus::NoPr,
+            created_at: now,
+            updated_at: now,
         };
         {
             let mut reg = shared.registry.lock().await;
@@ -1570,34 +1639,26 @@ mod tests {
         );
     }
 
-    // -- SetPrNumber updates watch-set ---------------------------------------
+    // -- watch-set includes every worktree (discovery is by branch now) ------
 
     #[tokio::test]
-    async fn set_pr_number_updates_watch_set() {
+    async fn watch_set_includes_every_worktree_by_path() {
         let (_dir, root) = make_temp_repo();
         let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
         let shared = make_shared(root, gh).await;
 
         let path = PathBuf::from("/tmp/pr-wt");
+        // Seed a worktree with NO pr_number — it must still be watched (the
+        // watcher resolves the PR from the branch each tick).
         seed_worktree(&shared, &path, false, None).await;
 
-        // No PR → watch-set empty.
         shared.rebuild_watch_set().await;
-        assert!(shared.watch_set.lock().await.is_empty());
-
-        handle_client_msg(
-            &shared,
-            ClientMsg::SetPrNumber {
-                worktree_path: path.clone(),
-                pr: Some(77),
-            },
-        )
-        .await;
-
         let ws = shared.watch_set.lock().await;
-        assert_eq!(ws.len(), 1);
-        assert_eq!(ws[0].pr_number, 77);
-        assert_eq!(ws[0].worktree_path, path);
+        // The seeded worktree is watched even though it has no pr_number.
+        assert!(
+            ws.iter().any(|item| item.worktree_path == path),
+            "seeded worktree must be in the watch-set regardless of pr_number"
+        );
     }
 
     // -- Refresh rebuilds from a real temp repo ------------------------------
@@ -1740,10 +1801,109 @@ mod tests {
         );
     }
 
-    // -- Watcher PrMerged → auto-continue ------------------------------------
+    // -- RemoveWorktree -------------------------------------------------------
 
     #[tokio::test]
-    async fn watcher_pr_merged_triggers_continue_for_auto_worktree() {
+    async fn remove_worktree_disappears_from_registry_and_git() {
+        let (_dir, root) = make_temp_repo();
+        let wt_dir = tempfile::tempdir().expect("wt tempdir");
+        let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
+        let shared = make_shared(root.clone(), gh).await;
+
+        // Create a real worktree on disk.
+        let manager = WorktreeManager::new(root.clone());
+        manager
+            .create_detached(wt_dir.path())
+            .expect("create_detached");
+        let canonical = wt_dir.path().canonicalize().expect("canonicalize");
+
+        // Rebuild registry so the daemon knows about it.
+        shared.rebuild_registry().await;
+        {
+            let reg = shared.registry.lock().await;
+            assert!(
+                reg.worktrees.contains_key(&canonical),
+                "worktree should be in registry before removal"
+            );
+        }
+
+        // Send RemoveWorktree.
+        handle_client_msg(
+            &shared,
+            ClientMsg::RemoveWorktree {
+                path: canonical.clone(),
+                force: true,
+            },
+        )
+        .await;
+
+        // Registry must no longer contain the worktree.
+        {
+            let reg = shared.registry.lock().await;
+            assert!(
+                !reg.worktrees.contains_key(&canonical),
+                "worktree must be absent from registry after removal"
+            );
+        }
+
+        // state.toml must not list it.
+        let st = state::load(&root).expect("load state");
+        assert!(
+            st.worktrees.iter().all(|w| w.path != canonical),
+            "removed worktree must not appear in state.toml"
+        );
+
+        // git worktree list must not contain the path.
+        let output = std::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&root)
+            .output()
+            .expect("git worktree list");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains(canonical.to_string_lossy().as_ref()),
+            "removed worktree must not appear in git worktree list"
+        );
+    }
+
+    // -- Watcher PrStatusChanged → pr_status update + merge-edge auto-continue --
+
+    #[tokio::test]
+    async fn watcher_pr_status_changed_updates_registry_and_state() {
+        let (_dir, root) = make_temp_repo();
+        let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
+        let shared = make_shared(root.clone(), gh).await;
+
+        let path = PathBuf::from("/tmp/pr-status-wt");
+        seed_worktree(&shared, &path, false, None).await;
+
+        handle_watch_event(
+            &shared,
+            AppEvent::PrStatusChanged {
+                worktree_path: path.clone(),
+                pr_status: PrStatus::ChecksPassing,
+                pr_number: Some(123),
+            },
+        )
+        .await;
+
+        // Registry reflects the new pr_status + pr_number; agent status untouched.
+        {
+            let reg = shared.registry.lock().await;
+            let v = reg.worktrees.get(&path).unwrap();
+            assert_eq!(v.pr_status, PrStatus::ChecksPassing);
+            assert_eq!(v.pr_number, Some(123));
+            assert_eq!(v.status, WorktreeStatus::Idle);
+        }
+        // Persisted to state.toml.
+        let st = state::load(&root).expect("load");
+        let w = st.worktrees.iter().find(|w| w.path == path).unwrap();
+        assert_eq!(w.pr_status, PrStatus::ChecksPassing);
+        assert_eq!(w.pr_number, Some(123));
+    }
+
+    #[tokio::test]
+    async fn watcher_merge_edge_triggers_continue_for_auto_worktree() {
         let (_dir, root) = make_temp_repo();
         let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
         let shared = make_shared(root, gh).await;
@@ -1753,25 +1913,23 @@ mod tests {
 
         let mut sub = shared.events.subscribe();
 
-        // Feed a PrMerged event as the watcher would.
+        // Transition into Merged → continue session starts.
         handle_watch_event(
             &shared,
-            AppEvent::PrMerged {
+            AppEvent::PrStatusChanged {
                 worktree_path: path.clone(),
-                pr: 5,
+                pr_status: PrStatus::Merged,
+                pr_number: Some(5),
             },
         )
         .await;
 
-        // We expect: PRMerged, then Running (continue session start), then
-        // eventually NeedsReview (mock session Done).
-        let mut saw_pr_merged = false;
+        // The continue session broadcasts Running then NeedsReview (mock Done).
         let mut saw_running = false;
         let mut saw_review = false;
         for _ in 0..8 {
             match tokio::time::timeout(Duration::from_secs(2), sub.recv()).await {
                 Ok(Ok(SupervisorMsg::StatusChanged { status, .. })) => match status {
-                    WorktreeStatus::PRMerged => saw_pr_merged = true,
                     WorktreeStatus::Running => saw_running = true,
                     WorktreeStatus::NeedsReview => {
                         saw_review = true;
@@ -1779,10 +1937,10 @@ mod tests {
                     }
                     _ => {}
                 },
+                Ok(Ok(_)) => {}
                 _ => break,
             }
         }
-        assert!(saw_pr_merged, "expected PRMerged status");
         assert!(
             saw_running,
             "expected Running status from auto-continue session"
@@ -1791,7 +1949,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watcher_pr_merged_no_continue_when_flag_off() {
+    async fn watcher_merge_no_continue_when_flag_off() {
         let (_dir, root) = make_temp_repo();
         let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
         let shared = make_shared(root, gh).await;
@@ -1801,18 +1959,74 @@ mod tests {
 
         handle_watch_event(
             &shared,
-            AppEvent::PrMerged {
+            AppEvent::PrStatusChanged {
                 worktree_path: path.clone(),
-                pr: 9,
+                pr_status: PrStatus::Merged,
+                pr_number: Some(9),
             },
         )
         .await;
 
-        // Status should be PRMerged and NOT progress to Running.
+        // pr_status is Merged but agent status stays Idle (no continue session).
         let reg = shared.registry.lock().await;
-        assert_eq!(
-            reg.worktrees.get(&path).map(|v| v.status.clone()),
-            Some(WorktreeStatus::PRMerged)
+        let v = reg.worktrees.get(&path).unwrap();
+        assert_eq!(v.pr_status, PrStatus::Merged);
+        assert_eq!(v.status, WorktreeStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn watcher_no_reissue_continue_while_staying_merged() {
+        let (_dir, root) = make_temp_repo();
+        let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
+        let shared = make_shared(root, gh).await;
+
+        let path = PathBuf::from("/tmp/stay-merged-wt");
+        seed_worktree(&shared, &path, /* auto_continue */ true, Some(11)).await;
+
+        // First merge edge fires the continue session.
+        handle_watch_event(
+            &shared,
+            AppEvent::PrStatusChanged {
+                worktree_path: path.clone(),
+                pr_status: PrStatus::Merged,
+                pr_number: Some(11),
+            },
+        )
+        .await;
+
+        // Drain everything the first event produced.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut sub = shared.events.subscribe();
+
+        // A second Merged observation (no transition) must NOT re-trigger a
+        // continue session → no Running broadcast follows.
+        handle_watch_event(
+            &shared,
+            AppEvent::PrStatusChanged {
+                worktree_path: path.clone(),
+                pr_status: PrStatus::Merged,
+                pr_number: Some(11),
+            },
+        )
+        .await;
+
+        let mut saw_running = false;
+        for _ in 0..4 {
+            match tokio::time::timeout(Duration::from_millis(200), sub.recv()).await {
+                Ok(Ok(SupervisorMsg::StatusChanged {
+                    status: WorktreeStatus::Running,
+                    ..
+                })) => {
+                    saw_running = true;
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(
+            !saw_running,
+            "must not re-trigger continue while staying Merged"
         );
     }
 
@@ -1860,6 +2074,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_infos_carries_name_and_path_in_order() {
+        let (_d1, root1) = make_temp_repo();
+        let (_d2, root2) = make_temp_repo();
+        let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
+        let shared = make_shared_with(
+            vec![
+                make_runtime("alpha", root1.clone()),
+                make_runtime("beta", root2.clone()),
+            ],
+            gh,
+        )
+        .await;
+
+        let infos = shared.project_infos().await;
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].name, "alpha");
+        assert_eq!(infos[0].path, root1);
+        assert_eq!(infos[1].name, "beta");
+        assert_eq!(infos[1].path, root2);
+    }
+
+    #[tokio::test]
     async fn state_write_goes_to_owning_project() {
         let (_d1, root1) = make_temp_repo();
         let (_d2, root2) = make_temp_repo();
@@ -1875,6 +2111,7 @@ mod tests {
 
         // Seed a worktree owned by "beta" (second project).
         let path = PathBuf::from("/tmp/beta-owned-wt");
+        let now = chrono::Utc::now();
         let wt = crate::worktree::model::Worktree {
             path: path.clone(),
             name: "Unnamed".to_string(),
@@ -1883,6 +2120,9 @@ mod tests {
             pr_number: None,
             auto_continue_on_merge: false,
             status: WorktreeStatus::Idle,
+            pr_status: crate::worktree::model::PrStatus::NoPr,
+            created_at: now,
+            updated_at: now,
         };
         {
             let mut reg = shared.registry.lock().await;
@@ -2051,5 +2291,37 @@ mod tests {
 
         // The project count is unchanged (still just alpha).
         assert_eq!(shared.projects.lock().await.len(), 1);
+    }
+
+    // -- Shared::error helper -------------------------------------------------
+
+    /// `Shared::error` must BOTH broadcast the Error message and log it (i.e.
+    /// a subscriber sees exactly one Error variant with the expected fields).
+    #[tokio::test]
+    async fn shared_error_broadcasts_and_logs() {
+        let (_dir, root) = make_temp_repo();
+        let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
+        let shared = make_shared(root, gh).await;
+
+        let mut sub = shared.events.subscribe();
+
+        let wt_path = PathBuf::from("/tmp/error-test-wt");
+        shared.error(Some(wt_path.clone()), "something went wrong".to_string());
+
+        let msg = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("timeout waiting for broadcast")
+            .expect("recv error");
+
+        match msg {
+            SupervisorMsg::Error {
+                worktree_path,
+                message,
+            } => {
+                assert_eq!(worktree_path.as_deref(), Some(wt_path.as_path()));
+                assert_eq!(message, "something went wrong");
+            }
+            other => panic!("expected SupervisorMsg::Error, got {other:?}"),
+        }
     }
 }

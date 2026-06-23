@@ -14,8 +14,7 @@ use tokio::sync::mpsc;
 use crate::client::SupervisorClient;
 use crate::commands::{self, CommandId, NewWorktreeModal, Palette, WorktreeChoice};
 use crate::config::Config;
-use crate::ipc::{BuiltinKind, ClientMsg, WorktreeView};
-use crate::prompts::PromptStore;
+use crate::ipc::{BuiltinKind, ClientMsg, ProjectInfo, WorktreeView};
 use crate::ui::detail::{split_grid_detail, DetailView};
 use crate::ui::grid::GridView;
 use crate::ui::keymap::{clamp_selection, Motion};
@@ -29,8 +28,9 @@ pub enum AppEvent {
     Quit,
     /// Full state snapshot from the daemon (handshake / Refresh / create / remove).
     Snapshot {
-        /// Ordered project names (drives grid grouping + the project picker).
-        projects: Vec<String>,
+        /// Ordered projects (name + path); drives grid grouping, the project
+        /// picker, and the per-project prompt stores in the library.
+        projects: Vec<ProjectInfo>,
         worktrees: Vec<WorktreeView>,
     },
     /// Incremental status update for a single worktree from the daemon.
@@ -46,19 +46,15 @@ pub enum AppEvent {
     },
     /// The daemon connection dropped (daemon died or socket closed).
     DaemonDisconnected,
-    /// The background watcher detected that a PR transitioned to merged.
+    /// The background watcher observed a change in a worktree's PR status.
     ///
     /// Emitted only by the daemon-side watcher → handled inside the daemon; the
     /// client never receives this variant, but the watcher → daemon channel is
     /// typed as `AppEvent`, so it stays defined here.
-    PrMerged {
+    PrStatusChanged {
         worktree_path: PathBuf,
-        pr: u64,
-    },
-    /// The background watcher detected a CI status change (daemon-side only).
-    CiStatusChanged {
-        worktree_path: PathBuf,
-        all_passing: bool,
+        pr_status: crate::worktree::model::PrStatus,
+        pr_number: Option<u64>,
     },
 }
 
@@ -80,6 +76,14 @@ pub enum GridMode {
     NameInput,
 }
 
+/// The worktree pending deletion, held while the (y/N) confirmation modal is open.
+pub struct DeleteTarget {
+    /// Canonical filesystem path of the worktree to delete.
+    pub path: PathBuf,
+    /// Human-facing name shown in the confirmation modal.
+    pub name: String,
+}
+
 pub struct App {
     pub running: bool,
     pub view: View,
@@ -91,10 +95,10 @@ pub struct App {
     detail: DetailView,
     /// Local cache of worktree views pushed by the daemon.
     worktrees: Vec<WorktreeView>,
-    /// Authoritative ordered project-name list pushed by the daemon.  Drives
-    /// grid grouping (so zero-worktree projects still get a header) and the
-    /// new-worktree modal's project picker.
-    projects: Vec<String>,
+    /// Authoritative ordered project list pushed by the daemon.  Drives grid
+    /// grouping (so zero-worktree projects still get a header), the new-worktree
+    /// modal's project picker, and the library's per-project prompt stores.
+    projects: Vec<ProjectInfo>,
     /// Transient status message shown in the status line.
     /// Persists until replaced or explicitly cleared.
     status_message: Option<String>,
@@ -116,17 +120,20 @@ pub struct App {
     /// Add-project path input overlay; `Some` while open (`A`).  Holds the
     /// in-progress path string (prefilled with the cwd).  Intercepts all keys.
     add_project_input: Option<String>,
+    /// Pending worktree deletion awaiting (y/N) confirmation.  `Some` while the
+    /// confirmation modal is open; `None` otherwise.
+    pending_delete: Option<DeleteTarget>,
 }
 
 impl App {
     pub fn new(
         event_rx: mpsc::Receiver<AppEvent>,
-        prompt_dir: PathBuf,
         config: Config,
         client: SupervisorClient,
     ) -> Self {
-        let store = PromptStore::new(prompt_dir);
-        let library = LibraryView::new(store);
+        // The library starts empty and fills per-project on the first Snapshot
+        // (same as the grid) — prompts now live at <project>/.karazhan/prompts/.
+        let library = LibraryView::new();
 
         Self {
             running: true,
@@ -147,6 +154,7 @@ impl App {
             palette: None,
             new_worktree: None,
             add_project_input: None,
+            pending_delete: None,
         }
     }
 
@@ -166,8 +174,12 @@ impl App {
                     View::Grid => {
                         let (grid_area, detail_area) = split_grid_detail(area);
 
+                        // The grid groups by project NAME; derive the ordered
+                        // name list from the ProjectInfo snapshot.
+                        let project_names: Vec<String> =
+                            self.projects.iter().map(|p| p.name.clone()).collect();
                         self.grid
-                            .render(frame, grid_area, &self.projects, &self.worktrees);
+                            .render(frame, grid_area, &project_names, &self.worktrees);
 
                         let selected_wt = self.worktrees.get(self.grid.selected);
                         let summary = selected_wt.and_then(|wt| wt.last_summary.as_deref());
@@ -208,6 +220,11 @@ impl App {
                 // Render the add-project path input on top of everything.
                 if let Some(input) = &self.add_project_input {
                     crate::ui::palette::render_add_project(frame, area, input);
+                }
+
+                // Render the delete-confirmation modal last (topmost).
+                if let Some(target) = &self.pending_delete {
+                    crate::ui::palette::render_confirm_delete(frame, area, &target.name);
                 }
             })?;
 
@@ -350,6 +367,29 @@ impl App {
             // New-worktree modal: while open it intercepts ALL keys.
             if self.new_worktree.is_some() {
                 self.handle_new_worktree_key(code, modifiers).await;
+                return;
+            }
+
+            // Delete-confirmation modal: while open intercepts ALL keys.
+            // Only y/Y confirms; everything else (including N/n/Esc) cancels.
+            if self.pending_delete.is_some() {
+                match code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        if let Some(target) = self.pending_delete.take() {
+                            self.client
+                                .send(ClientMsg::RemoveWorktree {
+                                    path: target.path,
+                                    force: true,
+                                })
+                                .await;
+                            self.set_status("deleting worktree…");
+                        }
+                    }
+                    _ => {
+                        self.pending_delete = None;
+                        self.set_status("delete cancelled");
+                    }
+                }
                 return;
             }
 
@@ -529,8 +569,18 @@ impl App {
 
         match phase {
             NewWorktreePhase::PickProject => {
-                if let Some(m) = self.new_worktree.as_mut() {
-                    m.advance_to_choice();
+                // Resolve the highlighted project's prompts, then advance the
+                // modal into PickChoice scoped to ONLY that project's prompts.
+                let picked = self
+                    .new_worktree
+                    .as_ref()
+                    .and_then(|m| m.selected_project_row().map(str::to_string));
+                if let Some(project) = picked {
+                    let choices = self.library.prompts_for_project(&project);
+                    if let Some(m) = self.new_worktree.as_mut() {
+                        m.set_choices(choices);
+                        m.advance_to_choice();
+                    }
                 }
             }
             NewWorktreePhase::PickChoice => {
@@ -666,12 +716,16 @@ impl App {
                     self.set_status("add a project first (A)");
                 } else {
                     // The modal owns project + choice selection.  With one
-                    // project it opens straight to the choice list; with more it
-                    // opens the project picker first.
-                    self.new_worktree = Some(NewWorktreeModal::new(
-                        self.projects.clone(),
-                        self.library.all_prompt_choices(),
-                    ));
+                    // project it opens straight to that project's choice list;
+                    // with more it opens the project picker first and the
+                    // choices are filled once a project is picked.
+                    let names: Vec<String> = self.projects.iter().map(|p| p.name.clone()).collect();
+                    let choices = if names.len() == 1 {
+                        self.library.prompts_for_project(&names[0])
+                    } else {
+                        Vec::new()
+                    };
+                    self.new_worktree = Some(NewWorktreeModal::new(names, choices));
                 }
             }
             CommandId::AddProject => {
@@ -685,6 +739,17 @@ impl App {
                 if self.selected_worktree_path().is_some() {
                     self.grid_mode = GridMode::NameInput;
                     self.prompt_input.clear();
+                } else {
+                    self.set_status("no worktree selected");
+                }
+            }
+            CommandId::DeleteWorktree => {
+                self.view = View::Grid;
+                if let Some(wt) = self.worktrees.get(self.grid.selected) {
+                    self.pending_delete = Some(DeleteTarget {
+                        path: wt.path.clone(),
+                        name: wt.name.clone(),
+                    });
                 } else {
                     self.set_status("no worktree selected");
                 }
@@ -730,6 +795,13 @@ impl App {
                 KeyCode::Esc => self.library.clear_filter(),
                 KeyCode::Backspace => self.library.filter_pop(),
                 KeyCode::Char(ch) => self.library.filter_push(ch),
+                _ => {}
+            },
+            LibraryMode::NewPromptProject => match code {
+                KeyCode::Esc => self.library.cancel_input(),
+                KeyCode::Enter => self.library.confirm_new_prompt_project(),
+                KeyCode::Char('j') | KeyCode::Down => self.library.new_prompt_project_move(1),
+                KeyCode::Char('k') | KeyCode::Up => self.library.new_prompt_project_move(-1),
                 _ => {}
             },
             LibraryMode::NewPrompt => match code {
@@ -807,11 +879,18 @@ impl App {
             return;
         }
 
+        // Derive `cols` from the grid PANE width (not the full terminal width)
+        // so motion and render use the exact same column count.
+        // `split_grid_detail` reserves 36 columns for the detail pane on the
+        // right, so grid_width = terminal_width - 36, floored at CELL_W (22).
         let cols = {
-            let w = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
-            crate::ui::grid::GridView::cols_for_width(w)
+            let (term_w, _) = crossterm::terminal::size().unwrap_or((80, 24));
+            let detail_w: u16 = 36;
+            let grid_w = term_w.saturating_sub(detail_w).max(crate::ui::grid::CELL_W);
+            crate::ui::grid::GridView::cols_for_width(grid_w)
         };
-        let count = self.worktrees.len();
+
+        let project_names: Vec<String> = self.projects.iter().map(|p| p.name.clone()).collect();
 
         match code {
             KeyCode::Char(ch @ '0'..='9') => {
@@ -821,26 +900,36 @@ impl App {
 
             KeyCode::Char('h') | KeyCode::Left => {
                 self.grid.clear_pending_count();
-                self.grid.apply(Motion::Left, count, cols);
+                self.grid
+                    .apply(Motion::Left, &project_names, &self.worktrees, cols);
             }
             KeyCode::Char('l') | KeyCode::Right => {
                 self.grid.clear_pending_count();
-                self.grid.apply(Motion::Right, count, cols);
+                self.grid
+                    .apply(Motion::Right, &project_names, &self.worktrees, cols);
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.grid.clear_pending_count();
-                self.grid.apply(Motion::Down, count, cols);
+                self.grid
+                    .apply(Motion::Down, &project_names, &self.worktrees, cols);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.grid.clear_pending_count();
-                self.grid.apply(Motion::Up, count, cols);
+                self.grid
+                    .apply(Motion::Up, &project_names, &self.worktrees, cols);
             }
             KeyCode::Char('g') => {
                 self.grid.clear_pending_count();
-                self.grid.apply(Motion::First, count, cols);
+                self.grid
+                    .apply(Motion::First, &project_names, &self.worktrees, cols);
             }
             KeyCode::Char('G') => {
-                self.grid.apply(Motion::Last { count: None }, count, cols);
+                self.grid.apply(
+                    Motion::Last { count: None },
+                    &project_names,
+                    &self.worktrees,
+                    cols,
+                );
             }
 
             KeyCode::Char('r') => {
@@ -876,6 +965,11 @@ impl App {
             KeyCode::Char('N') => {
                 self.grid.clear_pending_count();
                 self.execute_command(CommandId::RenameWorktree).await;
+            }
+
+            KeyCode::Char('d') => {
+                self.grid.clear_pending_count();
+                self.execute_command(CommandId::DeleteWorktree).await;
             }
 
             KeyCode::Char('A') => {
@@ -974,6 +1068,9 @@ impl App {
                 worktrees,
             } => {
                 self.projects = projects;
+                // Rebuild the library's per-project prompt stores from the new
+                // project list (reads <project>/.karazhan/prompts/ per project).
+                self.library.set_projects(&self.projects);
                 self.worktrees = worktrees;
                 self.grid.selected = clamp_selection(self.grid.selected, self.worktrees.len());
             }
@@ -1005,8 +1102,8 @@ impl App {
                 tracing::warn!("daemon disconnected");
                 self.set_status("daemon disconnected — restart karazhan to reconnect");
             }
-            // Watcher-only variants the client never receives.
-            AppEvent::PrMerged { .. } | AppEvent::CiStatusChanged { .. } => {}
+            // Watcher-only variant the client never receives.
+            AppEvent::PrStatusChanged { .. } => {}
         }
     }
 

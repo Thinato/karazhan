@@ -7,6 +7,9 @@
 # per-user project config (committed example lives at .karazhan/config.example.toml)
 .karazhan/config.toml
 
+# NOTE: .karazhan/prompts/ is intentionally NOT ignored — project-specific
+# prompts are committed and ship with the repo.
+
 # detached worktrees created via the "new worktree" modal (working copies).
 # The default location is now $XDG_DATA_HOME/karazhan/worktrees/<owner>/<project>/<uuid>/
 # (outside the repo). This entry covers repos that override worktrees_dir back

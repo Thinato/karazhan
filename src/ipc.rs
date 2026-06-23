@@ -18,7 +18,9 @@ use anyhow::{bail, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::worktree::model::{Worktree, WorktreeStatus};
+use chrono::{DateTime, Utc};
+
+use crate::worktree::model::{PrStatus, Worktree, WorktreeStatus};
 
 // ── Protocol version ─────────────────────────────────────────────────────────
 
@@ -50,7 +52,7 @@ use crate::worktree::model::{Worktree, WorktreeStatus};
 /// the handshake request and a `ProtocolMismatch` reply even when every other
 /// wire-format item has changed. Do NOT reorder these two; only append new
 /// variants after `ProtocolMismatch`.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Maximum frame body size accepted by `read_frame_async` (64 MiB).
 const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
@@ -70,8 +72,14 @@ pub struct WorktreeView {
     pub pr_number: Option<u64>,
     pub auto_continue_on_merge: bool,
     pub status: WorktreeStatus,
+    /// PR status (separate axis from the agent-activity `status`).
+    pub pr_status: PrStatus,
     /// Last agent summary line received for this worktree.
     pub last_summary: Option<String>,
+    /// When the worktree was first created.
+    pub created_at: DateTime<Utc>,
+    /// When the worktree was last used (any status/name/PR/flag mutation).
+    pub updated_at: DateTime<Utc>,
 }
 
 impl WorktreeView {
@@ -87,9 +95,24 @@ impl WorktreeView {
             pr_number: wt.pr_number,
             auto_continue_on_merge: wt.auto_continue_on_merge,
             status: wt.status.clone(),
+            pr_status: wt.pr_status,
             last_summary,
+            created_at: wt.created_at,
+            updated_at: wt.updated_at,
         }
     }
+}
+
+// ── ProjectInfo ────────────────────────────────────────────────────────────────
+
+/// A managed project: its supervisor-assigned name and its root path on disk.
+///
+/// The client needs the path (not just the name) because per-project prompts
+/// live at `<path>/.karazhan/prompts/` and are read client-side.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ProjectInfo {
+    pub name: String,
+    pub path: PathBuf,
 }
 
 // ── BuiltinKind ──────────────────────────────────────────────────────────────
@@ -120,8 +143,8 @@ pub struct HandshakeReq {
 pub enum HandshakeResp {
     Ok {
         supervisor_pid: u32,
-        /// Ordered project names (same order the daemon uses for grid grouping).
-        projects: Vec<String>,
+        /// Ordered projects (same order the daemon uses for grid grouping).
+        projects: Vec<ProjectInfo>,
         worktrees: Vec<WorktreeView>,
     },
     ProtocolMismatch {
@@ -188,8 +211,8 @@ pub enum ClientMsg {
 pub enum SupervisorMsg {
     /// Full state snapshot (after Refresh / create / remove).
     Snapshot {
-        /// Ordered project names (same order the daemon uses for grid grouping).
-        projects: Vec<String>,
+        /// Ordered projects (same order the daemon uses for grid grouping).
+        projects: Vec<ProjectInfo>,
         worktrees: Vec<WorktreeView>,
     },
     /// Incremental update for a single worktree.
@@ -331,6 +354,7 @@ mod tests {
 
     #[test]
     fn worktree_view_round_trip() {
+        let now = Utc::now();
         let wv = WorktreeView {
             path: PathBuf::from("/repo/feature"),
             project: "karazhan".into(),
@@ -340,9 +364,42 @@ mod tests {
             pr_number: Some(42),
             auto_continue_on_merge: true,
             status: WorktreeStatus::Running,
+            pr_status: PrStatus::ChecksPassing,
             last_summary: Some("done".into()),
+            created_at: now,
+            updated_at: now,
         };
         rt(&wv);
+    }
+
+    #[test]
+    fn worktree_view_round_trip_pr_status_variants() {
+        let now = Utc::now();
+        for pr_status in [
+            PrStatus::NoPr,
+            PrStatus::Draft,
+            PrStatus::Open,
+            PrStatus::ChecksFailing,
+            PrStatus::ChecksPassing,
+            PrStatus::Merged,
+            PrStatus::Closed,
+        ] {
+            let wv = WorktreeView {
+                path: PathBuf::from("/repo/feature"),
+                project: "karazhan".into(),
+                name: "wt".into(),
+                branch: "feat".into(),
+                prompt_slug: None,
+                pr_number: Some(7),
+                auto_continue_on_merge: false,
+                status: WorktreeStatus::Idle,
+                pr_status,
+                last_summary: None,
+                created_at: now,
+                updated_at: now,
+            };
+            rt(&wv);
+        }
     }
 
     // ── HandshakeReq / HandshakeResp ──────────────────────────────────────────
@@ -357,9 +414,19 @@ mod tests {
 
     #[test]
     fn handshake_resp_ok_round_trip() {
+        let now = Utc::now();
         rt(&HandshakeResp::Ok {
             supervisor_pid: 999,
-            projects: vec!["proj".into(), "empty-proj".into()],
+            projects: vec![
+                ProjectInfo {
+                    name: "proj".into(),
+                    path: PathBuf::from("/repo/proj"),
+                },
+                ProjectInfo {
+                    name: "empty-proj".into(),
+                    path: PathBuf::from("/repo/empty-proj"),
+                },
+            ],
             worktrees: vec![WorktreeView {
                 path: PathBuf::from("/a"),
                 project: "proj".into(),
@@ -369,7 +436,10 @@ mod tests {
                 pr_number: None,
                 auto_continue_on_merge: false,
                 status: WorktreeStatus::Idle,
+                pr_status: PrStatus::NoPr,
                 last_summary: None,
+                created_at: now,
+                updated_at: now,
             }],
         });
     }
@@ -382,8 +452,16 @@ mod tests {
     // ── Protocol version + frozen wire format ─────────────────────────────────
 
     #[test]
-    fn protocol_version_is_four() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+    fn protocol_version_is_seven() {
+        assert_eq!(PROTOCOL_VERSION, 7);
+    }
+
+    #[test]
+    fn project_info_round_trip() {
+        rt(&ProjectInfo {
+            name: "karazhan".into(),
+            path: PathBuf::from("/repo/karazhan"),
+        });
     }
 
     /// Locks the FROZEN variant order of `HandshakeResp`: the first body byte is
@@ -544,7 +622,16 @@ mod tests {
     #[test]
     fn supervisor_msg_snapshot() {
         rt(&SupervisorMsg::Snapshot {
-            projects: vec!["alpha".into(), "beta".into()],
+            projects: vec![
+                ProjectInfo {
+                    name: "alpha".into(),
+                    path: PathBuf::from("/repo/alpha"),
+                },
+                ProjectInfo {
+                    name: "beta".into(),
+                    path: PathBuf::from("/repo/beta"),
+                },
+            ],
             worktrees: vec![],
         });
     }
@@ -607,7 +694,10 @@ mod tests {
 
         let msgs = vec![
             SupervisorMsg::Snapshot {
-                projects: vec!["alpha".into()],
+                projects: vec![ProjectInfo {
+                    name: "alpha".into(),
+                    path: PathBuf::from("/repo/alpha"),
+                }],
                 worktrees: vec![],
             },
             SupervisorMsg::StatusChanged {
@@ -707,6 +797,7 @@ mod tests {
 
     #[test]
     fn worktree_view_from_worktree() {
+        let now = Utc::now();
         let wt = Worktree {
             path: PathBuf::from("/repo/feat"),
             name: "feat-name".into(),
@@ -715,6 +806,9 @@ mod tests {
             pr_number: Some(3),
             auto_continue_on_merge: false,
             status: WorktreeStatus::CIFailing,
+            pr_status: PrStatus::Merged,
+            created_at: now,
+            updated_at: now,
         };
         let view = WorktreeView::from_worktree(&wt, "karazhan".into(), Some("summary here".into()));
         assert_eq!(view.path, wt.path);
@@ -722,7 +816,10 @@ mod tests {
         assert_eq!(view.name, wt.name);
         assert_eq!(view.branch, wt.branch);
         assert_eq!(view.status, WorktreeStatus::CIFailing);
+        assert_eq!(view.pr_status, PrStatus::Merged);
         assert_eq!(view.last_summary, Some("summary here".into()));
+        assert_eq!(view.created_at, now);
+        assert_eq!(view.updated_at, now);
 
         // No summary → None.
         let view2 = WorktreeView::from_worktree(&wt, "karazhan".into(), None);

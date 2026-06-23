@@ -147,7 +147,7 @@ enum HandshakeOutcome {
         read_half: tokio::net::unix::OwnedReadHalf,
         write_half: tokio::net::unix::OwnedWriteHalf,
         supervisor_pid: u32,
-        projects: Vec<String>,
+        projects: Vec<ipc::ProjectInfo>,
         worktrees: Vec<ipc::WorktreeView>,
     },
     /// Version mismatch OR an undecodable handshake reply (treat the same):
@@ -227,7 +227,7 @@ async fn finish_connect(
     mut read_half: tokio::net::unix::OwnedReadHalf,
     mut write_half: tokio::net::unix::OwnedWriteHalf,
     supervisor_pid: u32,
-    projects: Vec<String>,
+    projects: Vec<ipc::ProjectInfo>,
     worktrees: Vec<ipc::WorktreeView>,
 ) -> Result<SupervisorClient> {
     // Seed the UI with current state immediately.
@@ -353,6 +353,7 @@ mod tests {
 
     #[test]
     fn snapshot_maps_to_app_snapshot() {
+        let now = chrono::Utc::now();
         let views = vec![ipc::WorktreeView {
             path: PathBuf::from("/wt"),
             project: "proj".into(),
@@ -362,9 +363,21 @@ mod tests {
             pr_number: None,
             auto_continue_on_merge: false,
             status: WorktreeStatus::Idle,
+            pr_status: crate::worktree::model::PrStatus::NoPr,
             last_summary: None,
+            created_at: now,
+            updated_at: now,
         }];
-        let projects = vec!["proj".to_string(), "empty".to_string()];
+        let projects = vec![
+            ipc::ProjectInfo {
+                name: "proj".to_string(),
+                path: PathBuf::from("/repo/proj"),
+            },
+            ipc::ProjectInfo {
+                name: "empty".to_string(),
+                path: PathBuf::from("/repo/empty"),
+            },
+        ];
         let event = supervisor_msg_to_app_event(SupervisorMsg::Snapshot {
             projects: projects.clone(),
             worktrees: views.clone(),

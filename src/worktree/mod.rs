@@ -5,4 +5,4 @@ pub mod state;
 #[allow(unused_imports)]
 pub use manager::WorktreeManager;
 #[allow(unused_imports)]
-pub use model::{Worktree, WorktreeStatus};
+pub use model::{PrStatus, Worktree, WorktreeStatus};

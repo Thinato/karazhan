@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use super::model::{Worktree, WorktreeStatus};
@@ -90,30 +91,60 @@ impl State {
         self.worktrees.retain(|w| w.path != path);
     }
 
+    /// Bump `updated_at` to now for the worktree at `path`.  No-op if absent.
+    pub fn touch(&mut self, path: &Path) {
+        if let Some(w) = self.worktrees.iter_mut().find(|w| w.path == path) {
+            w.updated_at = Utc::now();
+        }
+    }
+
     /// Update the human-facing name for a worktree identified by `path`.
-    /// No-op if not found.
+    /// No-op if not found.  Also bumps `updated_at`.
     pub fn set_name(&mut self, path: &Path, name: impl Into<String>) {
         if let Some(w) = self.worktrees.iter_mut().find(|w| w.path == path) {
             w.name = name.into();
+            w.updated_at = Utc::now();
         }
     }
 
     /// Update the status for a worktree identified by `path`.  No-op if not found.
+    /// Also bumps `updated_at`.
     pub fn set_status(&mut self, path: &Path, status: WorktreeStatus) {
         if let Some(w) = self.worktrees.iter_mut().find(|w| w.path == path) {
             w.status = status;
+            w.updated_at = Utc::now();
         }
     }
 
     /// Update the auto-continue flag for a worktree identified by `path`.
+    /// Also bumps `updated_at`.
     pub fn set_auto_continue(&mut self, path: &Path, value: bool) {
         if let Some(w) = self.worktrees.iter_mut().find(|w| w.path == path) {
             w.auto_continue_on_merge = value;
+            w.updated_at = Utc::now();
         }
     }
 
     /// Update the PR number for a worktree identified by `path`.
+    /// Also bumps `updated_at`.
     pub fn set_pr_number(&mut self, path: &Path, pr: Option<u64>) {
+        if let Some(w) = self.worktrees.iter_mut().find(|w| w.path == path) {
+            w.pr_number = pr;
+            w.updated_at = Utc::now();
+        }
+    }
+
+    /// Update the PR status for a worktree identified by `path`.  No-op if not
+    /// found.  Does NOT bump `updated_at` — polling is not user/agent activity.
+    pub fn set_pr_status(&mut self, path: &Path, pr_status: crate::worktree::model::PrStatus) {
+        if let Some(w) = self.worktrees.iter_mut().find(|w| w.path == path) {
+            w.pr_status = pr_status;
+        }
+    }
+
+    /// Set the PR number for a worktree WITHOUT bumping `updated_at` (used by the
+    /// poller, which is not user/agent activity).  No-op if not found.
+    pub fn set_pr_number_no_touch(&mut self, path: &Path, pr: Option<u64>) {
         if let Some(w) = self.worktrees.iter_mut().find(|w| w.path == path) {
             w.pr_number = pr;
         }
@@ -134,8 +165,10 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Utc};
 
     fn make_worktree(path: impl Into<PathBuf>, branch: &str) -> Worktree {
+        let now = Utc::now();
         Worktree {
             path: path.into(),
             name: "Unnamed".to_string(),
@@ -144,6 +177,9 @@ mod tests {
             pr_number: Some(42),
             auto_continue_on_merge: true,
             status: WorktreeStatus::NeedsReview,
+            pr_status: crate::worktree::model::PrStatus::NoPr,
+            created_at: now,
+            updated_at: now,
         }
     }
 
@@ -167,6 +203,17 @@ mod tests {
         assert_eq!(got.pr_number, wt.pr_number);
         assert_eq!(got.auto_continue_on_merge, wt.auto_continue_on_merge);
         assert_eq!(got.status, wt.status);
+        // Timestamps round-trip through TOML (RFC 3339 with second precision).
+        assert_eq!(
+            got.created_at.timestamp(),
+            wt.created_at.timestamp(),
+            "created_at round-trip"
+        );
+        assert_eq!(
+            got.updated_at.timestamp(),
+            wt.updated_at.timestamp(),
+            "updated_at round-trip"
+        );
     }
 
     #[test]
@@ -205,6 +252,39 @@ mod tests {
     }
 
     #[test]
+    fn legacy_toml_without_timestamps_loads_with_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+        let karazhan_dir = repo_root.join(".karazhan");
+        std::fs::create_dir_all(&karazhan_dir).expect("mkdir");
+
+        // A state.toml entry that predates `created_at` / `updated_at`.
+        let toml = "[[worktrees]]\n\
+                    path = \"/tmp/legacy-ts-wt\"\n\
+                    branch = \"legacy\"\n\
+                    name = \"OldName\"\n\
+                    auto_continue_on_merge = false\n\
+                    status = \"idle\"\n";
+        std::fs::write(karazhan_dir.join("state.toml"), toml).expect("write");
+
+        let before = Utc::now();
+        let loaded = load(repo_root).expect("load — must not panic on missing timestamps");
+        let after = Utc::now();
+
+        assert_eq!(loaded.worktrees.len(), 1);
+        let wt = &loaded.worktrees[0];
+        // Defaults are generated at load-time so they should be very close to now.
+        assert!(
+            wt.created_at >= before && wt.created_at <= after,
+            "created_at default should be ~now"
+        );
+        assert!(
+            wt.updated_at >= before && wt.updated_at <= after,
+            "updated_at default should be ~now"
+        );
+    }
+
+    #[test]
     fn missing_file_returns_empty_state() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = load(dir.path()).expect("load");
@@ -215,6 +295,7 @@ mod tests {
     fn upsert_replaces_existing() {
         let mut state = State::default();
         let path = PathBuf::from("/tmp/wt-x");
+        let now = Utc::now();
         state.upsert_worktree(make_worktree(&path, "branch-1"));
         state.upsert_worktree(Worktree {
             path: path.clone(),
@@ -224,6 +305,9 @@ mod tests {
             pr_number: None,
             auto_continue_on_merge: false,
             status: WorktreeStatus::Idle,
+            pr_status: crate::worktree::model::PrStatus::NoPr,
+            created_at: now,
+            updated_at: now,
         });
         assert_eq!(state.worktrees.len(), 1);
         assert_eq!(state.worktrees[0].branch, "branch-2");
@@ -251,5 +335,162 @@ mod tests {
         state.prune_missing(std::slice::from_ref(&p1));
         assert_eq!(state.worktrees.len(), 1);
         assert_eq!(state.worktrees[0].path, p1);
+    }
+
+    #[test]
+    fn touch_bumps_updated_at_not_created_at() {
+        let mut state = State::default();
+        let path = PathBuf::from("/tmp/touch-wt");
+        let past: DateTime<Utc> = "2020-01-01T00:00:00Z".parse().unwrap();
+        let wt = Worktree {
+            path: path.clone(),
+            name: "Unnamed".to_string(),
+            branch: "main".to_string(),
+            prompt_slug: None,
+            pr_number: None,
+            auto_continue_on_merge: false,
+            status: WorktreeStatus::Idle,
+            pr_status: crate::worktree::model::PrStatus::NoPr,
+            created_at: past,
+            updated_at: past,
+        };
+        state.upsert_worktree(wt);
+
+        let before = Utc::now();
+        state.touch(&path);
+        let after = Utc::now();
+
+        let w = &state.worktrees[0];
+        assert_eq!(w.created_at, past, "touch must not modify created_at");
+        assert!(
+            w.updated_at >= before && w.updated_at <= after,
+            "touch must bump updated_at to ~now"
+        );
+    }
+
+    #[test]
+    fn set_status_bumps_updated_at_not_created_at() {
+        let mut state = State::default();
+        let path = PathBuf::from("/tmp/setstatus-wt");
+        let past: DateTime<Utc> = "2020-06-15T12:00:00Z".parse().unwrap();
+        state.upsert_worktree(Worktree {
+            path: path.clone(),
+            name: "Unnamed".to_string(),
+            branch: "feat".to_string(),
+            prompt_slug: None,
+            pr_number: None,
+            auto_continue_on_merge: false,
+            status: WorktreeStatus::Idle,
+            pr_status: crate::worktree::model::PrStatus::NoPr,
+            created_at: past,
+            updated_at: past,
+        });
+
+        let before = Utc::now();
+        state.set_status(&path, WorktreeStatus::Running);
+        let after = Utc::now();
+
+        let w = &state.worktrees[0];
+        assert_eq!(w.created_at, past, "set_status must not modify created_at");
+        assert!(
+            w.updated_at >= before && w.updated_at <= after,
+            "set_status must bump updated_at"
+        );
+    }
+
+    #[test]
+    fn set_name_bumps_updated_at_not_created_at() {
+        let mut state = State::default();
+        let path = PathBuf::from("/tmp/setname-wt");
+        let past: DateTime<Utc> = "2019-03-10T08:00:00Z".parse().unwrap();
+        state.upsert_worktree(Worktree {
+            path: path.clone(),
+            name: "Old".to_string(),
+            branch: "main".to_string(),
+            prompt_slug: None,
+            pr_number: None,
+            auto_continue_on_merge: false,
+            status: WorktreeStatus::Idle,
+            pr_status: crate::worktree::model::PrStatus::NoPr,
+            created_at: past,
+            updated_at: past,
+        });
+
+        let before = Utc::now();
+        state.set_name(&path, "New");
+        let after = Utc::now();
+
+        let w = &state.worktrees[0];
+        assert_eq!(w.created_at, past, "set_name must not modify created_at");
+        assert!(
+            w.updated_at >= before && w.updated_at <= after,
+            "set_name must bump updated_at"
+        );
+    }
+
+    #[test]
+    fn set_auto_continue_bumps_updated_at_not_created_at() {
+        let mut state = State::default();
+        let path = PathBuf::from("/tmp/setac-wt");
+        let past: DateTime<Utc> = "2021-11-20T00:00:00Z".parse().unwrap();
+        state.upsert_worktree(Worktree {
+            path: path.clone(),
+            name: "Unnamed".to_string(),
+            branch: "main".to_string(),
+            prompt_slug: None,
+            pr_number: None,
+            auto_continue_on_merge: false,
+            status: WorktreeStatus::Idle,
+            pr_status: crate::worktree::model::PrStatus::NoPr,
+            created_at: past,
+            updated_at: past,
+        });
+
+        let before = Utc::now();
+        state.set_auto_continue(&path, true);
+        let after = Utc::now();
+
+        let w = &state.worktrees[0];
+        assert_eq!(
+            w.created_at, past,
+            "set_auto_continue must not modify created_at"
+        );
+        assert!(
+            w.updated_at >= before && w.updated_at <= after,
+            "set_auto_continue must bump updated_at"
+        );
+    }
+
+    #[test]
+    fn set_pr_number_bumps_updated_at_not_created_at() {
+        let mut state = State::default();
+        let path = PathBuf::from("/tmp/setpr-wt");
+        let past: DateTime<Utc> = "2022-07-04T16:00:00Z".parse().unwrap();
+        state.upsert_worktree(Worktree {
+            path: path.clone(),
+            name: "Unnamed".to_string(),
+            branch: "feat".to_string(),
+            prompt_slug: None,
+            pr_number: None,
+            auto_continue_on_merge: false,
+            status: WorktreeStatus::Idle,
+            pr_status: crate::worktree::model::PrStatus::NoPr,
+            created_at: past,
+            updated_at: past,
+        });
+
+        let before = Utc::now();
+        state.set_pr_number(&path, Some(99));
+        let after = Utc::now();
+
+        let w = &state.worktrees[0];
+        assert_eq!(
+            w.created_at, past,
+            "set_pr_number must not modify created_at"
+        );
+        assert!(
+            w.updated_at >= before && w.updated_at <= after,
+            "set_pr_number must bump updated_at"
+        );
     }
 }

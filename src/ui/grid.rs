@@ -7,9 +7,9 @@ use ratatui::{
 };
 
 use crate::ipc::WorktreeView;
-use crate::worktree::WorktreeStatus;
+use crate::worktree::{PrStatus, WorktreeStatus};
 
-use super::keymap::{apply_motion, Motion};
+use super::keymap::Motion;
 
 // ---------------------------------------------------------------------------
 // Cell geometry
@@ -53,10 +53,18 @@ impl GridView {
     }
 
     /// Apply a motion, updating `selected`.
-    /// `item_count` is the current length of the worktree list.
-    /// `cols` is the column count computed from the current terminal width.
-    pub fn apply(&mut self, motion: Motion, item_count: usize, cols: usize) {
-        if item_count == 0 {
+    ///
+    /// Uses the SAME per-project visual layout that `render` draws (each project
+    /// group wraps independently at `cols`), so the selection always moves to the
+    /// visually correct cell regardless of group sizes or terminal width.
+    pub fn apply(
+        &mut self,
+        motion: Motion,
+        projects: &[String],
+        worktrees: &[WorktreeView],
+        cols: usize,
+    ) {
+        if worktrees.is_empty() {
             self.selected = 0;
             self.pending_count = None;
             return;
@@ -69,7 +77,8 @@ impl GridView {
             other => other,
         };
 
-        self.selected = apply_motion(self.selected, item_count, cols, motion_with_count);
+        let rows = visual_rows(projects, worktrees, cols);
+        self.selected = move_in_layout(&rows, self.selected, motion_with_count);
         self.pending_count = None;
     }
 
@@ -162,8 +171,10 @@ impl GridView {
     }
 
     fn render_cell(&self, frame: &mut Frame, area: Rect, wt: &WorktreeView, selected: bool) {
-        // Derive colors from status.
+        // BORDER + name label colors come from the agent-activity status.
         let (border_color, label_color) = status_colors(&wt.status);
+        // The colored STATUS TAG line is the PR status (separate axis).
+        let pr_color = pr_status_colors(&wt.pr_status);
 
         let border_type = if selected {
             BorderType::Double
@@ -203,8 +214,8 @@ impl GridView {
         }
         let meta_label = truncate(&meta_parts.join(" "), inner_w);
 
-        // Status badge (short tag shown on line 3).
-        let status_tag = status_tag(&wt.status);
+        // Status badge (short tag shown on line 3) — reflects the PR status.
+        let status_tag = pr_status_label(&wt.pr_status).to_string();
 
         let label_style = if selected {
             Style::default()
@@ -218,12 +229,10 @@ impl GridView {
         let status_style = if selected {
             Style::default()
                 .fg(Color::Black)
-                .bg(label_color)
+                .bg(pr_color)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
-                .fg(label_color)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(pr_color).add_modifier(Modifier::BOLD)
         };
 
         // Clear the cell first so overlapping cells from a previous frame don't
@@ -253,6 +262,150 @@ impl GridView {
 impl Default for GridView {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Layout-aware motion
+// ---------------------------------------------------------------------------
+
+/// Build the visual row layout that exactly matches what `render` draws.
+///
+/// Returns a list of rows in top-to-bottom visual order.  Each row is a `Vec`
+/// of FLAT indices (flat = project-ordered concatenation, same ordering as
+/// `group_by_project` flattening): the indices of the cells that appear in
+/// that visual row, left-to-right.
+///
+/// Per-project wrapping: for each non-empty group (in `projects` order) its
+/// worktrees wrap at `cols`.  A group with `k` worktrees produces
+/// `ceil(k / cols)` rows; the last row may be partial.  Empty groups
+/// contribute NO rows (only a non-selectable header line in `render`).
+///
+/// `cols` is clamped to ≥ 1.  The flat index increments exactly as `render`
+/// does: only inside the per-group cell loop, so empty groups add 0 to `flat`.
+pub fn visual_rows(
+    projects: &[String],
+    worktrees: &[WorktreeView],
+    cols: usize,
+) -> Vec<Vec<usize>> {
+    let cols = cols.max(1);
+    let groups = group_by_project(projects, worktrees);
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    let mut flat: usize = 0;
+
+    for group in &groups {
+        if group.is_empty() {
+            // Empty groups: `render` increments `flat` 0 times. No selectable rows.
+            continue;
+        }
+        // Partition this group's worktrees into rows of `cols`.
+        let mut local = 0usize;
+        while local < group.len() {
+            let end = (local + cols).min(group.len());
+            let row: Vec<usize> = (local..end).map(|i| flat + i).collect();
+            rows.push(row);
+            local += cols;
+        }
+        flat += group.len();
+    }
+
+    rows
+}
+
+/// Compute the next selection index after applying `motion` to the given
+/// visual row layout produced by [`visual_rows`].
+///
+/// - Left  : c > 0 → same row, c-1; else r > 0 → last cell of rows[r-1]; else stay.
+/// - Right : c < row.len()-1 → same row, c+1; else r < last → rows[r+1][0]; else stay.
+/// - Up    : r > 0 → rows[r-1][min(c, rows[r-1].len()-1)]; else stay.
+/// - Down  : r < last → rows[r+1][min(c, rows[r+1].len()-1)]; else stay.
+/// - First : rows[0][0].
+/// - Last{None}    : last cell of last row.
+/// - Last{Some(n)} : 1-based flat index n, clamped to [1, total], mapped to actual flat index.
+///
+/// Returns the new flat `selected`, always in the valid range.
+pub fn move_in_layout(rows: &[Vec<usize>], selected: usize, motion: Motion) -> usize {
+    if rows.is_empty() {
+        return 0;
+    }
+
+    // Total number of selectable items = sum of all row lengths.
+    let total: usize = rows.iter().map(|r| r.len()).sum();
+
+    // Locate the current selection.
+    let mut cur_row = 0usize;
+    let mut cur_col = 0usize;
+    let mut found = false;
+    'outer: for (r, row) in rows.iter().enumerate() {
+        for (c, &flat) in row.iter().enumerate() {
+            if flat == selected {
+                cur_row = r;
+                cur_col = c;
+                found = true;
+                break 'outer;
+            }
+        }
+    }
+    if !found {
+        // selected not in layout (e.g. stale index after resize) — snap to first.
+        return rows[0][0];
+    }
+
+    let last_row = rows.len() - 1;
+
+    match motion {
+        Motion::Left => {
+            if cur_col > 0 {
+                rows[cur_row][cur_col - 1]
+            } else if cur_row > 0 {
+                // Wrap to last cell of the previous row.
+                *rows[cur_row - 1].last().unwrap()
+            } else {
+                selected
+            }
+        }
+        Motion::Right => {
+            if cur_col + 1 < rows[cur_row].len() {
+                rows[cur_row][cur_col + 1]
+            } else if cur_row < last_row {
+                // Wrap to first cell of the next row.
+                rows[cur_row + 1][0]
+            } else {
+                selected
+            }
+        }
+        Motion::Up => {
+            if cur_row > 0 {
+                let c = cur_col.min(rows[cur_row - 1].len() - 1);
+                rows[cur_row - 1][c]
+            } else {
+                selected
+            }
+        }
+        Motion::Down => {
+            if cur_row < last_row {
+                let c = cur_col.min(rows[cur_row + 1].len() - 1);
+                rows[cur_row + 1][c]
+            } else {
+                selected
+            }
+        }
+        Motion::First => rows[0][0],
+        Motion::Last { count: None } => *rows[last_row].last().unwrap(),
+        Motion::Last { count: Some(n) } => {
+            // 1-based index n into the flat selectable sequence; clamp to [1, total].
+            let one_based = n.max(1).min(total);
+            // Walk the rows to find the (one_based - 1)th flat index.
+            let mut remaining = one_based - 1;
+            for row in rows {
+                if remaining < row.len() {
+                    return row[remaining];
+                }
+                remaining -= row.len();
+            }
+            // Fallback (should not reach here after clamping).
+            *rows[last_row].last().unwrap()
+        }
     }
 }
 
@@ -353,15 +506,29 @@ fn status_colors(status: &WorktreeStatus) -> (Color, Color) {
     }
 }
 
-/// Short human-readable tag for a status.
-fn status_tag(status: &WorktreeStatus) -> String {
-    match status {
-        WorktreeStatus::Idle => "idle".to_string(),
-        WorktreeStatus::Running => "running…".to_string(),
-        WorktreeStatus::NeedsReview => "needs review".to_string(),
-        WorktreeStatus::CIFailing => "CI failing".to_string(),
-        WorktreeStatus::PRMerged => "PR merged".to_string(),
-        WorktreeStatus::Error => "error".to_string(),
+/// Color for a PR status tag (per the fixed taxonomy).
+fn pr_status_colors(pr: &PrStatus) -> Color {
+    match pr {
+        PrStatus::NoPr => Color::DarkGray,
+        PrStatus::Draft => Color::DarkGray,
+        PrStatus::Open => Color::Yellow,
+        PrStatus::ChecksFailing => Color::Red,
+        PrStatus::ChecksPassing => Color::Green,
+        PrStatus::Merged => Color::Magenta,
+        PrStatus::Closed => Color::Red,
+    }
+}
+
+/// Short human-readable tag for a PR status (kept short for the ~22-wide cell).
+fn pr_status_label(pr: &PrStatus) -> &'static str {
+    match pr {
+        PrStatus::NoPr => "no PR",
+        PrStatus::Draft => "draft",
+        PrStatus::Open => "PR open",
+        PrStatus::ChecksFailing => "checks ✗",
+        PrStatus::ChecksPassing => "checks ✓",
+        PrStatus::Merged => "merged",
+        PrStatus::Closed => "closed",
     }
 }
 
@@ -389,6 +556,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn wv(project: &str, name: &str) -> WorktreeView {
+        let now = chrono::Utc::now();
         WorktreeView {
             path: PathBuf::from(format!("/wt/{project}/{name}")),
             project: project.to_string(),
@@ -398,7 +566,10 @@ mod tests {
             pr_number: None,
             auto_continue_on_merge: false,
             status: WorktreeStatus::Idle,
+            pr_status: PrStatus::NoPr,
             last_summary: None,
+            created_at: now,
+            updated_at: now,
         }
     }
 
@@ -493,5 +664,232 @@ mod tests {
         for (i, wt) in wts.iter().enumerate() {
             assert_eq!(flat[i].path, wt.path);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // visual_rows tests
+    // -----------------------------------------------------------------------
+
+    // cols=3, project A has 2 worktrees (flat 0,1), project B has 4 (flat 2,3,4,5).
+    // Expected rows:
+    //   row 0: [0, 1]          (A's only row — partial)
+    //   row 1: [2, 3, 4]       (B's first row — full)
+    //   row 2: [5]             (B's second row — partial)
+    #[test]
+    fn visual_rows_multi_project_non_multiple_of_cols() {
+        let projects = names(&["A", "B"]);
+        let wts = vec![
+            wv("A", "a1"),
+            wv("A", "a2"),
+            wv("B", "b1"),
+            wv("B", "b2"),
+            wv("B", "b3"),
+            wv("B", "b4"),
+        ];
+        let rows = visual_rows(&projects, &wts, 3);
+        assert_eq!(rows.len(), 3, "expected 3 visual rows");
+        assert_eq!(rows[0], vec![0, 1]);
+        assert_eq!(rows[1], vec![2, 3, 4]);
+        assert_eq!(rows[2], vec![5]);
+    }
+
+    #[test]
+    fn visual_rows_single_project() {
+        let projects = names(&["solo"]);
+        let wts = vec![wv("solo", "x"), wv("solo", "y"), wv("solo", "z")];
+        // cols=2: [0,1], [2]
+        let rows = visual_rows(&projects, &wts, 2);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec![0, 1]);
+        assert_eq!(rows[1], vec![2]);
+    }
+
+    #[test]
+    fn visual_rows_empty_middle_project_contributes_no_rows() {
+        // "beta" is empty; flat indices skip over it.
+        let projects = names(&["alpha", "beta", "gamma"]);
+        let wts = vec![wv("alpha", "a1"), wv("gamma", "g1"), wv("gamma", "g2")];
+        // flat: alpha=0, gamma=1,2
+        // cols=3: row0=[0] (alpha), row1=[1,2] (gamma)
+        let rows = visual_rows(&projects, &wts, 3);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec![0]);
+        assert_eq!(rows[1], vec![1, 2]);
+    }
+
+    #[test]
+    fn visual_rows_cols_one_edge() {
+        // cols=1: every worktree is its own row.
+        let projects = names(&["p"]);
+        let wts = vec![wv("p", "w1"), wv("p", "w2"), wv("p", "w3")];
+        let rows = visual_rows(&projects, &wts, 1);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![0]);
+        assert_eq!(rows[1], vec![1]);
+        assert_eq!(rows[2], vec![2]);
+    }
+
+    #[test]
+    fn visual_rows_cols_zero_clamped_to_one() {
+        // cols=0 is clamped to 1; same result as cols=1.
+        let projects = names(&["p"]);
+        let wts = vec![wv("p", "w1"), wv("p", "w2")];
+        let rows = visual_rows(&projects, &wts, 0);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec![0]);
+        assert_eq!(rows[1], vec![1]);
+    }
+
+    // -----------------------------------------------------------------------
+    // move_in_layout tests
+    // -----------------------------------------------------------------------
+
+    // Layout used by many tests below:
+    //   cols=3, A=[0,1], B=[2,3,4,5]
+    //   row 0: [0, 1]
+    //   row 1: [2, 3, 4]
+    //   row 2: [5]
+    fn make_rows_a2_b4() -> Vec<Vec<usize>> {
+        let projects = names(&["A", "B"]);
+        let wts = vec![
+            wv("A", "a1"),
+            wv("A", "a2"),
+            wv("B", "b1"),
+            wv("B", "b2"),
+            wv("B", "b3"),
+            wv("B", "b4"),
+        ];
+        visual_rows(&projects, &wts, 3)
+    }
+
+    // REGRESSION: Right from A's last cell (flat 1) must reach B's first (flat 2),
+    // not land on the same-row uniform jump that the old apply_motion used.
+    #[test]
+    fn right_from_last_of_partial_row_crosses_group_boundary() {
+        let rows = make_rows_a2_b4();
+        // flat 1 is the last cell of row 0 ([0,1]). Right → row1[0] = 2.
+        assert_eq!(move_in_layout(&rows, 1, Motion::Right), 2);
+    }
+
+    // REGRESSION: Down from flat 0 (A's row) → B's first row, clamped col.
+    // With uniform layout (old code, cols=3) Down from 0 = 0+3 = 3.
+    // Layout-aware: rows[0]=[0,1], rows[1]=[2,3,4] → col 0 → flat 2. Correct.
+    #[test]
+    fn down_from_a_row_lands_on_b_first_row_clamped_col() {
+        let rows = make_rows_a2_b4();
+        assert_eq!(move_in_layout(&rows, 0, Motion::Down), 2);
+        assert_eq!(move_in_layout(&rows, 1, Motion::Down), 3); // col 1 → rows[1][1]=3
+    }
+
+    #[test]
+    fn up_from_b_first_row_lands_on_a_clamped_col() {
+        let rows = make_rows_a2_b4();
+        // From flat 4 (row1, col2). Up → rows[0][min(2,1)=1] = 1.
+        assert_eq!(move_in_layout(&rows, 4, Motion::Up), 1);
+        // From flat 2 (row1, col0). Up → rows[0][0] = 0.
+        assert_eq!(move_in_layout(&rows, 2, Motion::Up), 0);
+    }
+
+    #[test]
+    fn left_within_row_does_not_cross_boundary() {
+        let rows = make_rows_a2_b4();
+        assert_eq!(move_in_layout(&rows, 3, Motion::Left), 2); // within B's row1
+    }
+
+    #[test]
+    fn left_at_first_cell_stays() {
+        let rows = make_rows_a2_b4();
+        assert_eq!(move_in_layout(&rows, 0, Motion::Left), 0);
+    }
+
+    #[test]
+    fn right_at_last_cell_stays() {
+        let rows = make_rows_a2_b4();
+        assert_eq!(move_in_layout(&rows, 5, Motion::Right), 5);
+    }
+
+    #[test]
+    fn down_at_last_row_stays() {
+        let rows = make_rows_a2_b4();
+        assert_eq!(move_in_layout(&rows, 5, Motion::Down), 5);
+    }
+
+    #[test]
+    fn up_at_first_row_stays() {
+        let rows = make_rows_a2_b4();
+        assert_eq!(move_in_layout(&rows, 0, Motion::Up), 0);
+        assert_eq!(move_in_layout(&rows, 1, Motion::Up), 1);
+    }
+
+    #[test]
+    fn first_jumps_to_flat_zero() {
+        let rows = make_rows_a2_b4();
+        assert_eq!(move_in_layout(&rows, 5, Motion::First), 0);
+    }
+
+    #[test]
+    fn last_none_jumps_to_last_cell() {
+        let rows = make_rows_a2_b4();
+        assert_eq!(move_in_layout(&rows, 0, Motion::Last { count: None }), 5);
+    }
+
+    #[test]
+    fn last_some_1_based_index() {
+        let rows = make_rows_a2_b4(); // 6 total cells
+        assert_eq!(move_in_layout(&rows, 0, Motion::Last { count: Some(1) }), 0);
+        assert_eq!(move_in_layout(&rows, 0, Motion::Last { count: Some(2) }), 1);
+        assert_eq!(move_in_layout(&rows, 0, Motion::Last { count: Some(3) }), 2);
+        assert_eq!(move_in_layout(&rows, 0, Motion::Last { count: Some(6) }), 5);
+        // Out-of-range clamps to last.
+        assert_eq!(
+            move_in_layout(&rows, 0, Motion::Last { count: Some(100) }),
+            5
+        );
+        // 0G clamps to 1 → first cell.
+        assert_eq!(move_in_layout(&rows, 5, Motion::Last { count: Some(0) }), 0);
+    }
+
+    // REGRESSION: round-trip Down then Up with non-uniform group sizes (cols=3,
+    // sizes [2,4]).  Old uniform code: Down from flat 0 would give 0+3=3; Up from
+    // 3 gives 3-3=0 ✓ (accidental). Layout-aware: Down(0)=2, Up(2)=0 ✓.
+    // The distinguishing case is Down from flat 1 (col 1 of row 0):
+    //   old code: 1+3=4; Up(4)=4-3=1 ✓ (still round-trips).
+    //   But Down from flat 1 should go to rows[1][1]=3, not 4.
+    //   Then Up(3)=rows[0][min(1,1)]=1 ✓ — round-trips correctly.
+    #[test]
+    fn round_trip_down_up_with_non_uniform_groups() {
+        let rows = make_rows_a2_b4();
+        let after_down = move_in_layout(&rows, 1, Motion::Down);
+        assert_eq!(after_down, 3); // layout-aware, NOT 4 (old uniform mistake)
+        let after_up = move_in_layout(&rows, after_down, Motion::Up);
+        assert_eq!(after_up, 1); // round-trips back
+    }
+
+    // Resize: same logical worktree remains reachable after cols change.
+    // Layout: A=[0,1], B=[2,3,4,5].
+    //   cols=3: rows = [0,1], [2,3,4], [5]  → flat 3 is at row1 col1.
+    //   cols=2: rows = [0,1], [2,3], [4,5]  → flat 3 is at row1 col1.
+    // Both are in-range so no out-of-range jump.
+    #[test]
+    fn resize_no_out_of_range_selection() {
+        let projects = names(&["A", "B"]);
+        let wts = vec![
+            wv("A", "a1"),
+            wv("A", "a2"),
+            wv("B", "b1"),
+            wv("B", "b2"),
+            wv("B", "b3"),
+            wv("B", "b4"),
+        ];
+        let rows3 = visual_rows(&projects, &wts, 3);
+        let rows2 = visual_rows(&projects, &wts, 2);
+        // flat 3 should be locatable in both layouts.
+        let found3 = rows3.iter().any(|row| row.contains(&3));
+        let found2 = rows2.iter().any(|row| row.contains(&3));
+        assert!(found3, "flat 3 must appear in cols=3 layout");
+        assert!(found2, "flat 3 must appear in cols=2 layout");
+        // Down from flat 1 in cols=3 should NOT produce out-of-range index.
+        let next = move_in_layout(&rows3, 1, Motion::Down);
+        assert!(next < wts.len(), "result must be a valid flat index");
     }
 }

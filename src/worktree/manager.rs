@@ -81,6 +81,7 @@ impl WorktreeManager {
             .canonicalize()
             .with_context(|| format!("cannot canonicalize worktree path {:?}", path))?;
 
+        let now = chrono::Utc::now();
         let worktree = Worktree {
             path: canonical_path,
             name: super::model::default_name(),
@@ -89,6 +90,9 @@ impl WorktreeManager {
             pr_number: None,
             auto_continue_on_merge: false,
             status: super::model::WorktreeStatus::Idle,
+            pr_status: super::model::PrStatus::NoPr,
+            created_at: now,
+            updated_at: now,
         };
 
         // Persist to state.
@@ -133,6 +137,7 @@ impl WorktreeManager {
             .canonicalize()
             .with_context(|| format!("cannot canonicalize worktree path {:?}", path))?;
 
+        let now = chrono::Utc::now();
         let worktree = Worktree {
             path: canonical_path,
             name: super::model::default_name(),
@@ -143,6 +148,9 @@ impl WorktreeManager {
             pr_number: None,
             auto_continue_on_merge: false,
             status: super::model::WorktreeStatus::Idle,
+            pr_status: super::model::PrStatus::NoPr,
+            created_at: now,
+            updated_at: now,
         };
 
         // Persist to state.
@@ -191,6 +199,8 @@ impl WorktreeManager {
                 wt.pr_number = persisted.pr_number;
                 wt.auto_continue_on_merge = persisted.auto_continue_on_merge;
                 wt.status = persisted.status.clone();
+                wt.created_at = persisted.created_at;
+                wt.updated_at = persisted.updated_at;
             }
         }
 
@@ -204,38 +214,140 @@ impl WorktreeManager {
     // remove
     // -----------------------------------------------------------------------
 
-    /// Remove the worktree at `path`.
+    /// Remove the worktree at `path` using a robust, never-blocked strategy.
     ///
-    /// Runs `git worktree remove [--force] <path>` and drops the state entry.
-    /// Force is only applied when `force == true`.
-    pub fn remove(&self, path: &Path, force: bool) -> Result<()> {
-        // Canonicalize before running git — the directory still exists at this
-        // point, so canonicalize() will succeed and the key will match what
-        // create() stored in state.
-        let canonical = path
-            .canonicalize()
-            .with_context(|| format!("cannot canonicalize worktree path {:?}", path))?;
+    /// Removal sequence (the `force` parameter is accepted for API compatibility
+    /// but the delete flow always uses `--force`):
+    ///
+    /// 1. Canonicalize `path` (if the directory already does not exist, treat
+    ///    that as success — idempotent).
+    /// 2. Run `git worktree remove --force <canonical>`.
+    /// 3. If that fails and the directory still exists, fall back to
+    ///    `std::fs::remove_dir_all` (Rust-native, no shell) followed by
+    ///    `git worktree prune` to clear git's dangling admin metadata under
+    ///    `.git/worktrees/`.
+    /// 4. If after both attempts the directory is gone (or never existed),
+    ///    return `Ok`.  If `remove_dir_all` itself errors and the directory
+    ///    still exists, return `Err`.
+    ///
+    /// State-dropping (`.karazhan/state.toml`) is left to the caller (the
+    /// daemon's `remove_worktree` handler) so this method stays focused on
+    /// git/fs removal only.
+    pub fn remove(&self, path: &Path, _force: bool) -> Result<()> {
+        // Canonicalize before running git so the key matches what create()
+        // stored.  If the directory is already gone, treat that as success.
+        let canonical = match path.canonicalize() {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::info!(
+                    "worktree remove: path {:?} already absent — pruning and returning Ok",
+                    path
+                );
+                // Directory is gone; prune dangling admin metadata and succeed.
+                self.git_worktree_prune();
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("cannot canonicalize worktree path {:?}", path));
+            }
+        };
 
-        let mut cmd = Command::new("git");
-        cmd.arg("worktree").arg("remove");
-        if force {
-            cmd.arg("--force");
+        // --- Step 1: git worktree remove --force ----------------------------
+        let git_result = Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&canonical)
+            .current_dir(&self.repo_root)
+            .output();
+
+        match &git_result {
+            Ok(out) if out.status.success() => {
+                tracing::info!(
+                    "worktree remove: git worktree remove --force succeeded for {:?}",
+                    canonical
+                );
+                return Ok(());
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                tracing::warn!(
+                    "worktree remove: git worktree remove --force failed for {:?}: {stderr}",
+                    canonical
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "worktree remove: failed to spawn git for {:?}: {e}",
+                    canonical
+                );
+            }
         }
-        cmd.arg(&canonical).current_dir(&self.repo_root);
 
-        let output = cmd.output().context("failed to run git worktree remove")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("git worktree remove failed: {stderr}");
+        // --- Step 2: fs::remove_dir_all + git worktree prune ----------------
+        if canonical.exists() {
+            tracing::info!(
+                "worktree remove: falling back to remove_dir_all for {:?}",
+                canonical
+            );
+            match std::fs::remove_dir_all(&canonical) {
+                Ok(()) => {
+                    tracing::info!(
+                        "worktree remove: remove_dir_all succeeded for {:?}",
+                        canonical
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Raced with something else removing it — that's fine.
+                    tracing::info!(
+                        "worktree remove: remove_dir_all: {:?} vanished mid-removal (ok)",
+                        canonical
+                    );
+                }
+                Err(e) => {
+                    // remove_dir_all failed and the directory may still exist.
+                    if canonical.exists() {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "remove_dir_all failed for worktree {:?} and directory still exists",
+                                canonical
+                            )
+                        });
+                    }
+                    // Directory is gone despite the error — treat as success.
+                    tracing::warn!(
+                        "worktree remove: remove_dir_all errored ({e}) but {:?} is gone — ok",
+                        canonical
+                    );
+                }
+            }
         }
 
-        // Drop from persisted state.
-        let mut st = state::load(&self.repo_root)?;
-        st.remove_worktree(&canonical);
-        state::save(&self.repo_root, &st)?;
+        // Prune git's dangling worktree admin metadata.
+        self.git_worktree_prune();
 
         Ok(())
+    }
+
+    /// Run `git worktree prune` in `repo_root` to clear dangling admin
+    /// metadata after a manual directory removal.  Failure is logged but not
+    /// propagated — the directory is already gone at this point.
+    fn git_worktree_prune(&self) {
+        match Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(&self.repo_root)
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                tracing::info!("worktree remove: git worktree prune succeeded");
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                tracing::warn!("worktree remove: git worktree prune failed: {stderr}");
+            }
+            Err(e) => {
+                tracing::warn!("worktree remove: failed to spawn git worktree prune: {e}");
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -546,6 +658,69 @@ mod tests {
             !st.worktrees.iter().any(|w| w.path == canonical_wt),
             "removed worktree should be pruned from state"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // remove — robust strategy tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn remove_detached_worktree_deletes_dir_and_prunes_git() {
+        let (_dir, root) = make_temp_repo();
+        let wt_dir = tempfile::tempdir().expect("wt tempdir");
+        let wt_path = wt_dir.path().to_path_buf();
+
+        let mgr = WorktreeManager::new(&root);
+        mgr.create_detached(&wt_path).expect("create_detached");
+
+        let canonical_wt = wt_path.canonicalize().expect("canonicalize");
+
+        // Remove (force=true — always force per spec).
+        mgr.remove(&wt_path, true).expect("remove");
+
+        // Directory must be gone.
+        assert!(
+            !canonical_wt.exists(),
+            "worktree directory should be removed"
+        );
+
+        // Must not appear in git worktree list.
+        let output = Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&root)
+            .output()
+            .expect("git worktree list");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains(canonical_wt.to_string_lossy().as_ref()),
+            "removed worktree must not appear in git worktree list"
+        );
+    }
+
+    #[test]
+    fn remove_already_deleted_dir_is_idempotent() {
+        // Simulate a "stuck" worktree: remove the directory behind git's back,
+        // then call manager.remove() — it must prune and return Ok without error.
+        let (_dir, root) = make_temp_repo();
+        let wt_dir = tempfile::tempdir().expect("wt tempdir");
+        let wt_path = wt_dir.path().to_path_buf();
+
+        let mgr = WorktreeManager::new(&root);
+        mgr.create_detached(&wt_path).expect("create_detached");
+
+        let canonical_wt = wt_path.canonicalize().expect("canonicalize");
+
+        // Remove the directory behind git's back (simulating a stuck/locked tree
+        // that was force-deleted by the OS or another process).
+        std::fs::remove_dir_all(&canonical_wt).expect("manual remove");
+        assert!(
+            !canonical_wt.exists(),
+            "dir should be gone after manual remove"
+        );
+
+        // manager.remove() must succeed (idempotent / prune path).
+        mgr.remove(&wt_path, true)
+            .expect("remove of already-deleted dir must succeed");
     }
 
     // -----------------------------------------------------------------------

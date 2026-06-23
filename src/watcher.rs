@@ -1,18 +1,19 @@
-//! Background poller: monitors PR state and CI status for active worktrees.
+//! Background poller: auto-discovers each worktree's PR status by branch.
 //!
-//! The watcher runs as a detached tokio task that ticks every [`WatcherConfig::interval`],
-//! queries `gh` for each worktree that has a known PR number, and emits [`AppEvent`]s
-//! when state changes (PR merged, CI passing/failing).
+//! The watcher runs as a detached tokio task that ticks every [`WatcherConfig::interval`].
+//! For EVERY worktree in the shared watch-set it calls [`fetch_pr_status`] (one `gh pr
+//! view` per worktree, resolving the PR from the worktree's current branch) and emits a
+//! [`AppEvent::PrStatusChanged`] whenever the observed [`PrStatus`] changes.
 //!
 //! # Watch-set sharing
-//! The App owns an `Arc<Mutex<Vec<WatchItem>>>` that it updates after every
-//! `refresh_worktrees()` call.  The watcher reads this shared list on each tick so
-//! it always polls the current set of active worktrees without requiring a separate
-//! channel handshake.
+//! The daemon owns an `Arc<Mutex<Vec<WatchItem>>>` that it updates after every registry
+//! rebuild.  The watcher reads this shared list on each tick so it always polls the
+//! current set of worktrees without a separate channel handshake.
 //!
 //! # Error handling
 //! Errors for individual worktrees are logged as warnings and skipped — one bad worktree
-//! never stops the poll of others, and the watcher never crashes.
+//! never stops the poll of others, and the watcher never crashes.  A worktree with no PR
+//! (detached / unopened) is `NoPr` and is not an error.
 //!
 //! # Shutdown
 //! The caller passes a `tokio::sync::watch::Receiver<bool>` (shutdown signal).  The
@@ -20,7 +21,7 @@
 //! receiver sees `true` the loop exits cleanly.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,9 +30,9 @@ use tokio::task::JoinHandle;
 use tokio::time;
 
 use crate::app::AppEvent;
-use crate::github::ci::ci_status;
-use crate::github::pr::pr_state;
+use crate::github::pr_status::fetch_pr_status;
 use crate::github::GhRunner;
+use crate::worktree::model::PrStatus;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -51,69 +52,41 @@ impl Default for WatcherConfig {
     }
 }
 
-/// A single entry in the shared watch-set: a worktree path + its PR number.
+/// A single entry in the shared watch-set: a worktree path.
+///
+/// PR discovery is by branch now (gh resolves the PR from the worktree's
+/// current branch), so no PR number is stored here.
 #[derive(Debug, Clone)]
 pub struct WatchItem {
     pub worktree_path: PathBuf,
-    pub pr_number: u64,
 }
 
 // ---------------------------------------------------------------------------
 // Change-detection (pure, easily unit-tested)
 // ---------------------------------------------------------------------------
 
-/// Last-known state for a single (worktree, PR) pair.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WatchState {
-    /// Whether the PR was merged on the previous tick.
-    pub merged: bool,
-    /// Whether CI was fully passing on the previous tick.
-    pub ci_all_passing: bool,
-}
-
-/// An event produced by the diff between previous and current state.
+/// An event produced when a worktree's observed [`PrStatus`] changes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WatchEvent {
-    PrMerged {
+    PrStatusChanged {
         worktree_path: PathBuf,
-        pr: u64,
-    },
-    CiStatusChanged {
-        worktree_path: PathBuf,
-        all_passing: bool,
+        pr_status: PrStatus,
+        pr_number: Option<u64>,
     },
 }
 
-/// Pure function: compare previous state with freshly-fetched values and
-/// produce the minimal set of [`WatchEvent`]s needed to update the UI.
+/// Pure change-detection: should we emit an event given the previous observed
+/// status (`None` on the first tick) and the current one?
 ///
-/// This is extracted so unit tests can exercise it without any I/O.
-pub fn diff_state(
-    worktree_path: &Path,
-    pr: u64,
-    prev: &WatchState,
-    merged: bool,
-    ci_all_passing: bool,
-) -> Vec<WatchEvent> {
-    let mut events = Vec::new();
-
-    // PR transition: open → merged (only fire once; stay quiet if already merged).
-    if merged && !prev.merged {
-        events.push(WatchEvent::PrMerged {
-            worktree_path: worktree_path.to_path_buf(),
-            pr,
-        });
+/// We emit on any real change.  The first observation emits only when it is not
+/// `NoPr` (a fresh worktree with no PR starts at the registry default `NoPr`, so
+/// re-announcing `NoPr` is noise).  Extracted so tests can cover transitions
+/// without any I/O.
+pub fn diff_pr(prev: Option<PrStatus>, curr: PrStatus) -> bool {
+    match prev {
+        None => curr != PrStatus::NoPr,
+        Some(p) => p != curr,
     }
-
-    // CI status changed in either direction.
-    if ci_all_passing != prev.ci_all_passing {
-        events.push(WatchEvent::CiStatusChanged {
-            worktree_path: worktree_path.to_path_buf(),
-            all_passing: ci_all_passing,
-        });
-    }
-
-    events
 }
 
 // ---------------------------------------------------------------------------
@@ -158,12 +131,12 @@ pub fn spawn_watcher(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // Per-(path, pr) last-known state; initialised lazily on first tick.
-        let mut known: HashMap<(PathBuf, u64), WatchState> = HashMap::new();
+        // Per-path last-observed PR status; initialised lazily on first tick.
+        let mut known: HashMap<PathBuf, PrStatus> = HashMap::new();
 
         let mut interval = time::interval(config.interval);
         // Don't fire the first tick immediately — wait one full interval so the
-        // App has time to populate the watch-set after refresh_worktrees().
+        // daemon has time to populate the watch-set after a registry rebuild.
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
         loop {
@@ -177,67 +150,37 @@ pub fn spawn_watcher(
                     };
 
                     for item in &items {
-                        let key = (item.worktree_path.clone(), item.pr_number);
-
-                        // Fetch fresh PR + CI state from the worktree's own cwd
-                        // (project-agnostic: each gh call runs in its worktree).
-                        let pr_result =
-                            pr_state(runner.as_ref(), &item.worktree_path, item.pr_number).await;
-                        let ci_result =
-                            ci_status(runner.as_ref(), &item.worktree_path, item.pr_number).await;
-
-                        let (merged, ci_all_passing) = match (pr_result, ci_result) {
-                            (Ok(pr), Ok(ci)) => (pr.merged, ci.all_passing),
-                            (Err(e), _) => {
+                        // One gh call per worktree, by branch (no PR number).
+                        let info = match fetch_pr_status(runner.as_ref(), &item.worktree_path).await
+                        {
+                            Ok(info) => info,
+                            Err(e) => {
                                 tracing::warn!(
                                     worktree = %item.worktree_path.display(),
-                                    pr = item.pr_number,
-                                    "watcher: gh pr_state error (skipping): {e}"
+                                    "watcher: gh fetch_pr_status error (skipping): {e}"
                                 );
-                                continue;
-                            }
-                            (Ok(pr), Err(e)) => {
-                                tracing::warn!(
-                                    worktree = %item.worktree_path.display(),
-                                    pr = item.pr_number,
-                                    "watcher: gh ci_status error (using pr only): {e}"
-                                );
-                                // Still process PR state change even without CI.
-                                let prev = known.entry(key.clone()).or_insert(WatchState {
-                                    merged: false,
-                                    ci_all_passing: false,
-                                });
-                                let events = diff_state(
-                                    &item.worktree_path,
-                                    item.pr_number,
-                                    prev,
-                                    pr.merged,
-                                    prev.ci_all_passing, // no change
-                                );
-                                prev.merged = pr.merged;
-                                emit_events(&event_tx, events).await;
                                 continue;
                             }
                         };
 
-                        let prev = known.entry(key).or_insert(WatchState {
-                            merged: false,
-                            ci_all_passing: false,
-                        });
+                        let (curr, pr_number) = match info {
+                            Some(pr) => (pr.status, Some(pr.number)),
+                            None => (PrStatus::NoPr, None),
+                        };
 
-                        let events = diff_state(
-                            &item.worktree_path,
-                            item.pr_number,
-                            prev,
-                            merged,
-                            ci_all_passing,
-                        );
-
-                        // Update last-known state.
-                        prev.merged = merged;
-                        prev.ci_all_passing = ci_all_passing;
-
-                        emit_events(&event_tx, events).await;
+                        let prev = known.get(&item.worktree_path).copied();
+                        if diff_pr(prev, curr) {
+                            emit_event(
+                                &event_tx,
+                                WatchEvent::PrStatusChanged {
+                                    worktree_path: item.worktree_path.clone(),
+                                    pr_status: curr,
+                                    pr_number,
+                                },
+                            )
+                            .await;
+                        }
+                        known.insert(item.worktree_path.clone(), curr);
                     }
                 }
 
@@ -253,24 +196,23 @@ pub fn spawn_watcher(
     })
 }
 
-/// Send a slice of [`WatchEvent`]s into the app event channel, converting each
-/// to the appropriate [`AppEvent`].  Logs and continues on send failure (receiver
+/// Send a [`WatchEvent`] into the app event channel, converting it to the
+/// appropriate [`AppEvent`].  Logs and continues on send failure (receiver
 /// dropped means the app is shutting down — that's fine).
-async fn emit_events(tx: &tokio::sync::mpsc::Sender<AppEvent>, events: Vec<WatchEvent>) {
-    for ev in events {
-        let app_event = match ev {
-            WatchEvent::PrMerged { worktree_path, pr } => AppEvent::PrMerged { worktree_path, pr },
-            WatchEvent::CiStatusChanged {
-                worktree_path,
-                all_passing,
-            } => AppEvent::CiStatusChanged {
-                worktree_path,
-                all_passing,
-            },
-        };
-        if tx.send(app_event).await.is_err() {
-            tracing::debug!("watcher: event_tx closed, app shutting down");
-        }
+async fn emit_event(tx: &tokio::sync::mpsc::Sender<AppEvent>, event: WatchEvent) {
+    let app_event = match event {
+        WatchEvent::PrStatusChanged {
+            worktree_path,
+            pr_status,
+            pr_number,
+        } => AppEvent::PrStatusChanged {
+            worktree_path,
+            pr_status,
+            pr_number,
+        },
+    };
+    if tx.send(app_event).await.is_err() {
+        tracing::debug!("watcher: event_tx closed, app shutting down");
     }
 }
 
@@ -283,89 +225,40 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn path(s: &str) -> PathBuf {
-        PathBuf::from(s)
-    }
-
     // -----------------------------------------------------------------------
-    // diff_state: change-detection pure logic
+    // diff_pr: change-detection pure logic
     // -----------------------------------------------------------------------
 
     #[test]
-    fn diff_open_to_merged_yields_pr_merged() {
-        let prev = WatchState {
-            merged: false,
-            ci_all_passing: false,
-        };
-        let events = diff_state(&path("/wt/a"), 42, &prev, true, false);
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], WatchEvent::PrMerged { pr: 42, .. }));
+    fn diff_first_observation_nopr_is_noop() {
+        // Fresh worktree, still NoPr → no event (it already defaults to NoPr).
+        assert!(!diff_pr(None, PrStatus::NoPr));
     }
 
     #[test]
-    fn diff_already_merged_no_duplicate_event() {
-        // PR was already merged on the previous tick — no new event.
-        let prev = WatchState {
-            merged: true,
-            ci_all_passing: false,
-        };
-        let events = diff_state(&path("/wt/a"), 42, &prev, true, false);
-        assert!(events.is_empty());
+    fn diff_first_observation_open_emits() {
+        assert!(diff_pr(None, PrStatus::Open));
     }
 
     #[test]
-    fn diff_ci_passing_to_failing_yields_ci_status_changed_false() {
-        let prev = WatchState {
-            merged: false,
-            ci_all_passing: true,
-        };
-        let events = diff_state(&path("/wt/b"), 7, &prev, false, false);
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0],
-            WatchEvent::CiStatusChanged {
-                all_passing: false,
-                ..
-            }
-        ));
+    fn diff_nopr_to_open_emits() {
+        assert!(diff_pr(Some(PrStatus::NoPr), PrStatus::Open));
     }
 
     #[test]
-    fn diff_ci_failing_to_passing_yields_ci_status_changed_true() {
-        let prev = WatchState {
-            merged: false,
-            ci_all_passing: false,
-        };
-        let events = diff_state(&path("/wt/c"), 3, &prev, false, true);
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0],
-            WatchEvent::CiStatusChanged {
-                all_passing: true,
-                ..
-            }
-        ));
+    fn diff_open_to_open_is_noop() {
+        assert!(!diff_pr(Some(PrStatus::Open), PrStatus::Open));
     }
 
     #[test]
-    fn diff_no_change_yields_nothing() {
-        let prev = WatchState {
-            merged: false,
-            ci_all_passing: true,
-        };
-        let events = diff_state(&path("/wt/d"), 1, &prev, false, true);
-        assert!(events.is_empty());
+    fn diff_open_to_merged_emits() {
+        assert!(diff_pr(Some(PrStatus::Open), PrStatus::Merged));
     }
 
     #[test]
-    fn diff_both_pr_and_ci_change_yields_two_events() {
-        let prev = WatchState {
-            merged: false,
-            ci_all_passing: true,
-        };
-        // PR merged + CI now failing (edge-case: merge can flip CI to failing state)
-        let events = diff_state(&path("/wt/e"), 5, &prev, true, false);
-        assert_eq!(events.len(), 2);
+    fn diff_merged_to_merged_is_noop() {
+        // Once merged, staying merged must not re-emit (gate auto-continue edge).
+        assert!(!diff_pr(Some(PrStatus::Merged), PrStatus::Merged));
     }
 
     // -----------------------------------------------------------------------
@@ -383,22 +276,20 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn watcher_tick_emits_pr_merged_via_mock() {
+    async fn watcher_tick_emits_pr_status_changed_via_mock() {
         use crate::github::mock::MockGh;
         use tokio::sync::mpsc;
 
-        // MockGh returns a merged PR and passing CI.
-        let pr_json = r#"{"state":"MERGED","mergeStateStatus":null,"mergedAt":"2024-01-15T10:00:00Z","title":"feat"}"#;
-        let ci_json = r#"[{"name":"build","status":"completed","conclusion":"success"}]"#;
-        let mock = Arc::new(MockGh::new(vec![
-            ("pr view", Ok(pr_json.to_string())),
-            ("pr checks", Ok(ci_json.to_string())),
-        ]));
+        // MockGh returns a merged PR for the branch.
+        let pr_json = r#"{"number":99,"state":"MERGED","isDraft":false,"mergedAt":"2024-01-15T10:00:00Z","statusCheckRollup":[]}"#;
+        let mock = Arc::new(MockGh::new(vec![(
+            "pr view --json",
+            Ok(pr_json.to_string()),
+        )]));
 
         let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(16);
         let watch_set = Arc::new(Mutex::new(vec![WatchItem {
             worktree_path: PathBuf::from("/tmp/wt-test"),
-            pr_number: 99,
         }]));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -412,20 +303,23 @@ mod tests {
             shutdown_rx,
         );
 
-        // Wait for an event with a generous timeout.
         let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
             .await
             .expect("timeout waiting for watcher event")
             .expect("channel closed");
 
-        // Expect either PrMerged or CiStatusChanged (both are valid on first tick).
         match event {
-            AppEvent::PrMerged { pr, .. } => assert_eq!(pr, 99),
-            AppEvent::CiStatusChanged { all_passing, .. } => assert!(all_passing),
+            AppEvent::PrStatusChanged {
+                pr_status,
+                pr_number,
+                ..
+            } => {
+                assert_eq!(pr_status, PrStatus::Merged);
+                assert_eq!(pr_number, Some(99));
+            }
             other => panic!("unexpected event: {other:?}"),
         }
 
-        // Shut down.
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
     }

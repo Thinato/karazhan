@@ -53,6 +53,8 @@ pub enum CommandId {
     RenameWorktree,
     /// Register a git repo as a new project (Global; same as `A`).
     AddProject,
+    /// Delete the selected worktree with a (y/N) confirmation (Grid; same as `d`).
+    DeleteWorktree,
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +191,13 @@ pub const ALL_COMMANDS: &[CommandSpec] = &[
         description: "register a git repo as a project",
         keybind: "A",
         context: CommandContext::Global,
+    },
+    CommandSpec {
+        id: CommandId::DeleteWorktree,
+        title: "Delete worktree",
+        description: "delete the selected worktree (with confirmation)",
+        keybind: "d",
+        context: CommandContext::Grid,
     },
 ];
 
@@ -444,6 +453,19 @@ impl NewWorktreeModal {
         self.phase
     }
 
+    /// Replace the choice options from a project's prompt list `(slug, title,
+    /// body)`.  "blank worktree" remains the first option.  Used to scope the
+    /// `PickChoice` list to the project picked in `PickProject` before advancing.
+    pub fn set_choices(&mut self, prompt_choices: Vec<(String, String, String)>) {
+        let mut options = vec![WorktreeChoice::Blank];
+        options.extend(
+            prompt_choices
+                .into_iter()
+                .map(|(slug, title, body)| WorktreeChoice::Prompt { slug, title, body }),
+        );
+        self.options = options;
+    }
+
     /// The selected project, once chosen (always `Some` in `PickChoice`).
     pub fn selected_project(&self) -> Option<&str> {
         self.selected_project.as_deref()
@@ -577,13 +599,15 @@ mod tests {
             NewWorktree,
             RenameWorktree,
             AddProject,
+            DeleteWorktree,
         ];
         // Exhaustive match: a new variant forces a compile error here.
         for id in all {
             match id {
                 SwitchView | ToggleHelp | Quit | StopDaemon | NewPrompt | EditPrompt
                 | FilterPrompts | RefreshWorktrees | RunCustomPrompt | AddressPrComments
-                | CheckCi | ToggleAutoContinue | NewWorktree | RenameWorktree | AddProject => {}
+                | CheckCi | ToggleAutoContinue | NewWorktree | RenameWorktree | AddProject
+                | DeleteWorktree => {}
             }
         }
         all.to_vec()
@@ -852,5 +876,32 @@ mod tests {
         // No project step → back_to_project is a no-op (caller closes instead).
         assert!(!m.back_to_project());
         assert_eq!(m.phase(), NewWorktreePhase::PickChoice);
+    }
+
+    #[test]
+    fn modal_choices_reflect_picked_project() {
+        // Multi-project modal opens with NO choices; the app fills them per the
+        // picked project via set_choices before advancing.
+        let mut m = multi_modal(&["alpha", "beta"], &[]);
+
+        // Pick "alpha" → scope to alpha's prompts.
+        assert_eq!(m.selected_project_row(), Some("alpha"));
+        m.set_choices(choices_of(&[("a1", "Alpha One")]));
+        assert!(m.advance_to_choice());
+        let labels: Vec<String> = m.filtered_rows().into_iter().map(|(l, _)| l).collect();
+        assert!(labels.contains(&"blank worktree".to_string()));
+        assert!(labels.contains(&"Alpha One".to_string()));
+        assert!(!labels.contains(&"Beta One".to_string()));
+
+        // Go back, pick "beta" → scope to beta's prompts (different set).
+        assert!(m.back_to_project());
+        m.move_cursor(1); // highlight "beta"
+        assert_eq!(m.selected_project_row(), Some("beta"));
+        m.set_choices(choices_of(&[("b1", "Beta One")]));
+        assert!(m.advance_to_choice());
+        let labels: Vec<String> = m.filtered_rows().into_iter().map(|(l, _)| l).collect();
+        assert!(labels.contains(&"blank worktree".to_string())); // blank always present
+        assert!(labels.contains(&"Beta One".to_string()));
+        assert!(!labels.contains(&"Alpha One".to_string()));
     }
 }

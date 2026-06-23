@@ -182,18 +182,14 @@ async fn run_client() -> Result<()> {
         }
     });
 
-    // Resolve the prompt directory from config or fall back to <cwd>/prompts.
-    let prompt_dir = cfg.prompt_dir.clone().unwrap_or_else(|| {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("prompts")
-    });
-
     // Connect to the supervisor daemon (auto-spawning it on first launch).  The
     // daemon owns the agent backend, the watcher, and all state.toml writes.
     let client = client::connect(event_tx.clone()).await?;
 
-    let app = App::new(event_rx, prompt_dir, cfg, client);
+    // The library now reads prompts per-project from each project's
+    // <project>/.karazhan/prompts/ dir (populated on the first Snapshot), so no
+    // global prompt_dir is resolved here.
+    let app = App::new(event_rx, cfg, client);
 
     let result = app.run(&mut terminal).await;
 
