@@ -52,7 +52,7 @@ use crate::worktree::model::{PrStatus, Worktree, WorktreeStatus};
 /// the handshake request and a `ProtocolMismatch` reply even when every other
 /// wire-format item has changed. Do NOT reorder these two; only append new
 /// variants after `ProtocolMismatch`.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Maximum frame body size accepted by `read_frame_async` (64 MiB).
 const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
@@ -379,8 +379,10 @@ mod tests {
             PrStatus::NoPr,
             PrStatus::Draft,
             PrStatus::Open,
+            PrStatus::ChecksRunning,
             PrStatus::ChecksFailing,
             PrStatus::ChecksPassing,
+            PrStatus::Approved,
             PrStatus::Merged,
             PrStatus::Closed,
         ] {
@@ -452,8 +454,8 @@ mod tests {
     // ── Protocol version + frozen wire format ─────────────────────────────────
 
     #[test]
-    fn protocol_version_is_seven() {
-        assert_eq!(PROTOCOL_VERSION, 7);
+    fn protocol_version_is_nine() {
+        assert_eq!(PROTOCOL_VERSION, 9);
     }
 
     #[test]

@@ -28,8 +28,15 @@ pub enum PrStatus {
     NoPr,
     Draft,
     Open,
+    /// At least one check is still in progress (IN_PROGRESS / QUEUED / PENDING /
+    /// WAITING / REQUESTED) and none have conclusively failed.
+    ChecksRunning,
     ChecksFailing,
     ChecksPassing,
+    /// PR is OPEN, non-draft, all checks green (or no checks), and the review
+    /// decision is explicitly APPROVED.  Takes precedence over `Open` but loses
+    /// to `ChecksFailing` and `ChecksRunning`.
+    Approved,
     Merged,
     Closed,
 }

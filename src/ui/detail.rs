@@ -240,8 +240,10 @@ fn pr_status_label(pr: &PrStatus) -> &'static str {
         PrStatus::NoPr => "no PR",
         PrStatus::Draft => "draft",
         PrStatus::Open => "open",
+        PrStatus::ChecksRunning => "CI running",
         PrStatus::ChecksFailing => "checks failing",
         PrStatus::ChecksPassing => "checks passing",
+        PrStatus::Approved => "approved",
         PrStatus::Merged => "merged",
         PrStatus::Closed => "closed",
     }
@@ -253,8 +255,10 @@ fn pr_status_val_style(pr: &PrStatus) -> Style {
         PrStatus::NoPr => Color::DarkGray,
         PrStatus::Draft => Color::DarkGray,
         PrStatus::Open => Color::Yellow,
+        PrStatus::ChecksRunning => Color::Yellow,
         PrStatus::ChecksFailing => Color::Red,
-        PrStatus::ChecksPassing => Color::Green,
+        PrStatus::ChecksPassing => Color::LightGreen,
+        PrStatus::Approved => Color::Green,
         PrStatus::Merged => Color::Magenta,
         PrStatus::Closed => Color::Red,
     };
