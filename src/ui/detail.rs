@@ -8,6 +8,7 @@ use ratatui::{
 };
 
 use crate::ipc::WorktreeView;
+use crate::ui::{fmt_elapsed, fmt_tokens, spinner_glyph};
 use crate::worktree::{PrStatus, WorktreeStatus};
 
 // ---------------------------------------------------------------------------
@@ -38,6 +39,7 @@ impl DetailView {
     /// mode, and `status_line` is an optional message shown at the bottom of
     /// the pane (backend name, gh errors, transient notifications, …).
     /// If `worktree` is `None` (empty grid), shows a placeholder message.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
         frame: &mut Frame,
@@ -46,6 +48,7 @@ impl DetailView {
         summary: Option<&str>,
         prompt_input: Option<&str>,
         status_line: Option<&str>,
+        spinner_frame: usize,
     ) {
         let block = Block::default()
             .title(" worktree detail ")
@@ -74,7 +77,7 @@ impl DetailView {
             return;
         };
 
-        let lines = build_detail_lines(wt, summary, prompt_input);
+        let lines = build_detail_lines(wt, summary, prompt_input, spinner_frame);
         let para = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
         frame.render_widget(para, content_area);
 
@@ -96,6 +99,7 @@ fn build_detail_lines(
     wt: &WorktreeView,
     summary: Option<&str>,
     prompt_input: Option<&str>,
+    spinner_frame: usize,
 ) -> Vec<Line<'static>> {
     let key_style = Style::default()
         .fg(Color::DarkGray)
@@ -195,6 +199,7 @@ fn build_detail_lines(
         WorktreeStatus::Running => "running",
         WorktreeStatus::NeedsReview => "done (needs review)",
         WorktreeStatus::Error => "error",
+        WorktreeStatus::Deleting => "deleting",
         _ => "idle",
     };
     lines.push(kv_line(
@@ -203,6 +208,42 @@ fn build_detail_lines(
         key_style,
         status_style,
     ));
+
+    // Live progress block.  While Running, show the current action (with an
+    // animated spinner) and a wall-clock elapsed timer.  Turn/token counters are
+    // shown whenever they are non-zero (so they linger after a run finishes).
+    if matches!(wt.status, WorktreeStatus::Running) {
+        let activity = wt.activity.as_deref().unwrap_or("working…");
+        lines.push(kv_line(
+            "activity    ",
+            &format!("{} {activity}", spinner_glyph(spinner_frame)),
+            key_style,
+            status_style,
+        ));
+        if let Some(start) = wt.run_started_at {
+            let secs = (Utc::now() - start).num_seconds().max(0) as u64;
+            lines.push(kv_line(
+                "elapsed     ",
+                &fmt_elapsed(secs),
+                key_style,
+                val_style,
+            ));
+        }
+    }
+    if wt.turns > 0 || wt.tokens > 0 {
+        lines.push(kv_line(
+            "turns       ",
+            &wt.turns.to_string(),
+            key_style,
+            val_style,
+        ));
+        lines.push(kv_line(
+            "tokens      ",
+            &fmt_tokens(wt.tokens),
+            key_style,
+            val_style,
+        ));
+    }
 
     // Last-line summary surfaced from the agent (truncated upstream).
     if let Some(s) = summary {
@@ -250,6 +291,7 @@ fn status_label(status: &WorktreeStatus) -> &'static str {
         WorktreeStatus::CIFailing => "CI Failing",
         WorktreeStatus::PRMerged => "PR Merged",
         WorktreeStatus::Error => "Error",
+        WorktreeStatus::Deleting => "Deleting…",
     }
 }
 
@@ -294,6 +336,7 @@ fn status_val_style(status: &WorktreeStatus) -> Style {
         WorktreeStatus::CIFailing => Color::Red,
         WorktreeStatus::PRMerged => Color::Green,
         WorktreeStatus::Error => Color::Red,
+        WorktreeStatus::Deleting => Color::Red,
     };
     let base = Style::default().fg(color);
     match status {
@@ -367,6 +410,15 @@ mod tests {
 
     fn ts(rfc3339: &str) -> DateTime<Utc> {
         rfc3339.parse().unwrap()
+    }
+
+    #[test]
+    fn deleting_status_label_and_style() {
+        assert_eq!(status_label(&WorktreeStatus::Deleting), "Deleting…");
+        assert_eq!(
+            status_val_style(&WorktreeStatus::Deleting),
+            Style::default().fg(Color::Red)
+        );
     }
 
     // -----------------------------------------------------------------------

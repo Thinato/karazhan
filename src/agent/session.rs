@@ -39,6 +39,12 @@ pub struct ParseState {
     pub status: AgentStatus,
     /// Short last-line summary (truncated `result` text), if any.
     pub summary: Option<String>,
+    /// Current human-readable action, e.g. "Editing foo.rs".
+    pub activity: Option<String>,
+    /// Count of assistant turns with content.
+    pub turns: u32,
+    /// Cumulative output tokens reported by the stream.
+    pub tokens: u64,
 }
 
 /// An update emitted by the session runner.
@@ -47,6 +53,9 @@ pub struct StatusUpdate {
     pub worktree_path: PathBuf,
     pub status: AgentStatus,
     pub summary: Option<String>,
+    pub activity: Option<String>,
+    pub turns: u32,
+    pub tokens: u64,
 }
 
 /// A simulated run plan used by the mock backend (no real process).
@@ -103,22 +112,128 @@ pub fn parse_line(line: &str, state: &mut ParseState) -> bool {
                 let new = ParseState {
                     status: AgentStatus::Error(reason),
                     summary: result_text,
+                    activity: None,
+                    turns: state.turns,
+                    tokens: state.tokens,
                 };
                 changed(state, new)
             } else {
                 let new = ParseState {
                     status: AgentStatus::Done,
                     summary: result_text,
+                    activity: None,
+                    turns: state.turns,
+                    tokens: state.tokens,
                 };
                 changed(state, new)
             }
         }
-        // Any in-flight turn means the session is running. Preserve summary.
-        "system" | "assistant" | "user" if state.status != AgentStatus::Running => {
+        "assistant" => {
+            let mut changed_any = false;
+            if state.status != AgentStatus::Running {
+                state.status = AgentStatus::Running;
+                changed_any = true;
+            }
+            let msg = value.get("message");
+            if let Some(content) = msg.and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+                if !content.is_empty() {
+                    state.turns += 1;
+                    changed_any = true;
+                    if let Some(act) = describe_activity(content) {
+                        state.activity = Some(act);
+                    }
+                }
+            }
+            if let Some(out) = msg
+                .and_then(|m| m.get("usage"))
+                .and_then(|u| u.get("output_tokens"))
+                .and_then(|v| v.as_u64())
+            {
+                if out > 0 {
+                    state.tokens += out;
+                    changed_any = true;
+                }
+            }
+            changed_any
+        }
+        // Any in-flight turn means the session is running.
+        "system" | "user" if state.status != AgentStatus::Running => {
             state.status = AgentStatus::Running;
             true
         }
         _ => false, // unknown type — ignore.
+    }
+}
+
+/// Describe the human-facing action represented by a message's content blocks.
+///
+/// Prefers the LAST `tool_use` block; falls back to "Thinking…" when any text
+/// block is present; otherwise `None`.
+fn describe_activity(content: &[serde_json::Value]) -> Option<String> {
+    let mut last_tool: Option<String> = None;
+    let mut has_text = false;
+    for block in content {
+        match block.get("type").and_then(|t| t.as_str()) {
+            Some("tool_use") => {
+                let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let input = block.get("input").cloned().unwrap_or(serde_json::Value::Null);
+                last_tool = Some(describe_tool(name, &input));
+            }
+            Some("text") => has_text = true,
+            _ => {}
+        }
+    }
+    if let Some(t) = last_tool {
+        Some(t)
+    } else if has_text {
+        Some("Thinking…".to_string())
+    } else {
+        None
+    }
+}
+
+/// Map a tool-use (name + input) to a short human action string.
+fn describe_tool(name: &str, input: &serde_json::Value) -> String {
+    let field = |k: &str| input.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    match name {
+        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => {
+            let file_path = field("file_path");
+            if file_path.is_empty() {
+                "Editing".to_string()
+            } else {
+                format!("Editing {}", basename(file_path))
+            }
+        }
+        "Read" => {
+            let file_path = field("file_path");
+            format!("Reading {}", basename(file_path))
+        }
+        "Bash" => format!("Bash: {}", truncate_activity(field("command"), 36)),
+        "Grep" => format!("Searching: {}", truncate_activity(field("pattern"), 30)),
+        "Glob" => format!("Globbing: {}", truncate_activity(field("pattern"), 30)),
+        "Task" => format!("Subagent: {}", truncate_activity(field("description"), 30)),
+        "WebFetch" | "WebSearch" => "Browsing web…".to_string(),
+        "TodoWrite" => "Planning…".to_string(),
+        _ => format!("{name}…"),
+    }
+}
+
+/// Return the substring after the last `/` (the whole string if none); returns
+/// the input unchanged when empty.
+fn basename(p: &str) -> &str {
+    match p.rfind('/') {
+        Some(i) => &p[i + 1..],
+        None => p,
+    }
+}
+
+/// Truncate `s` to at most `max` characters, appending `…` if truncated.
+fn truncate_activity(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let truncated: String = s.chars().take(max).collect();
+        format!("{truncated}…")
+    } else {
+        s.to_string()
     }
 }
 
@@ -180,6 +295,9 @@ pub async fn run_session(mut handle: SessionHandle, tx: mpsc::Sender<StatusUpdat
             worktree_path: worktree_path.clone(),
             status: AgentStatus::Running,
             summary: None,
+            activity: None,
+            turns: 0,
+            tokens: 0,
         })
         .await;
 
@@ -204,6 +322,9 @@ pub async fn run_session(mut handle: SessionHandle, tx: mpsc::Sender<StatusUpdat
                                 worktree_path: worktree_path.clone(),
                                 status: state.status.clone(),
                                 summary: state.summary.clone(),
+                                activity: state.activity.clone(),
+                                turns: state.turns,
+                                tokens: state.tokens,
                             })
                             .await;
                     }
@@ -270,6 +391,9 @@ pub async fn run_session(mut handle: SessionHandle, tx: mpsc::Sender<StatusUpdat
             worktree_path,
             status: final_status,
             summary: state.summary.clone(),
+            activity: None,
+            turns: state.turns,
+            tokens: state.tokens,
         })
         .await;
 
@@ -347,6 +471,9 @@ async fn run_simulated(
             worktree_path: worktree_path.clone(),
             status: AgentStatus::Running,
             summary: None,
+            activity: None,
+            turns: 0,
+            tokens: 0,
         })
         .await;
 
@@ -357,6 +484,9 @@ async fn run_simulated(
             worktree_path,
             status: plan.final_status,
             summary: plan.summary,
+            activity: None,
+            turns: 0,
+            tokens: 0,
         })
         .await;
 
@@ -561,5 +691,57 @@ mod tests {
         // SUMMARY_MAX chars + ellipsis.
         assert_eq!(summary.chars().count(), SUMMARY_MAX + 1);
         assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn assistant_tool_use_edit_sets_activity_turns_tokens() {
+        let mut st = ParseState::default();
+        let changed = parse_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/a/b/foo.rs"}}],"usage":{"output_tokens":50}}}"#,
+            &mut st,
+        );
+        assert!(changed);
+        assert_eq!(st.activity.as_deref(), Some("Editing foo.rs"));
+        assert_eq!(st.turns, 1);
+        assert_eq!(st.tokens, 50);
+    }
+
+    #[test]
+    fn assistant_bash_tool_use_sets_activity() {
+        let mut st = ParseState::default();
+        parse_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+            &mut st,
+        );
+        assert_eq!(st.activity.as_deref(), Some("Bash: cargo test"));
+    }
+
+    #[test]
+    fn assistant_text_only_is_thinking() {
+        let mut st = ParseState::default();
+        parse_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"let me look"}]}}"#,
+            &mut st,
+        );
+        assert_eq!(st.activity.as_deref(), Some("Thinking…"));
+    }
+
+    #[test]
+    fn result_success_clears_activity_keeps_turns_tokens() {
+        let mut st = ParseState::default();
+        parse_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/a/b/foo.rs"}}],"usage":{"output_tokens":50}}}"#,
+            &mut st,
+        );
+        assert_eq!(st.turns, 1);
+        assert_eq!(st.tokens, 50);
+        parse_line(
+            r#"{"type":"result","subtype":"success","result":"All done."}"#,
+            &mut st,
+        );
+        assert_eq!(st.status, AgentStatus::Done);
+        assert_eq!(st.activity, None);
+        assert_eq!(st.turns, 1);
+        assert_eq!(st.tokens, 50);
     }
 }

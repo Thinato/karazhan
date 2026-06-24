@@ -64,6 +64,7 @@ fn help_lines() -> Vec<Line<'static>> {
         kv("j / ↓   ", "move selection down", key, desc),
         kv("k / ↑   ", "move selection up", key, desc),
         kv("/       ", "enter filter mode (type to search)", key, desc),
+        kv("Enter   ", "new worktree from selected prompt", key, desc),
         kv("n / a   ", "create a new prompt", key, desc),
         kv("e       ", "edit selected prompt in $EDITOR", key, desc),
         Line::from(""),

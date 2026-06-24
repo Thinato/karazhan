@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::ipc::WorktreeView;
+use crate::ui::spinner_glyph;
 use crate::worktree::{PrStatus, WorktreeStatus};
 
 use super::keymap::Motion;
@@ -108,6 +109,7 @@ impl GridView {
         area: Rect,
         projects: &[String],
         worktrees: &[WorktreeView],
+        spinner_frame: usize,
     ) {
         if projects.is_empty() {
             let msg = Paragraph::new(" No worktrees found.  Add a project with `A`.")
@@ -161,7 +163,7 @@ impl GridView {
 
                 let cell_area = Rect::new(x, cell_y, CELL_W, CELL_H);
                 let is_selected = flat == self.selected;
-                self.render_cell(frame, cell_area, wt, is_selected);
+                self.render_cell(frame, cell_area, wt, is_selected, spinner_frame);
                 flat += 1;
             }
 
@@ -170,7 +172,18 @@ impl GridView {
         }
     }
 
-    fn render_cell(&self, frame: &mut Frame, area: Rect, wt: &WorktreeView, selected: bool) {
+    fn render_cell(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        wt: &WorktreeView,
+        selected: bool,
+        spinner_frame: usize,
+    ) {
+        let running = wt.status == WorktreeStatus::Running;
+        let deleting = wt.status == WorktreeStatus::Deleting;
+        // Both Running and Deleting are "active" states that animate a spinner.
+        let active = running || deleting;
         // BORDER + name label colors come from the agent-activity status.
         let (border_color, label_color) = status_colors(&wt.status);
         // The colored STATUS TAG line is the PR status (separate axis).
@@ -198,10 +211,21 @@ impl GridView {
             .file_name()
             .map(|n| n.to_string_lossy().chars().take(8).collect())
             .unwrap_or_default();
-        let name_label = if dir_suffix.is_empty() {
-            truncate(&wt.name, inner_w)
+        let name_core = if dir_suffix.is_empty() {
+            wt.name.clone()
         } else {
-            truncate(&format!("{} {}", wt.name, dir_suffix), inner_w)
+            format!("{} {}", wt.name, dir_suffix)
+        };
+        // While active (Running/Deleting), prefix the name with an animated
+        // spinner (reserving 2 cols for the glyph + space) so the user sees work.
+        let name_label = if active {
+            format!(
+                "{} {}",
+                spinner_glyph(spinner_frame),
+                truncate(&name_core, inner_w.saturating_sub(2))
+            )
+        } else {
+            truncate(&name_core, inner_w)
         };
 
         // Line 2: prompt slug + PR number, with an optional unresolved-comment
@@ -277,11 +301,35 @@ impl GridView {
             meta_spans.push(Span::styled(badge, badge_style));
         }
 
+        // Line 3: while Running, show the live agent activity (e.g. "Editing
+        // foo.rs"); while Deleting, show "Deleting…"; otherwise the PR status tag.
+        let line3 = if running || deleting {
+            let (text, fg) = if deleting {
+                (truncate("Deleting…", inner_w), Color::Red)
+            } else {
+                (
+                    truncate(wt.activity.as_deref().unwrap_or("working…"), inner_w),
+                    Color::Yellow,
+                )
+            };
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(fg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(fg)
+            };
+            Span::styled(text, style)
+        } else {
+            Span::styled(status_tag, status_style)
+        };
+
         // Render the text lines inside the border.
         let lines: Vec<Line> = vec![
             Line::from(Span::styled(name_label, label_style)),
             Line::from(meta_spans),
-            Line::from(Span::styled(status_tag, status_style)),
+            Line::from(line3),
         ];
 
         let para = Paragraph::new(lines);
@@ -533,6 +581,7 @@ fn status_colors(status: &WorktreeStatus) -> (Color, Color) {
         WorktreeStatus::CIFailing => (Color::Red, Color::Red),
         WorktreeStatus::PRMerged => (Color::Green, Color::Green),
         WorktreeStatus::Error => (Color::Red, Color::Red),
+        WorktreeStatus::Deleting => (Color::Red, Color::Red),
     }
 }
 
@@ -607,6 +656,10 @@ mod tests {
             pr_status: PrStatus::NoPr,
             unresolved_comments: None,
             last_summary: None,
+            activity: None,
+            turns: 0,
+            tokens: 0,
+            run_started_at: None,
             created_at: now,
             updated_at: now,
         }
@@ -614,6 +667,14 @@ mod tests {
 
     fn names(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn deleting_status_colors_are_red() {
+        assert_eq!(
+            status_colors(&WorktreeStatus::Deleting),
+            (Color::Red, Color::Red)
+        );
     }
 
     // -----------------------------------------------------------------------

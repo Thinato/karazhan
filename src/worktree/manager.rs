@@ -205,6 +205,14 @@ impl WorktreeManager {
                 wt.pr_number = persisted.pr_number;
                 wt.auto_continue_on_merge = persisted.auto_continue_on_merge;
                 wt.status = persisted.status.clone();
+                // Poll-driven PR fields are persisted by the watcher; overlay
+                // them too so a registry rebuild (e.g. after deleting another
+                // worktree) keeps the last-known PR status instead of resetting
+                // every card to "Loading…" until the next poll.
+                wt.pr_status = persisted.pr_status;
+                wt.pr_url = persisted.pr_url.clone();
+                wt.pr_title = persisted.pr_title.clone();
+                wt.unresolved_comments = persisted.unresolved_comments;
                 wt.created_at = persisted.created_at;
                 wt.updated_at = persisted.updated_at;
             }
@@ -621,6 +629,13 @@ mod tests {
             &canonical_wt,
             super::super::model::WorktreeStatus::NeedsReview,
         );
+        st.set_pr_status(&canonical_wt, super::super::model::PrStatus::Merged);
+        st.set_pr_url_no_touch(
+            &canonical_wt,
+            Some("https://github.com/o/r/pull/99".to_string()),
+        );
+        st.set_pr_title_no_touch(&canonical_wt, Some("Overlay PR".to_string()));
+        st.set_unresolved_no_touch(&canonical_wt, Some(3));
         state::save(&root, &st).expect("save state");
 
         // list() should overlay that metadata back.
@@ -633,6 +648,11 @@ mod tests {
         assert!(wt.auto_continue_on_merge);
         assert_eq!(wt.status, super::super::model::WorktreeStatus::NeedsReview);
         assert_eq!(wt.prompt_slug.as_deref(), Some("overlay-prompt"));
+        // Poll-driven PR fields must round-trip through the overlay too.
+        assert_eq!(wt.pr_status, super::super::model::PrStatus::Merged);
+        assert_eq!(wt.pr_url.as_deref(), Some("https://github.com/o/r/pull/99"));
+        assert_eq!(wt.pr_title.as_deref(), Some("Overlay PR"));
+        assert_eq!(wt.unresolved_comments, Some(3));
     }
 
     // -----------------------------------------------------------------------

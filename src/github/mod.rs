@@ -26,6 +26,18 @@ use async_trait::async_trait;
 #[async_trait]
 pub trait GhRunner: Send + Sync {
     async fn run(&self, args: &[&str], cwd: &Path) -> Result<String>;
+
+    /// Like [`run`], but returns stdout even when `gh` exits non-zero, as long
+    /// as stdout is non-empty.  Some `gh` subcommands (notably `pr checks`) exit
+    /// non-zero to signal "checks are not all green" while still emitting valid
+    /// JSON on stdout — the very case the `i` (check-CI) command needs to read.
+    /// Only errors when the process can't be spawned, or exits non-zero with no
+    /// stdout to fall back on.
+    ///
+    /// Default impl delegates to [`run`]; `RealGh` overrides it.
+    async fn run_lenient(&self, args: &[&str], cwd: &Path) -> Result<String> {
+        self.run(args, cwd).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -73,6 +85,31 @@ impl GhRunner for RealGh {
                 args.join(" "),
                 output.status,
                 if stderr.is_empty() { stdout } else { stderr }
+            )
+        }
+    }
+
+    async fn run_lenient(&self, args: &[&str], cwd: &Path) -> Result<String> {
+        let output = tokio::process::Command::new(&self.bin)
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .await
+            .with_context(|| format!("failed to spawn `{} {}`", self.bin, args.join(" ")))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // `gh pr checks` exits non-zero when checks are pending/failing but still
+        // prints the JSON we asked for — accept any non-empty stdout regardless
+        // of exit code, and only error when there is genuinely nothing to read.
+        if !stdout.is_empty() || output.status.success() {
+            Ok(stdout)
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            bail!(
+                "`gh {}` failed (exit {}): {}",
+                args.join(" "),
+                output.status,
+                stderr
             )
         }
     }

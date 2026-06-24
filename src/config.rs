@@ -88,6 +88,8 @@ impl ColorsConfig {
             WorktreeStatus::CIFailing => &self.ci_failing,
             WorktreeStatus::PRMerged => &self.pr_merged,
             WorktreeStatus::Error => &self.error,
+            // No dedicated color; reuse the error color (destructive op).
+            WorktreeStatus::Deleting => &self.error,
         };
         Self::parse_color(name)
     }

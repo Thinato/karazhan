@@ -69,8 +69,10 @@ struct RawCheck {
 /// `failure`, `cancelled`, `timed_out`, `action_required`.
 pub async fn ci_status(runner: &dyn GhRunner, cwd: &Path, pr_number: u64) -> Result<CiStatus> {
     let pr_str = pr_number.to_string();
+    // `run_lenient`: `gh pr checks` exits non-zero when checks are pending or
+    // failing (exactly the cases `i` exists to handle) but still emits the JSON.
     let stdout = runner
-        .run(
+        .run_lenient(
             &["pr", "checks", &pr_str, "--json", "name,status,conclusion"],
             cwd,
         )

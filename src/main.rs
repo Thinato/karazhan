@@ -169,10 +169,12 @@ async fn run_client() -> Result<()> {
     // tick task post AppEvents here; the App's event loop drains them.
     let (event_tx, event_rx) = mpsc::channel::<AppEvent>(64);
 
-    // Spawn a tick task.
+    // Spawn a tick task.  250ms cadence drives the spinner animation and the
+    // live elapsed timer on Running worktrees; AppEvent::Tick is otherwise a
+    // no-op redraw, so a faster tick is safe.
     let tick_tx = event_tx.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(250));
         loop {
             interval.tick().await;
             if tick_tx.send(AppEvent::Tick).await.is_err() {

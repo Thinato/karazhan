@@ -52,7 +52,7 @@ use crate::worktree::model::{PrStatus, Worktree, WorktreeStatus};
 /// the handshake request and a `ProtocolMismatch` reply even when every other
 /// wire-format item has changed. Do NOT reorder these two; only append new
 /// variants after `ProtocolMismatch`.
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Maximum frame body size accepted by `read_frame_async` (64 MiB).
 const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
@@ -83,6 +83,16 @@ pub struct WorktreeView {
     pub unresolved_comments: Option<u64>,
     /// Last agent summary line received for this worktree.
     pub last_summary: Option<String>,
+    /// Current human-readable agent action while Running (e.g. "Editing foo.rs");
+    /// `None` when idle or between actions.  Ephemeral (runtime only).
+    pub activity: Option<String>,
+    /// Number of assistant turns in the current/last run.  Ephemeral.
+    pub turns: u32,
+    /// Cumulative output tokens generated in the current/last run.  Ephemeral.
+    pub tokens: u64,
+    /// Wall-clock start of the current run; `Some` only while Running so the
+    /// client can render a live elapsed timer.  Ephemeral.
+    pub run_started_at: Option<DateTime<Utc>>,
     /// When the worktree was first created.
     pub created_at: DateTime<Utc>,
     /// When the worktree was last used (any status/name/PR/flag mutation).
@@ -107,6 +117,12 @@ impl WorktreeView {
             pr_status: wt.pr_status,
             unresolved_comments: wt.unresolved_comments,
             last_summary,
+            // Progress fields are ephemeral runtime state, not derived from the
+            // persisted Worktree; the daemon injects/preserves them at runtime.
+            activity: None,
+            turns: 0,
+            tokens: 0,
+            run_started_at: None,
             created_at: wt.created_at,
             updated_at: wt.updated_at,
         }
@@ -230,6 +246,14 @@ pub enum SupervisorMsg {
         worktree_path: PathBuf,
         status: WorktreeStatus,
         summary: Option<String>,
+        /// Live agent action while Running (e.g. "Editing foo.rs"); `None` idle.
+        activity: Option<String>,
+        /// Assistant turns so far in this run.
+        turns: u32,
+        /// Cumulative output tokens so far in this run.
+        tokens: u64,
+        /// Run start time; `Some` only while Running (drives the elapsed timer).
+        run_started_at: Option<DateTime<Utc>>,
     },
     /// Non-fatal error (gh failures, etc.) surfaced to the client status line.
     Error {
@@ -379,6 +403,10 @@ mod tests {
             pr_status: PrStatus::ChecksPassing,
             unresolved_comments: Some(2),
             last_summary: Some("done".into()),
+            activity: None,
+            turns: 0,
+            tokens: 0,
+            run_started_at: None,
             created_at: now,
             updated_at: now,
         };
@@ -402,6 +430,10 @@ mod tests {
             pr_status: PrStatus::NoPr,
             unresolved_comments: None,
             last_summary: None,
+            activity: None,
+            turns: 0,
+            tokens: 0,
+            run_started_at: None,
             created_at: now,
             updated_at: now,
         };
@@ -437,7 +469,11 @@ mod tests {
                 pr_status,
                 unresolved_comments: None,
                 last_summary: None,
-                created_at: now,
+                activity: None,
+            turns: 0,
+            tokens: 0,
+            run_started_at: None,
+            created_at: now,
                 updated_at: now,
             };
             rt(&wv);
@@ -461,6 +497,10 @@ mod tests {
             pr_status: PrStatus::Open,
             unresolved_comments: Some(1),
             last_summary: None,
+            activity: None,
+            turns: 0,
+            tokens: 0,
+            run_started_at: None,
             created_at: now,
             updated_at: now,
         };
@@ -507,7 +547,11 @@ mod tests {
                 pr_status: PrStatus::NoPr,
                 unresolved_comments: None,
                 last_summary: None,
-                created_at: now,
+                activity: None,
+            turns: 0,
+            tokens: 0,
+            run_started_at: None,
+            created_at: now,
                 updated_at: now,
             }],
         });
@@ -521,8 +565,8 @@ mod tests {
     // ── Protocol version + frozen wire format ─────────────────────────────────
 
     #[test]
-    fn protocol_version_is_thirteen() {
-        assert_eq!(PROTOCOL_VERSION, 13);
+    fn protocol_version_is_fifteen() {
+        assert_eq!(PROTOCOL_VERSION, 15);
     }
 
     #[test]
@@ -711,6 +755,10 @@ mod tests {
             worktree_path: PathBuf::from("/repo/wt"),
             status: WorktreeStatus::NeedsReview,
             summary: Some("agent finished".into()),
+            activity: None,
+            turns: 5,
+            tokens: 1234,
+            run_started_at: None,
         });
     }
 
@@ -773,6 +821,10 @@ mod tests {
                 worktree_path: PathBuf::from("/wt"),
                 status: WorktreeStatus::Running,
                 summary: None,
+                activity: Some("Editing foo.rs".into()),
+                turns: 2,
+                tokens: 88,
+                run_started_at: None,
             },
             SupervisorMsg::Error {
                 worktree_path: None,

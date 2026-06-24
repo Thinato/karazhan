@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -18,7 +19,7 @@ use crate::ipc::{BuiltinKind, ClientMsg, ProjectInfo, WorktreeView};
 use crate::ui::detail::{split_grid_detail, DetailView};
 use crate::ui::grid::GridView;
 use crate::ui::keymap::{clamp_selection, Motion};
-use crate::ui::library::{LibraryMode, LibraryView};
+use crate::ui::library::{LibraryMode, LibraryView, SelectedPrompt};
 use crate::worktree::WorktreeStatus;
 
 #[derive(Debug)]
@@ -38,6 +39,14 @@ pub enum AppEvent {
         worktree_path: PathBuf,
         status: WorktreeStatus,
         summary: Option<String>,
+        /// Live agent action while Running (e.g. "Editing foo.rs").
+        activity: Option<String>,
+        /// Assistant turns so far in this run.
+        turns: u32,
+        /// Cumulative output tokens so far in this run.
+        tokens: u64,
+        /// Run start time; `Some` only while Running (drives the elapsed timer).
+        run_started_at: Option<DateTime<Utc>>,
     },
     /// Non-fatal error surfaced by the daemon (gh failures, etc.).
     DaemonError {
@@ -89,6 +98,25 @@ pub struct DeleteTarget {
     pub name: String,
 }
 
+/// State held while the "new worktree from prompt" confirm modal is open.
+pub struct ConfirmNewWorktree {
+    pub project: String,
+    pub slug: String,
+    pub title: String,
+    pub body: String,
+}
+
+impl ConfirmNewWorktree {
+    fn from_selected(sp: SelectedPrompt) -> Self {
+        Self {
+            project: sp.project,
+            slug: sp.slug,
+            title: sp.title,
+            body: sp.body,
+        }
+    }
+}
+
 pub struct App {
     pub running: bool,
     pub view: View,
@@ -128,6 +156,12 @@ pub struct App {
     /// Pending worktree deletion awaiting (y/N) confirmation.  `Some` while the
     /// confirmation modal is open; `None` otherwise.
     pending_delete: Option<DeleteTarget>,
+    /// Pending "new worktree from prompt" awaiting (Y/n) confirmation.  `Some`
+    /// while the modal is open; `None` otherwise.
+    confirm_new_worktree: Option<ConfirmNewWorktree>,
+    /// Monotonic counter advanced on every tick; drives the Running spinner
+    /// animation.  Wraps harmlessly.
+    spinner_frame: usize,
 }
 
 impl App {
@@ -160,6 +194,8 @@ impl App {
             new_worktree: None,
             add_project_input: None,
             pending_delete: None,
+            confirm_new_worktree: None,
+            spinner_frame: 0,
         }
     }
 
@@ -183,8 +219,13 @@ impl App {
                         // name list from the ProjectInfo snapshot.
                         let project_names: Vec<String> =
                             self.projects.iter().map(|p| p.name.clone()).collect();
-                        self.grid
-                            .render(frame, grid_area, &project_names, &self.worktrees);
+                        self.grid.render(
+                            frame,
+                            grid_area,
+                            &project_names,
+                            &self.worktrees,
+                            self.spinner_frame,
+                        );
 
                         let selected_wt = self.worktrees.get(self.grid.selected);
                         let summary = selected_wt.and_then(|wt| wt.last_summary.as_deref());
@@ -203,6 +244,7 @@ impl App {
                             summary,
                             prompt_input,
                             Some(&status_text),
+                            self.spinner_frame,
                         );
                     }
                 }
@@ -230,6 +272,16 @@ impl App {
                 // Render the delete-confirmation modal last (topmost).
                 if let Some(target) = &self.pending_delete {
                     crate::ui::palette::render_confirm_delete(frame, area, &target.name);
+                }
+
+                // Render the new-worktree-from-prompt confirmation modal (topmost).
+                if let Some(cnw) = &self.confirm_new_worktree {
+                    crate::ui::palette::render_confirm_new_worktree(
+                        frame,
+                        area,
+                        &cnw.title,
+                        &cnw.project,
+                    );
                 }
             })?;
 
@@ -394,6 +446,32 @@ impl App {
                         self.pending_delete = None;
                         self.set_status("delete cancelled");
                     }
+                }
+                return;
+            }
+
+            // Confirm-new-worktree modal: while open intercepts ALL keys.
+            // Enter/y/Y confirms (default YES); n/N/Esc cancels.
+            if self.confirm_new_worktree.is_some() {
+                match code {
+                    KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        if let Some(cnw) = self.confirm_new_worktree.take() {
+                            self.client
+                                .send(ClientMsg::NewWorktree {
+                                    project: cnw.project,
+                                    prompt_slug: Some(cnw.slug),
+                                    prompt_body: Some(cnw.body),
+                                })
+                                .await;
+                            self.set_status("creating worktree…");
+                            self.view = View::Grid;
+                        }
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        self.confirm_new_worktree = None;
+                        self.set_status("cancelled");
+                    }
+                    _ => {} // other keys: modal stays open
                 }
                 return;
             }
@@ -817,6 +895,14 @@ impl App {
                     },
                 }
             }
+            CommandId::NewWorktreeFromPrompt => match self.library.selected_prompt() {
+                Some(sp) => {
+                    self.confirm_new_worktree = Some(ConfirmNewWorktree::from_selected(sp));
+                }
+                None => {
+                    self.set_status("no prompt selected");
+                }
+            },
         }
     }
 
@@ -843,6 +929,7 @@ impl App {
 
         match self.library.mode {
             LibraryMode::Normal => match code {
+                KeyCode::Enter => self.execute_command(CommandId::NewWorktreeFromPrompt).await,
                 KeyCode::Char('q') => self.execute_command(CommandId::Quit).await,
                 KeyCode::Char('j') | KeyCode::Down => self.library.move_down(),
                 KeyCode::Char('k') | KeyCode::Up => self.library.move_up(),
@@ -1140,7 +1227,9 @@ impl App {
             AppEvent::Quit => {
                 self.running = false;
             }
-            AppEvent::Tick => {}
+            AppEvent::Tick => {
+                self.spinner_frame = self.spinner_frame.wrapping_add(1);
+            }
             AppEvent::Snapshot {
                 projects,
                 worktrees,
@@ -1156,12 +1245,20 @@ impl App {
                 worktree_path,
                 status,
                 summary,
+                activity,
+                turns,
+                tokens,
+                run_started_at,
             } => {
                 if let Some(view) = self.worktrees.iter_mut().find(|w| w.path == worktree_path) {
                     view.status = status;
                     if summary.is_some() {
                         view.last_summary = summary;
                     }
+                    view.activity = activity;
+                    view.turns = turns;
+                    view.tokens = tokens;
+                    view.run_started_at = run_started_at;
                 }
             }
             AppEvent::DaemonError {

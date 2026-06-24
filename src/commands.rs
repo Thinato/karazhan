@@ -61,6 +61,9 @@ pub enum CommandId {
     CopyPrUrl,
     /// Copy `"<PR URL> - <PR title>"` to the system clipboard (Grid; same as `Y`).
     CopyPrUrlWithTitle,
+    /// Create a new worktree from the selected library prompt in its own project
+    /// (Library Normal mode; same as `Enter`).
+    NewWorktreeFromPrompt,
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +228,13 @@ pub const ALL_COMMANDS: &[CommandSpec] = &[
         description: "copy '<URL> - <title>' to the clipboard",
         keybind: "Y",
         context: CommandContext::Grid,
+    },
+    CommandSpec {
+        id: CommandId::NewWorktreeFromPrompt,
+        title: "New worktree from prompt",
+        description: "create a worktree from the selected prompt (its project)",
+        keybind: "Enter",
+        context: CommandContext::Library,
     },
 ];
 
@@ -630,14 +640,31 @@ mod tests {
             OpenPr,
             CopyPrUrl,
             CopyPrUrlWithTitle,
+            NewWorktreeFromPrompt,
         ];
         // Exhaustive match: a new variant forces a compile error here.
         for id in all {
             match id {
-                SwitchView | ToggleHelp | Quit | StopDaemon | NewPrompt | EditPrompt
-                | FilterPrompts | RefreshWorktrees | RunCustomPrompt | AddressPrComments
-                | CheckCi | ToggleAutoContinue | NewWorktree | RenameWorktree | AddProject
-                | DeleteWorktree | OpenPr | CopyPrUrl | CopyPrUrlWithTitle => {}
+                SwitchView
+                | ToggleHelp
+                | Quit
+                | StopDaemon
+                | NewPrompt
+                | EditPrompt
+                | FilterPrompts
+                | RefreshWorktrees
+                | RunCustomPrompt
+                | AddressPrComments
+                | CheckCi
+                | ToggleAutoContinue
+                | NewWorktree
+                | RenameWorktree
+                | AddProject
+                | DeleteWorktree
+                | OpenPr
+                | CopyPrUrl
+                | CopyPrUrlWithTitle
+                | NewWorktreeFromPrompt => {}
             }
         }
         all.to_vec()

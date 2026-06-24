@@ -15,6 +15,9 @@ pub enum WorktreeStatus {
     CIFailing,
     PRMerged,
     Error,
+    /// Worktree is being torn down (git + fs removal in progress).  Transient:
+    /// the entry disappears from the next snapshot once removal completes.
+    Deleting,
 }
 
 /// PR status of a worktree's pull request, tracked as a SEPARATE axis from the

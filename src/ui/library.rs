@@ -35,6 +35,23 @@ pub enum LibraryMode {
 }
 
 // ---------------------------------------------------------------------------
+// SelectedPrompt
+// ---------------------------------------------------------------------------
+
+/// The identifying data of the currently selected prompt in the library.
+/// Returned by [`LibraryView::selected_prompt`].
+pub struct SelectedPrompt {
+    /// Name of the project that owns this prompt.
+    pub project: String,
+    /// Filesystem slug (used as the prompt filename without `.md`).
+    pub slug: String,
+    /// Human-readable title.
+    pub title: String,
+    /// Full prompt body text.
+    pub body: String,
+}
+
+// ---------------------------------------------------------------------------
 // Per-project prompt store + loaded prompts
 // ---------------------------------------------------------------------------
 
@@ -189,6 +206,20 @@ impl LibraryView {
         let proj = self.projects.get(r.project)?;
         let slug = &proj.prompts.get(r.prompt)?.slug;
         Some(proj.store.path_for(slug))
+    }
+
+    /// The currently selected prompt's identifying data (project name, slug,
+    /// title, body), or `None` when nothing is selected or the library is empty.
+    pub fn selected_prompt(&self) -> Option<SelectedPrompt> {
+        let r = self.flat.get(self.selected?)?;
+        let proj = self.projects.get(r.project)?;
+        let prompt = proj.prompts.get(r.prompt)?;
+        Some(SelectedPrompt {
+            project: proj.name.clone(),
+            slug: prompt.slug.clone(),
+            title: prompt.title.clone(),
+            body: prompt.body.clone(),
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -761,5 +792,35 @@ mod tests {
     fn selected_prompt_path_none_when_empty() {
         let view = LibraryView::new();
         assert_eq!(view.selected_prompt_path(), None);
+    }
+
+    #[test]
+    fn selected_prompt_returns_right_project_slug_title_body() {
+        let (_d1, p1) = project_with("alpha", &["a1", "a2"]);
+        let (_d2, p2) = project_with("beta", &["b1"]);
+        let mut view = LibraryView::new();
+        view.set_projects(&[p1, p2]);
+
+        // First selection → alpha's first prompt (alphabetical: a1).
+        let sp = view.selected_prompt().expect("selection");
+        assert_eq!(sp.project, "alpha");
+        assert_eq!(sp.slug, "a1");
+        assert_eq!(sp.title, "a1");
+        assert_eq!(sp.body, "body of a1");
+
+        // Move to last flat row → beta's b1.
+        view.move_down();
+        view.move_down();
+        let sp = view.selected_prompt().expect("selection after move");
+        assert_eq!(sp.project, "beta");
+        assert_eq!(sp.slug, "b1");
+        assert_eq!(sp.title, "b1");
+        assert_eq!(sp.body, "body of b1");
+    }
+
+    #[test]
+    fn selected_prompt_none_when_empty() {
+        let view = LibraryView::new();
+        assert!(view.selected_prompt().is_none());
     }
 }

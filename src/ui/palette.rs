@@ -325,6 +325,69 @@ pub fn render_confirm_delete(frame: &mut Frame, area: Rect, name: &str) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Render a (Y/n) confirmation modal for creating a worktree from a library prompt.
+///
+/// `title` is the prompt title; `project` is the owning project name.
+/// Default answer is YES — Enter/y/Y confirms; n/N/Esc cancels.
+pub fn render_confirm_new_worktree(frame: &mut Frame, area: Rect, title: &str, project: &str) {
+    let width = 64u16.min(area.width.saturating_sub(2)).max(1);
+    let height = 7u16.min(area.height.max(1));
+
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + area.height / 6;
+    let y = y.min(area.y + area.height.saturating_sub(height));
+    let popup = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" New worktree ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let inner_w = inner.width as usize;
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    let prompt_line = truncate(
+        &format!("Create a worktree from prompt \"{title}\"?"),
+        inner_w,
+    );
+    lines.push(Line::from(Span::styled(
+        prompt_line,
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    let project_line = truncate(&format!("Project: {project}"), inner_w);
+    lines.push(Line::from(Span::styled(
+        project_line,
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    lines.push(Line::from(Span::styled(
+        "(Y/n)",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    while lines.len() < inner.height as usize {
+        lines.push(Line::from(""));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 /// Truncate a string to at most `max` columns, appending `…` if truncated.
 fn truncate(s: &str, max: usize) -> String {
     if max == 0 {

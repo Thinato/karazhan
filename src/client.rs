@@ -25,6 +25,12 @@ use crate::ipc::{self, ClientMsg, HandshakeReq, HandshakeResp, SupervisorMsg, PR
 /// Capacity of the outbound `ClientMsg` channel feeding the writer task.
 const CLIENT_TX_CAP: usize = 64;
 
+/// Maximum time to wait for the daemon's handshake reply before treating it as
+/// wedged and restarting it.  Generous enough for a healthy daemon to build its
+/// snapshot (sub-second in practice, even with dozens of worktrees), short
+/// enough that a stuck daemon never leaves the client hanging on a blank screen.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// Handle the TUI uses to talk to the supervisor daemon.
 ///
 /// Cloning is not needed: the `App` owns a single client.  Outgoing commands
@@ -61,10 +67,18 @@ pub fn supervisor_msg_to_app_event(msg: SupervisorMsg) -> AppEvent {
             worktree_path,
             status,
             summary,
+            activity,
+            turns,
+            tokens,
+            run_started_at,
         } => AppEvent::WorktreeStatusChanged {
             worktree_path,
             status,
             summary,
+            activity,
+            turns,
+            tokens,
+            run_started_at,
         },
         SupervisorMsg::Error {
             worktree_path,
@@ -132,8 +146,9 @@ pub async fn connect(event_tx: mpsc::Sender<AppEvent>) -> Result<SupervisorClien
                     .await
                 }
                 HandshakeOutcome::Mismatch => bail!(
-                    "protocol mismatch persisted after restarting the daemon: client speaks \
-                     v{PROTOCOL_VERSION}. Stop any stale daemon (pidfile {}) and relaunch.",
+                    "daemon still unreachable after a restart (protocol mismatch or no handshake \
+                     reply): client speaks v{PROTOCOL_VERSION}. Stop any stale daemon (pidfile {}) \
+                     and relaunch.",
                     ipc::pidfile_path(&sock_path).display()
                 ),
             }
@@ -191,7 +206,27 @@ async fn connect_once(sock_path: &std::path::Path) -> Result<HandshakeOutcome> {
 
     // Read the typed reply.  A decode error means the daemon is old enough that
     // its handshake layout is incompatible — treat it as a mismatch.
-    match ipc::read_frame_async::<_, HandshakeResp>(&mut read_half).await {
+    //
+    // The read is bounded by HANDSHAKE_TIMEOUT: a wedged/unresponsive daemon must
+    // never hang the client forever (that manifests as "karazhan won't open" — a
+    // blank alt-screen).  On timeout we treat the daemon as stale and let the
+    // caller stop + respawn + retry, which self-heals the hang.
+    let reply = match tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        ipc::read_frame_async::<_, HandshakeResp>(&mut read_half),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_elapsed) => {
+            tracing::warn!(
+                timeout_secs = HANDSHAKE_TIMEOUT.as_secs(),
+                "client: daemon did not answer handshake in time; assuming wedged daemon, restarting"
+            );
+            return Ok(HandshakeOutcome::Mismatch);
+        }
+    };
+    match reply {
         Ok(HandshakeResp::Ok {
             supervisor_pid,
             projects,
@@ -368,6 +403,10 @@ mod tests {
             pr_status: crate::worktree::model::PrStatus::NoPr,
             unresolved_comments: None,
             last_summary: None,
+            activity: None,
+            turns: 0,
+            tokens: 0,
+            run_started_at: None,
             created_at: now,
             updated_at: now,
         }];
@@ -403,16 +442,28 @@ mod tests {
             worktree_path: PathBuf::from("/wt"),
             status: WorktreeStatus::NeedsReview,
             summary: Some("done".into()),
+            activity: Some("Editing foo.rs".into()),
+            turns: 3,
+            tokens: 100,
+            run_started_at: None,
         });
         match event {
             AppEvent::WorktreeStatusChanged {
                 worktree_path,
                 status,
                 summary,
+                activity,
+                turns,
+                tokens,
+                run_started_at,
             } => {
                 assert_eq!(worktree_path, PathBuf::from("/wt"));
                 assert_eq!(status, WorktreeStatus::NeedsReview);
                 assert_eq!(summary, Some("done".to_string()));
+                assert_eq!(activity, Some("Editing foo.rs".to_string()));
+                assert_eq!(turns, 3);
+                assert_eq!(tokens, 100);
+                assert_eq!(run_started_at, None);
             }
             other => panic!("expected WorktreeStatusChanged, got {other:?}"),
         }

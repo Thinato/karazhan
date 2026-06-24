@@ -91,6 +91,14 @@ impl ProjectRuntime {
     }
 }
 
+/// Ephemeral per-run progress carried from the agent stream to the client.
+#[derive(Default, Clone)]
+pub struct Progress {
+    pub activity: Option<String>,
+    pub turns: u32,
+    pub tokens: u64,
+}
+
 /// Authoritative worktree state held by the daemon.
 ///
 /// `worktrees` is the live set keyed by canonical path; `summaries` holds the
@@ -232,14 +240,58 @@ impl Shared {
     }
 
     /// Update registry + persist + broadcast a `StatusChanged` for one worktree.
-    async fn set_status(&self, path: &Path, status: WorktreeStatus, summary: Option<String>) {
+    ///
+    /// `progress` carries the live agent action / turn / token counters parsed
+    /// from the stream.  On the FIRST transition into `Running` the run timer is
+    /// stamped and the counters reset; on any terminal status the timer + live
+    /// activity are cleared (counters are retained for post-run display).
+    async fn set_status(
+        &self,
+        path: &Path,
+        status: WorktreeStatus,
+        summary: Option<String>,
+        progress: Option<Progress>,
+    ) {
+        let now = chrono::Utc::now();
+        let (activity, turns, tokens, run_started_at);
         {
             let mut reg = self.registry.lock().await;
             if let Some(view) = reg.worktrees.get_mut(path) {
+                let was_running = matches!(view.status, WorktreeStatus::Running);
                 view.status = status.clone();
                 if let Some(s) = &summary {
                     view.last_summary = Some(s.clone());
                 }
+                if matches!(status, WorktreeStatus::Running) {
+                    if !was_running {
+                        // Fresh run: stamp the timer and reset live counters.
+                        view.run_started_at = Some(now);
+                        view.turns = 0;
+                        view.tokens = 0;
+                        view.activity = None;
+                    }
+                    if let Some(p) = &progress {
+                        view.activity = p.activity.clone();
+                        view.turns = p.turns;
+                        view.tokens = p.tokens;
+                    }
+                } else {
+                    view.run_started_at = None;
+                    view.activity = None;
+                    if let Some(p) = &progress {
+                        view.turns = p.turns;
+                        view.tokens = p.tokens;
+                    }
+                }
+                activity = view.activity.clone();
+                turns = view.turns;
+                tokens = view.tokens;
+                run_started_at = view.run_started_at;
+            } else {
+                activity = None;
+                turns = 0;
+                tokens = 0;
+                run_started_at = None;
             }
             if let Some(s) = &summary {
                 reg.summaries.insert(path.to_path_buf(), s.clone());
@@ -250,6 +302,10 @@ impl Shared {
             worktree_path: path.to_path_buf(),
             status,
             summary,
+            activity,
+            turns,
+            tokens,
+            run_started_at,
         });
     }
 
@@ -433,10 +489,20 @@ impl Shared {
         for (project_name, list) in &listed {
             for wt in list {
                 let summary = reg.summaries.get(&wt.path).cloned();
-                next.insert(
-                    wt.path.clone(),
-                    ipc::WorktreeView::from_worktree(wt, project_name.clone(), summary),
-                );
+                let mut view =
+                    ipc::WorktreeView::from_worktree(wt, project_name.clone(), summary);
+                // `from_worktree` defaults the ephemeral progress fields, which
+                // would wipe a worktree mid-run.  Preserve them when the previous
+                // view was Running so the spinner/activity/timer survive a rebuild.
+                if let Some(prev) = reg.worktrees.get(&wt.path) {
+                    if matches!(prev.status, WorktreeStatus::Running) {
+                        view.activity = prev.activity.clone();
+                        view.turns = prev.turns;
+                        view.tokens = prev.tokens;
+                        view.run_started_at = prev.run_started_at;
+                    }
+                }
+                next.insert(wt.path.clone(), view);
                 project_of.insert(wt.path.clone(), project_name.clone());
                 order.push(wt.path.clone());
             }
@@ -906,7 +972,16 @@ async fn handle_client_msg(shared: &Arc<Shared>, msg: ClientMsg) {
             set_worktree_name(shared, &worktree_path, name).await;
         }
         ClientMsg::RemoveWorktree { path, force } => {
-            remove_worktree(shared, &path, force).await;
+            // Detach: worktree removal can be slow (git + `rm -rf` of e.g.
+            // node_modules).  Running it inline would freeze this connection's
+            // message loop for the whole teardown — and a client that quits
+            // mid-delete would leave a wedged handler.  The spawned task owns its
+            // own `Arc<Shared>` clone, broadcasts "Deleting…" immediately, and
+            // emits the final snapshot when done — independent of this client.
+            let shared = Arc::clone(shared);
+            tokio::spawn(async move {
+                remove_worktree(&shared, &path, force).await;
+            });
         }
         ClientMsg::Shutdown => {
             // Handled by the caller (signals serve() to exit); nothing here.
@@ -923,7 +998,7 @@ async fn run_prompt(shared: Arc<Shared>, worktree_path: PathBuf, prompt: String)
         reg.summaries.remove(&worktree_path);
     }
     shared
-        .set_status(&worktree_path, WorktreeStatus::Running, None)
+        .set_status(&worktree_path, WorktreeStatus::Running, None, None)
         .await;
 
     let Some(backend) = shared.backend_for(&worktree_path).await else {
@@ -947,6 +1022,7 @@ async fn run_prompt(shared: Arc<Shared>, worktree_path: PathBuf, prompt: String)
                     .set_status(
                         &path,
                         agent_status_to_worktree_status(&AgentStatus::Error(format!("{e}"))),
+                        None,
                         None,
                     )
                     .await;
@@ -975,7 +1051,7 @@ fn run_continue_session(shared: Arc<Shared>, worktree_path: PathBuf) {
             reg.summaries.remove(&path);
         }
         shared
-            .set_status(&path, WorktreeStatus::Running, None)
+            .set_status(&path, WorktreeStatus::Running, None, None)
             .await;
 
         match backend.continue_session(&path, &prompt).await {
@@ -986,6 +1062,7 @@ fn run_continue_session(shared: Arc<Shared>, worktree_path: PathBuf) {
                     .set_status(
                         &path,
                         agent_status_to_worktree_status(&AgentStatus::Error(format!("{e}"))),
+                        None,
                         None,
                     )
                     .await;
@@ -1004,8 +1081,18 @@ async fn drive_session(shared: Arc<Shared>, path: PathBuf, handle: crate::agent:
 
     while let Some(update) = status_rx.recv().await {
         let wt_status = agent_status_to_worktree_status(&update.status);
+        let progress = Progress {
+            activity: update.activity.clone(),
+            turns: update.turns,
+            tokens: update.tokens,
+        };
         shared
-            .set_status(&update.worktree_path, wt_status, update.summary.clone())
+            .set_status(
+                &update.worktree_path,
+                wt_status,
+                update.summary.clone(),
+                Some(progress),
+            )
             .await;
         tracing::info!(
             worktree = %update.worktree_path.display(),
@@ -1020,6 +1107,7 @@ async fn drive_session(shared: Arc<Shared>, path: PathBuf, handle: crate::agent:
             .set_status(
                 &path,
                 agent_status_to_worktree_status(&AgentStatus::Error(format!("{e}"))),
+                None,
                 None,
             )
             .await;
@@ -1240,6 +1328,7 @@ async fn new_worktree(
                     &canonical,
                     WorktreeStatus::Running,
                     Some(format!("running setup: {}", truncate_command(&command))),
+                    None,
                 )
                 .await;
             tracing::info!(
@@ -1266,7 +1355,7 @@ async fn new_worktree(
             None => {
                 // No prompt → leave the worktree Idle once setup is done.
                 task_shared
-                    .set_status(&canonical, WorktreeStatus::Idle, None)
+                    .set_status(&canonical, WorktreeStatus::Idle, None, None)
                     .await;
             }
         }
@@ -1339,13 +1428,43 @@ async fn remove_worktree(shared: &Arc<Shared>, path: &Path, _force: bool) {
         return;
     };
 
-    // The manager handles git + fs removal (always force per the spec).
+    // Flip the card to "Deleting…" before the (potentially slow) git + fs
+    // removal so the user sees the teardown is underway.  Broadcast happens
+    // before the blocking remove call below.
+    shared
+        .set_status(
+            path,
+            WorktreeStatus::Deleting,
+            Some("removing worktree".to_string()),
+            None,
+        )
+        .await;
+
+    // The manager handles git + fs removal (always force per the spec).  This is
+    // blocking I/O (git subprocess + recursive directory delete), so run it on
+    // the blocking pool — never inline on an async worker — so it cannot stall
+    // the runtime (handshakes, the watcher, other agents).
     let manager = WorktreeManager::new(root.clone());
-    match manager.remove(path, true) {
+    let rm_path = path.to_path_buf();
+    let removal = tokio::task::spawn_blocking(move || manager.remove(&rm_path, true)).await;
+    let remove_result = match removal {
+        Ok(r) => r,
+        Err(join_err) => Err(anyhow::anyhow!("removal task failed: {join_err}")),
+    };
+    match remove_result {
         Ok(()) => {
             tracing::info!("daemon: worktree removed from disk: {}", path.display());
         }
         Err(e) => {
+            // Removal failed — don't leave the card stuck on "Deleting…".
+            shared
+                .set_status(
+                    path,
+                    WorktreeStatus::Error,
+                    Some(format!("remove failed: {e}")),
+                    None,
+                )
+                .await;
             shared.error(
                 Some(path.to_path_buf()),
                 format!("remove worktree failed: {e}"),
@@ -2136,15 +2255,11 @@ mod tests {
             );
         }
 
-        // Send RemoveWorktree.
-        handle_client_msg(
-            &shared,
-            ClientMsg::RemoveWorktree {
-                path: canonical.clone(),
-                force: true,
-            },
-        )
-        .await;
+        // Drive the removal directly.  (The `RemoveWorktree` dispatch arm now
+        // just spawns this as a detached task so the connection loop stays
+        // responsive; awaiting it here keeps the assertion deterministic while
+        // still exercising the full git + fs + registry teardown path.)
+        remove_worktree(&shared, &canonical, true).await;
 
         // Registry must no longer contain the worktree.
         {
