@@ -10,6 +10,7 @@ use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::project_config::WorktreeSettings;
 use crate::worktree::WorktreeStatus;
 
 // ---------------------------------------------------------------------------
@@ -124,6 +125,10 @@ pub struct Config {
 
     /// Per-status colour overrides.
     pub colors: ColorsConfig,
+
+    /// Global per-worktree setup defaults (`[worktree]` table).  Used as the
+    /// fallback when a project does not set its own values.
+    pub worktree: WorktreeSettings,
 }
 
 impl Default for Config {
@@ -137,6 +142,7 @@ impl Default for Config {
                 "The PR for this worktree was merged. Continue with the next step of the task."
                     .to_string(),
             colors: ColorsConfig::default(),
+            worktree: WorktreeSettings::default(),
         }
     }
 }
@@ -321,6 +327,30 @@ error = "red"
             ColorsConfig::parse_color("totally_unknown_color"),
             Color::Gray
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Global [worktree] table parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_global_worktree_table() {
+        let toml = r#"
+[worktree]
+setup_command = "pnpm install"
+setup_timeout_seconds = 600
+"#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        assert_eq!(cfg.worktree.setup_command.as_deref(), Some("pnpm install"));
+        assert_eq!(cfg.worktree.setup_timeout_seconds, Some(600));
+    }
+
+    #[test]
+    fn missing_global_worktree_table_is_all_none() {
+        let toml = r#"poll_interval_secs = 10"#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        assert!(cfg.worktree.setup_command.is_none());
+        assert!(cfg.worktree.setup_timeout_seconds.is_none());
     }
 
     #[test]

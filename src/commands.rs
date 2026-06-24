@@ -55,6 +55,12 @@ pub enum CommandId {
     AddProject,
     /// Delete the selected worktree with a (y/N) confirmation (Grid; same as `d`).
     DeleteWorktree,
+    /// Open the selected worktree's PR in the default browser (Grid; same as `o`).
+    OpenPr,
+    /// Copy the selected worktree's PR URL to the system clipboard (Grid; same as `y`).
+    CopyPrUrl,
+    /// Copy `"<PR URL> - <PR title>"` to the system clipboard (Grid; same as `Y`).
+    CopyPrUrlWithTitle,
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +203,27 @@ pub const ALL_COMMANDS: &[CommandSpec] = &[
         title: "Delete worktree",
         description: "delete the selected worktree (with confirmation)",
         keybind: "d",
+        context: CommandContext::Grid,
+    },
+    CommandSpec {
+        id: CommandId::OpenPr,
+        title: "Open PR in browser",
+        description: "open the worktree's PR in your default browser",
+        keybind: "o",
+        context: CommandContext::Grid,
+    },
+    CommandSpec {
+        id: CommandId::CopyPrUrl,
+        title: "Copy PR URL",
+        description: "copy the worktree's PR URL to the clipboard",
+        keybind: "y",
+        context: CommandContext::Grid,
+    },
+    CommandSpec {
+        id: CommandId::CopyPrUrlWithTitle,
+        title: "Copy PR URL + title",
+        description: "copy '<URL> - <title>' to the clipboard",
+        keybind: "Y",
         context: CommandContext::Grid,
     },
 ];
@@ -600,6 +627,9 @@ mod tests {
             RenameWorktree,
             AddProject,
             DeleteWorktree,
+            OpenPr,
+            CopyPrUrl,
+            CopyPrUrlWithTitle,
         ];
         // Exhaustive match: a new variant forces a compile error here.
         for id in all {
@@ -607,7 +637,7 @@ mod tests {
                 SwitchView | ToggleHelp | Quit | StopDaemon | NewPrompt | EditPrompt
                 | FilterPrompts | RefreshWorktrees | RunCustomPrompt | AddressPrComments
                 | CheckCi | ToggleAutoContinue | NewWorktree | RenameWorktree | AddProject
-                | DeleteWorktree => {}
+                | DeleteWorktree | OpenPr | CopyPrUrl | CopyPrUrlWithTitle => {}
             }
         }
         all.to_vec()

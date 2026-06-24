@@ -20,11 +20,20 @@ pub enum WorktreeStatus {
 /// PR status of a worktree's pull request, tracked as a SEPARATE axis from the
 /// agent-activity [`WorktreeStatus`].  Auto-discovered by the watcher from the
 /// worktree's current branch via `gh`.  Detached / no-branch / no-PR → `NoPr`.
+///
+/// `Loading` is the initial/pre-fetch state: newly created worktrees and those
+/// discovered from `git worktree list` without prior persisted state start as
+/// `Loading` (cyan "loading…" in the UI) until the watcher's first poll
+/// completes and transitions them to a real status.  `Loading` is NEVER returned
+/// by [`crate::github::pr_status::classify`] — it is purely a pre-fetch marker.
 #[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PrStatus {
+    /// Initial/pre-fetch state: the watcher has not yet polled this worktree.
+    /// Transitions to a real status on the first successful poll.
     #[default]
+    Loading,
     NoPr,
     Draft,
     Open,
@@ -70,15 +79,27 @@ pub struct Worktree {
     pub prompt_slug: Option<String>,
     /// GitHub PR number associated with this worktree, if any.
     pub pr_number: Option<u64>,
+    /// Canonical GitHub URL for the worktree's PR, if known.
+    #[serde(default)]
+    pub pr_url: Option<String>,
+    /// PR title, as returned by `gh pr view --json title`.
+    #[serde(default)]
+    pub pr_title: Option<String>,
     /// When true, the agent will auto-continue as soon as the PR is merged.
     pub auto_continue_on_merge: bool,
     /// Current lifecycle status (defaults to Idle on deserialise if missing).
     #[serde(default)]
     pub status: WorktreeStatus,
     /// PR status, auto-discovered by the watcher (separate axis from `status`).
-    /// Legacy state.toml entries that lack this field deserialise as `NoPr`.
+    /// New/legacy state.toml entries that lack this field deserialise as `Loading`
+    /// (the `#[default]` on `PrStatus`), which triggers a re-fetch on the next poll.
     #[serde(default)]
     pub pr_status: PrStatus,
+    /// Count of UNRESOLVED PR review threads (GitHub "Resolve conversation"
+    /// state), auto-discovered by the watcher for OPEN PRs.  `None` when there is
+    /// no open PR or the count has not been fetched yet.
+    #[serde(default)]
+    pub unresolved_comments: Option<u64>,
     /// When the worktree was first created.  Serialises as RFC 3339.
     /// Legacy entries that lack this field get the load-time instant as a
     /// best-effort value; `created_at` is NEVER modified after first creation.
@@ -101,11 +122,96 @@ impl Worktree {
             branch,
             prompt_slug: None,
             pr_number: None,
+            pr_url: None,
+            pr_title: None,
             auto_continue_on_merge: false,
             status: WorktreeStatus::Idle,
-            pr_status: PrStatus::NoPr,
+            pr_status: PrStatus::Loading,
+            unresolved_comments: None,
             created_at: now,
             updated_at: now,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pr_status_default_is_loading() {
+        assert_eq!(PrStatus::default(), PrStatus::Loading);
+    }
+
+    #[test]
+    fn from_git_pr_status_is_loading() {
+        let wt = Worktree::from_git(PathBuf::from("/tmp/wt"), "feat".to_string());
+        assert_eq!(wt.pr_status, PrStatus::Loading);
+    }
+
+    #[test]
+    fn serde_missing_pr_status_deserializes_to_loading() {
+        // A state.toml row without a "pr_status" field (legacy or new) should
+        // deserialise to Loading via the #[serde(default)] + #[default] combo.
+        let toml_no_pr_status = r#"
+path = "/tmp/wt"
+branch = "feat"
+auto_continue_on_merge = false
+"#;
+        let wt: Worktree = toml::from_str(toml_no_pr_status).expect("deserialize");
+        assert_eq!(wt.pr_status, PrStatus::Loading);
+    }
+
+    #[test]
+    fn serde_present_pr_status_loads_as_is() {
+        // A persisted real status (e.g. "merged") must NOT be overridden by Loading.
+        let toml_merged = r#"
+path = "/tmp/wt"
+branch = "feat"
+auto_continue_on_merge = false
+pr_status = "merged"
+"#;
+        let wt: Worktree = toml::from_str(toml_merged).expect("deserialize");
+        assert_eq!(wt.pr_status, PrStatus::Merged);
+    }
+
+    #[test]
+    fn serde_missing_unresolved_comments_defaults_to_none() {
+        // A state.toml row without `unresolved_comments` deserialises to None.
+        let toml_no_field = r#"
+path = "/tmp/wt"
+branch = "feat"
+auto_continue_on_merge = false
+"#;
+        let wt: Worktree = toml::from_str(toml_no_field).expect("deserialize");
+        assert_eq!(wt.unresolved_comments, None);
+    }
+
+    #[test]
+    fn serde_present_unresolved_comments_loads() {
+        let toml_with_field = r#"
+path = "/tmp/wt"
+branch = "feat"
+auto_continue_on_merge = false
+unresolved_comments = 3
+"#;
+        let wt: Worktree = toml::from_str(toml_with_field).expect("deserialize");
+        assert_eq!(wt.unresolved_comments, Some(3));
+    }
+
+    #[test]
+    fn serde_loading_round_trips() {
+        let toml_loading = r#"
+path = "/tmp/wt"
+branch = "feat"
+auto_continue_on_merge = false
+pr_status = "loading"
+"#;
+        let wt: Worktree = toml::from_str(toml_loading).expect("deserialize");
+        assert_eq!(wt.pr_status, PrStatus::Loading);
     }
 }

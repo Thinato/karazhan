@@ -130,6 +130,25 @@ fn build_detail_lines(
         pr_status_val_style(&wt.pr_status),
     ));
 
+    // Unresolved review-comment count.  Bright when > 0 to draw attention; dim
+    // "0" when there are none; "—" when unknown / no open PR.
+    let (unresolved_value, unresolved_style) = match wt.unresolved_comments {
+        Some(n) if n > 0 => (
+            n.to_string(),
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Some(_) => ("0".to_string(), val_style),
+        None => ("—".to_string(), dim_style()),
+    };
+    lines.push(kv_line(
+        "unresolved  ",
+        &unresolved_value,
+        key_style,
+        unresolved_style,
+    ));
+
     let auto_str = if wt.auto_continue_on_merge {
         "yes"
     } else {
@@ -237,6 +256,7 @@ fn status_label(status: &WorktreeStatus) -> &'static str {
 /// Human-readable label for a PR status (full words for the detail card).
 fn pr_status_label(pr: &PrStatus) -> &'static str {
     match pr {
+        PrStatus::Loading => "loading\u{2026}",
         PrStatus::NoPr => "no PR",
         PrStatus::Draft => "draft",
         PrStatus::Open => "open",
@@ -252,6 +272,7 @@ fn pr_status_label(pr: &PrStatus) -> &'static str {
 /// Color style for a PR status value (per the fixed taxonomy).
 fn pr_status_val_style(pr: &PrStatus) -> Style {
     let color = match pr {
+        PrStatus::Loading => Color::Cyan,
         PrStatus::NoPr => Color::DarkGray,
         PrStatus::Draft => Color::DarkGray,
         PrStatus::Open => Color::Yellow,
@@ -346,6 +367,24 @@ mod tests {
 
     fn ts(rfc3339: &str) -> DateTime<Utc> {
         rfc3339.parse().unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // Loading variant label + color
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pr_status_loading_label_is_loading_ellipsis() {
+        assert_eq!(
+            pr_status_label(&crate::worktree::PrStatus::Loading),
+            "loading\u{2026}"
+        );
+    }
+
+    #[test]
+    fn pr_status_loading_val_style_is_cyan() {
+        let style = pr_status_val_style(&crate::worktree::PrStatus::Loading);
+        assert_eq!(style, Style::default().fg(Color::Cyan));
     }
 
     #[test]

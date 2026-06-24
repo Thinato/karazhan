@@ -18,10 +18,14 @@ use crate::worktree::model::PrStatus;
 // ---------------------------------------------------------------------------
 
 /// Resolved PR info for a worktree's current branch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrInfo {
     pub number: u64,
     pub status: PrStatus,
+    /// Canonical GitHub URL for the PR (e.g. `https://github.com/owner/repo/pull/42`).
+    pub url: Option<String>,
+    /// PR title, as returned by `gh pr view --json title`.
+    pub title: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -42,6 +46,12 @@ struct RawPrView {
     /// included in the gh call.
     #[serde(default)]
     review_decision: Option<String>,
+    /// Canonical HTML URL for the PR.
+    #[serde(default)]
+    url: Option<String>,
+    /// PR title.
+    #[serde(default)]
+    title: Option<String>,
     #[serde(default)]
     status_check_rollup: Vec<RawRollupCheck>,
 }
@@ -229,7 +239,7 @@ pub async fn fetch_pr_status(runner: &dyn GhRunner, cwd: &Path) -> Result<Option
                 "pr",
                 "view",
                 "--json",
-                "number,state,isDraft,mergedAt,reviewDecision,statusCheckRollup",
+                "number,state,isDraft,mergedAt,reviewDecision,url,title,statusCheckRollup",
             ],
             cwd,
         )
@@ -270,7 +280,118 @@ pub async fn fetch_pr_status(runner: &dyn GhRunner, cwd: &Path) -> Result<Option
     Ok(Some(PrInfo {
         number: raw.number,
         status,
+        url: raw.url,
+        title: raw.title,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// fetch_unresolved_count — GraphQL unresolved review-thread count
+// ---------------------------------------------------------------------------
+
+/// GraphQL query fetching the first 100 review threads of a PR plus the total
+/// count.  Single page — see [`count_unresolved`] for the >100 cap behaviour.
+const UNRESOLVED_QUERY: &str = "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100){totalCount nodes{isResolved}}}}}";
+
+/// Raw serde shape for the `gh api graphql` reviewThreads response.
+#[derive(Deserialize)]
+struct RawGraphQl {
+    data: RawGraphQlData,
+}
+
+#[derive(Deserialize)]
+struct RawGraphQlData {
+    repository: RawRepository,
+}
+
+#[derive(Deserialize)]
+struct RawRepository {
+    #[serde(rename = "pullRequest")]
+    pull_request: RawPullRequest,
+}
+
+#[derive(Deserialize)]
+struct RawPullRequest {
+    #[serde(rename = "reviewThreads")]
+    review_threads: RawReviewThreads,
+}
+
+#[derive(Deserialize)]
+struct RawReviewThreads {
+    #[serde(rename = "totalCount")]
+    total_count: u64,
+    nodes: Vec<RawReviewThread>,
+}
+
+#[derive(Deserialize)]
+struct RawReviewThread {
+    #[serde(rename = "isResolved")]
+    is_resolved: bool,
+}
+
+/// Pure parse helper: given the JSON returned by `gh api graphql`, count the
+/// review threads whose `isResolved == false`.
+///
+/// When `totalCount` exceeds the number of returned `nodes` (i.e. the PR has
+/// more than the first 100 review threads), logs a `debug` note that the count
+/// is capped at the first 100 — we deliberately do NOT paginate for now.
+pub fn count_unresolved(json: &str) -> Result<u64> {
+    let parsed: RawGraphQl = serde_json::from_str(json)
+        .with_context(|| "failed to parse gh api graphql reviewThreads JSON")?;
+    let threads = parsed.data.repository.pull_request.review_threads;
+
+    if threads.total_count > threads.nodes.len() as u64 {
+        tracing::debug!(
+            total = threads.total_count,
+            fetched = threads.nodes.len(),
+            "unresolved review-thread count capped at first 100 threads (not paginating)"
+        );
+    }
+
+    let unresolved = threads.nodes.iter().filter(|t| !t.is_resolved).count() as u64;
+    Ok(unresolved)
+}
+
+/// Fetch the number of UNRESOLVED review threads (GitHub's "Resolve
+/// conversation" state) for PR `number` in `owner/repo`, via a single
+/// `gh api graphql` call run in `cwd`.
+///
+/// Only one page (`reviewThreads(first:100)`) is fetched; counts beyond 100
+/// threads are capped (logged in [`count_unresolved`]).  Returns `Err` on any
+/// gh failure or parse error so the caller can log + skip and leave the
+/// previously-known count unchanged.
+pub async fn fetch_unresolved_count(
+    runner: &dyn GhRunner,
+    cwd: &Path,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<u64> {
+    let query_arg = format!("query={UNRESOLVED_QUERY}");
+    let owner_arg = format!("owner={owner}");
+    let repo_arg = format!("repo={repo}");
+    let number_arg = format!("number={number}");
+
+    let stdout = runner
+        .run(
+            &[
+                "api",
+                "graphql",
+                "-f",
+                &query_arg,
+                "-f",
+                &owner_arg,
+                "-f",
+                &repo_arg,
+                "-F",
+                &number_arg,
+            ],
+            cwd,
+        )
+        .await
+        .with_context(|| "gh api graphql (reviewThreads) failed")?;
+
+    count_unresolved(&stdout)
 }
 
 // ---------------------------------------------------------------------------
@@ -570,6 +691,7 @@ mod tests {
             .expect("Some");
         assert_eq!(info.number, 42);
         assert_eq!(info.status, PrStatus::ChecksPassing);
+        assert_eq!(info.url, None);
     }
 
     #[tokio::test]
@@ -591,6 +713,7 @@ mod tests {
             .expect("Some");
         assert_eq!(info.number, 55);
         assert_eq!(info.status, PrStatus::ChecksRunning);
+        assert_eq!(info.url, None);
     }
 
     #[tokio::test]
@@ -613,6 +736,67 @@ mod tests {
             .expect("Some");
         assert_eq!(info.number, 99);
         assert_eq!(info.status, PrStatus::Approved);
+        assert_eq!(info.url, None);
+    }
+
+    #[tokio::test]
+    async fn fetch_pr_url_is_captured() {
+        let json = r#"{
+            "number": 7,
+            "state": "OPEN",
+            "isDraft": false,
+            "mergedAt": null,
+            "url": "https://github.com/owner/repo/pull/7",
+            "statusCheckRollup": []
+        }"#;
+        let mock = MockGh::new(vec![("pr view --json", Ok(json.to_string()))]);
+        let info = fetch_pr_status(&mock, Path::new("/tmp"))
+            .await
+            .unwrap()
+            .expect("Some");
+        assert_eq!(info.number, 7);
+        assert_eq!(
+            info.url,
+            Some("https://github.com/owner/repo/pull/7".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_pr_title_is_captured() {
+        let json = r#"{
+            "number": 11,
+            "state": "OPEN",
+            "isDraft": false,
+            "mergedAt": null,
+            "url": "https://github.com/owner/repo/pull/11",
+            "title": "Fix the widget renderer",
+            "statusCheckRollup": []
+        }"#;
+        let mock = MockGh::new(vec![("pr view --json", Ok(json.to_string()))]);
+        let info = fetch_pr_status(&mock, Path::new("/tmp"))
+            .await
+            .unwrap()
+            .expect("Some");
+        assert_eq!(info.number, 11);
+        assert_eq!(info.title, Some("Fix the widget renderer".to_string()));
+    }
+
+    #[tokio::test]
+    async fn fetch_pr_title_absent_is_none() {
+        // JSON without a "title" field — the serde default kicks in.
+        let json = r#"{
+            "number": 3,
+            "state": "OPEN",
+            "isDraft": false,
+            "mergedAt": null,
+            "statusCheckRollup": []
+        }"#;
+        let mock = MockGh::new(vec![("pr view --json", Ok(json.to_string()))]);
+        let info = fetch_pr_status(&mock, Path::new("/tmp"))
+            .await
+            .unwrap()
+            .expect("Some");
+        assert_eq!(info.title, None);
     }
 
     #[tokio::test]
@@ -643,5 +827,73 @@ mod tests {
             .expect("Some");
         assert_eq!(info.number, 7);
         assert_eq!(info.status, PrStatus::Merged);
+        assert_eq!(info.url, None);
+    }
+
+    // -- count_unresolved (pure parse) ---------------------------------------
+
+    fn graphql_threads(total: u64, resolved_flags: &[bool]) -> String {
+        let nodes: Vec<String> = resolved_flags
+            .iter()
+            .map(|r| format!(r#"{{"isResolved":{r}}}"#))
+            .collect();
+        format!(
+            r#"{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"totalCount":{total},"nodes":[{}]}}}}}}}}}}"#,
+            nodes.join(",")
+        )
+    }
+
+    #[test]
+    fn count_unresolved_two_of_three() {
+        // 3 threads: 2 unresolved (false), 1 resolved (true) → 2.
+        let json = graphql_threads(3, &[false, false, true]);
+        assert_eq!(count_unresolved(&json).unwrap(), 2);
+    }
+
+    #[test]
+    fn count_unresolved_all_resolved_is_zero() {
+        let json = graphql_threads(2, &[true, true]);
+        assert_eq!(count_unresolved(&json).unwrap(), 0);
+    }
+
+    #[test]
+    fn count_unresolved_empty_is_zero() {
+        let json = graphql_threads(0, &[]);
+        assert_eq!(count_unresolved(&json).unwrap(), 0);
+    }
+
+    #[test]
+    fn count_unresolved_over_100_caps_at_fetched_nodes() {
+        // totalCount > nodes.len() → debug log + count only fetched nodes.
+        // 2 fetched nodes, both unresolved, but totalCount claims 150.
+        let json = graphql_threads(150, &[false, false]);
+        assert_eq!(count_unresolved(&json).unwrap(), 2);
+    }
+
+    #[test]
+    fn count_unresolved_malformed_is_err() {
+        assert!(count_unresolved("not json").is_err());
+    }
+
+    // -- fetch_unresolved_count via MockGh -----------------------------------
+
+    #[tokio::test]
+    async fn fetch_unresolved_count_two_of_three() {
+        let json = graphql_threads(3, &[false, true, false]);
+        let mock = MockGh::new(vec![("api graphql", Ok(json))]);
+        let n = fetch_unresolved_count(&mock, Path::new("/tmp"), "owner", "repo", 42)
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    async fn fetch_unresolved_count_gh_error_is_err() {
+        let mock = MockGh::new(vec![(
+            "api graphql",
+            Err(anyhow::anyhow!("gh api graphql failed (exit 1): bad creds")),
+        )]);
+        let result = fetch_unresolved_count(&mock, Path::new("/tmp"), "owner", "repo", 42).await;
+        assert!(result.is_err());
     }
 }

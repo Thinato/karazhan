@@ -52,7 +52,7 @@ use crate::worktree::model::{PrStatus, Worktree, WorktreeStatus};
 /// the handshake request and a `ProtocolMismatch` reply even when every other
 /// wire-format item has changed. Do NOT reorder these two; only append new
 /// variants after `ProtocolMismatch`.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// Maximum frame body size accepted by `read_frame_async` (64 MiB).
 const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
@@ -70,10 +70,17 @@ pub struct WorktreeView {
     pub branch: String,
     pub prompt_slug: Option<String>,
     pub pr_number: Option<u64>,
+    /// Canonical GitHub URL for the PR, if known.
+    pub pr_url: Option<String>,
+    /// PR title, if known.
+    pub pr_title: Option<String>,
     pub auto_continue_on_merge: bool,
     pub status: WorktreeStatus,
     /// PR status (separate axis from the agent-activity `status`).
     pub pr_status: PrStatus,
+    /// Count of UNRESOLVED PR review threads (open PRs only); `None` when no
+    /// open PR or not yet fetched.
+    pub unresolved_comments: Option<u64>,
     /// Last agent summary line received for this worktree.
     pub last_summary: Option<String>,
     /// When the worktree was first created.
@@ -93,9 +100,12 @@ impl WorktreeView {
             branch: wt.branch.clone(),
             prompt_slug: wt.prompt_slug.clone(),
             pr_number: wt.pr_number,
+            pr_url: wt.pr_url.clone(),
+            pr_title: wt.pr_title.clone(),
             auto_continue_on_merge: wt.auto_continue_on_merge,
             status: wt.status.clone(),
             pr_status: wt.pr_status,
+            unresolved_comments: wt.unresolved_comments,
             last_summary,
             created_at: wt.created_at,
             updated_at: wt.updated_at,
@@ -362,10 +372,36 @@ mod tests {
             branch: "feature/x".into(),
             prompt_slug: Some("refactor".into()),
             pr_number: Some(42),
+            pr_url: Some("https://github.com/owner/repo/pull/42".into()),
+            pr_title: Some("Fix the bug".into()),
             auto_continue_on_merge: true,
             status: WorktreeStatus::Running,
             pr_status: PrStatus::ChecksPassing,
+            unresolved_comments: Some(2),
             last_summary: Some("done".into()),
+            created_at: now,
+            updated_at: now,
+        };
+        rt(&wv);
+    }
+
+    #[test]
+    fn worktree_view_round_trip_with_pr_url_none() {
+        let now = Utc::now();
+        let wv = WorktreeView {
+            path: PathBuf::from("/repo/feature"),
+            project: "karazhan".into(),
+            name: "my-worktree".into(),
+            branch: "feature/x".into(),
+            prompt_slug: None,
+            pr_number: None,
+            pr_url: None,
+            pr_title: None,
+            auto_continue_on_merge: false,
+            status: WorktreeStatus::Idle,
+            pr_status: PrStatus::NoPr,
+            unresolved_comments: None,
+            last_summary: None,
             created_at: now,
             updated_at: now,
         };
@@ -376,6 +412,7 @@ mod tests {
     fn worktree_view_round_trip_pr_status_variants() {
         let now = Utc::now();
         for pr_status in [
+            PrStatus::Loading,
             PrStatus::NoPr,
             PrStatus::Draft,
             PrStatus::Open,
@@ -393,15 +430,42 @@ mod tests {
                 branch: "feat".into(),
                 prompt_slug: None,
                 pr_number: Some(7),
+                pr_url: None,
+                pr_title: None,
                 auto_continue_on_merge: false,
                 status: WorktreeStatus::Idle,
                 pr_status,
+                unresolved_comments: None,
                 last_summary: None,
                 created_at: now,
                 updated_at: now,
             };
             rt(&wv);
         }
+    }
+
+    #[test]
+    fn worktree_view_round_trip_with_pr_title() {
+        let now = Utc::now();
+        let wv = WorktreeView {
+            path: PathBuf::from("/repo/feature"),
+            project: "karazhan".into(),
+            name: "my-worktree".into(),
+            branch: "feature/x".into(),
+            prompt_slug: None,
+            pr_number: Some(99),
+            pr_url: Some("https://github.com/owner/repo/pull/99".into()),
+            pr_title: Some("Add copy PR URL + title command".into()),
+            auto_continue_on_merge: false,
+            status: WorktreeStatus::Idle,
+            pr_status: PrStatus::Open,
+            unresolved_comments: Some(1),
+            last_summary: None,
+            created_at: now,
+            updated_at: now,
+        };
+        rt(&wv);
+        assert_eq!(wv.pr_title, Some("Add copy PR URL + title command".into()));
     }
 
     // ── HandshakeReq / HandshakeResp ──────────────────────────────────────────
@@ -436,9 +500,12 @@ mod tests {
                 branch: "main".into(),
                 prompt_slug: None,
                 pr_number: None,
+                pr_url: None,
+                pr_title: None,
                 auto_continue_on_merge: false,
                 status: WorktreeStatus::Idle,
                 pr_status: PrStatus::NoPr,
+                unresolved_comments: None,
                 last_summary: None,
                 created_at: now,
                 updated_at: now,
@@ -454,8 +521,8 @@ mod tests {
     // ── Protocol version + frozen wire format ─────────────────────────────────
 
     #[test]
-    fn protocol_version_is_nine() {
-        assert_eq!(PROTOCOL_VERSION, 9);
+    fn protocol_version_is_thirteen() {
+        assert_eq!(PROTOCOL_VERSION, 13);
     }
 
     #[test]
@@ -806,9 +873,12 @@ mod tests {
             branch: "feat/y".into(),
             prompt_slug: Some("tidy".into()),
             pr_number: Some(3),
+            pr_url: Some("https://github.com/owner/repo/pull/3".into()),
+            pr_title: Some("My PR title".into()),
             auto_continue_on_merge: false,
             status: WorktreeStatus::CIFailing,
             pr_status: PrStatus::Merged,
+            unresolved_comments: Some(4),
             created_at: now,
             updated_at: now,
         };
@@ -819,6 +889,11 @@ mod tests {
         assert_eq!(view.branch, wt.branch);
         assert_eq!(view.status, WorktreeStatus::CIFailing);
         assert_eq!(view.pr_status, PrStatus::Merged);
+        assert_eq!(view.unresolved_comments, Some(4));
+        assert_eq!(
+            view.pr_url,
+            Some("https://github.com/owner/repo/pull/3".into())
+        );
         assert_eq!(view.last_summary, Some("summary here".into()));
         assert_eq!(view.created_at, now);
         assert_eq!(view.updated_at, now);

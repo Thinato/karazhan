@@ -88,9 +88,12 @@ impl WorktreeManager {
             branch: branch.to_string(),
             prompt_slug,
             pr_number: None,
+            pr_url: None,
+            pr_title: None,
             auto_continue_on_merge: false,
             status: super::model::WorktreeStatus::Idle,
-            pr_status: super::model::PrStatus::NoPr,
+            pr_status: super::model::PrStatus::Loading,
+            unresolved_comments: None,
             created_at: now,
             updated_at: now,
         };
@@ -146,9 +149,12 @@ impl WorktreeManager {
             branch: "HEAD".to_string(),
             prompt_slug: None,
             pr_number: None,
+            pr_url: None,
+            pr_title: None,
             auto_continue_on_merge: false,
             status: super::model::WorktreeStatus::Idle,
-            pr_status: super::model::PrStatus::NoPr,
+            pr_status: super::model::PrStatus::Loading,
+            unresolved_comments: None,
             created_at: now,
             updated_at: now,
         };
@@ -775,5 +781,56 @@ branch refs/heads/work
         let wts = parse_porcelain(input);
         assert_eq!(wts.len(), 1);
         assert_eq!(wts[0].branch, "work");
+    }
+
+    // -----------------------------------------------------------------------
+    // Loading pr_status for fresh worktrees
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn create_worktree_has_loading_pr_status() {
+        let (_dir, root) = make_temp_repo();
+        let wt_dir = tempfile::tempdir().expect("wt tempdir");
+        let wt_path = wt_dir.path().to_path_buf();
+
+        let mgr = WorktreeManager::new(&root);
+        let wt = mgr
+            .create(None, "loading-branch", &wt_path)
+            .expect("create");
+
+        assert_eq!(
+            wt.pr_status,
+            super::super::model::PrStatus::Loading,
+            "fresh worktree from create() must start as Loading"
+        );
+    }
+
+    #[test]
+    fn create_detached_has_loading_pr_status() {
+        let (_dir, root) = make_temp_repo();
+        let base = tempfile::tempdir().expect("base tempdir");
+        let wt_path = base.path().join("detached-loading");
+
+        let mgr = WorktreeManager::new(&root);
+        let wt = mgr.create_detached(&wt_path).expect("create_detached");
+
+        assert_eq!(
+            wt.pr_status,
+            super::super::model::PrStatus::Loading,
+            "fresh worktree from create_detached() must start as Loading"
+        );
+    }
+
+    #[test]
+    fn from_git_has_loading_pr_status() {
+        let wt = super::super::model::Worktree::from_git(
+            std::path::PathBuf::from("/tmp/wt"),
+            "feat".to_string(),
+        );
+        assert_eq!(
+            wt.pr_status,
+            super::super::model::PrStatus::Loading,
+            "Worktree::from_git() must start as Loading"
+        );
     }
 }

@@ -43,7 +43,7 @@ use crate::github::commands::{build_address_pr_comments_prompt, build_check_ci_p
 use crate::github::pr::pr_for_current_branch;
 use crate::github::{GhRunner, RealGh};
 use crate::ipc::{self, BuiltinKind, ClientMsg, HandshakeReq, HandshakeResp, SupervisorMsg};
-use crate::project_config::ProjectConfig;
+use crate::project_config::{ProjectConfig, WorktreeSettings};
 use crate::projects;
 use crate::watcher::{spawn_watcher, WatchItem, WatcherConfig};
 use crate::worktree::model::PrStatus;
@@ -253,8 +253,9 @@ impl Shared {
         });
     }
 
-    /// Update a worktree's `pr_status` (+ optional `pr_number`) in the registry
-    /// and the OWNING project's `state.toml`, then broadcast a fresh Snapshot.
+    /// Update a worktree's `pr_status` (+ optional `pr_number` + optional `pr_url`)
+    /// in the registry and the OWNING project's `state.toml`, then broadcast a
+    /// fresh Snapshot.
     ///
     /// Polling is NOT user/agent activity, so `updated_at` is deliberately left
     /// untouched.  Returns the PREVIOUS `pr_status` so the caller can detect the
@@ -264,7 +265,16 @@ impl Shared {
         path: &Path,
         pr_status: PrStatus,
         pr_number: Option<u64>,
+        pr_url: Option<String>,
+        pr_title: Option<String>,
+        unresolved: Option<u64>,
     ) -> Option<PrStatus> {
+        // No meaningful unresolved-comment count when there is no open PR.
+        let unresolved = match pr_status {
+            PrStatus::NoPr | PrStatus::Merged | PrStatus::Closed => None,
+            _ => unresolved,
+        };
+
         let prev = {
             let mut reg = self.registry.lock().await;
             if let Some(view) = reg.worktrees.get_mut(path) {
@@ -273,6 +283,12 @@ impl Shared {
                 if let Some(n) = pr_number {
                     view.pr_number = Some(n);
                 }
+                // Always update pr_url (clears it when NoPr passes None).
+                view.pr_url = pr_url.clone();
+                // Always update pr_title (clears it when NoPr passes None).
+                view.pr_title = pr_title.clone();
+                // Always update the unresolved count (cleared for non-open PRs above).
+                view.unresolved_comments = unresolved;
                 Some(prev)
             } else {
                 None
@@ -286,6 +302,9 @@ impl Shared {
                     if let Some(n) = pr_number {
                         st.set_pr_number_no_touch(path, Some(n));
                     }
+                    st.set_pr_url_no_touch(path, pr_url);
+                    st.set_pr_title_no_touch(path, pr_title);
+                    st.set_unresolved_no_touch(path, unresolved);
                     if let Err(e) = state::save(&root, &st) {
                         tracing::warn!("daemon: failed to persist pr_status: {e}");
                     }
@@ -310,16 +329,57 @@ impl Shared {
 
     /// Rebuild the shared watch-set from the registry: EVERY worktree across
     /// ALL projects (PR discovery is by branch now, so no pr_number filter).
+    ///
+    /// The GitHub `(owner, repo)` coordinates are computed ONCE per worktree here
+    /// (via `git config --get remote.origin.url` against the owning project root)
+    /// and stored on each [`WatchItem`], so the watcher never shells `git` on the
+    /// hot per-tick path.  Results are cached per project root within this rebuild
+    /// so each project's remote is parsed at most once.
     async fn rebuild_watch_set(&self) {
-        let items: Vec<WatchItem> = {
+        // Snapshot (path, owning-project-name) pairs without holding locks across
+        // the blocking git calls below.
+        let entries: Vec<(PathBuf, Option<String>)> = {
             let reg = self.registry.lock().await;
             reg.worktrees
                 .values()
-                .map(|v| WatchItem {
-                    worktree_path: v.path.clone(),
-                })
+                .map(|v| (v.path.clone(), reg.project_of.get(&v.path).cloned()))
                 .collect()
         };
+        // name -> root for resolving the owning project's repo root.
+        let roots: HashMap<String, PathBuf> = {
+            let projects = self.projects.lock().await;
+            projects
+                .iter()
+                .map(|p| (p.name.clone(), p.root.clone()))
+                .collect()
+        };
+
+        // Cache (owner, repo) per project root so we parse each remote once.
+        let mut owner_repo_cache: HashMap<PathBuf, Option<(String, String)>> = HashMap::new();
+        let mut items: Vec<WatchItem> = Vec::with_capacity(entries.len());
+        for (path, project_name) in entries {
+            // Prefer the owning project's root; fall back to the worktree path
+            // itself (a linked worktree shares the repo remote, so either works).
+            let root = project_name
+                .as_ref()
+                .and_then(|n| roots.get(n).cloned())
+                .unwrap_or_else(|| path.clone());
+
+            let owner_repo = owner_repo_cache
+                .entry(root.clone())
+                .or_insert_with(|| projects::git_owner_repo(&root))
+                .clone();
+            let (owner, repo) = match owner_repo {
+                Some((o, r)) => (Some(o), Some(r)),
+                None => (None, None),
+            };
+            items.push(WatchItem {
+                worktree_path: path,
+                owner,
+                repo,
+            });
+        }
+
         let mut guard = self.watch_set.lock().await;
         *guard = items;
     }
@@ -654,15 +714,26 @@ async fn handle_watch_event(shared: &Arc<Shared>, event: AppEvent) {
             worktree_path,
             pr_status,
             pr_number,
+            pr_url,
+            pr_title,
+            unresolved_comments,
         } => {
             tracing::info!(
                 worktree = %worktree_path.display(),
                 ?pr_status,
                 ?pr_number,
+                ?unresolved_comments,
                 "daemon: PR status changed"
             );
             let prev = shared
-                .set_pr_status(&worktree_path, pr_status, pr_number)
+                .set_pr_status(
+                    &worktree_path,
+                    pr_status,
+                    pr_number,
+                    pr_url,
+                    pr_title,
+                    unresolved_comments,
+                )
                 .await;
 
             // Auto-continue ONLY on the transition edge into Merged (not every
@@ -1085,19 +1156,26 @@ async fn new_worktree(
     prompt_slug: Option<String>,
     prompt_body: Option<String>,
 ) {
-    // Resolve the target project's base dir + manager up-front (clone what we
-    // need so we don't hold the projects lock across git/state I/O).
-    let resolved: Option<(PathBuf, PathBuf)> = {
+    // Resolve the target project's base dir + worktree settings up-front (clone
+    // what we need so we don't hold the projects lock across git/state I/O).
+    let resolved: Option<(PathBuf, PathBuf, WorktreeSettings)> = {
         let projects = shared.projects.lock().await;
-        projects
-            .iter()
-            .find(|p| p.name == project)
-            .map(|p| (p.root.clone(), p.project_config.worktrees_base(&p.root)))
+        projects.iter().find(|p| p.name == project).map(|p| {
+            (
+                p.root.clone(),
+                p.project_config.worktrees_base(&p.root),
+                p.project_config.worktree.clone(),
+            )
+        })
     };
-    let Some((root, base)) = resolved else {
+    let Some((root, base, project_worktree)) = resolved else {
         shared.error(None, format!("unknown project: {project}"));
         return;
     };
+
+    // Resolve the effective setup command + timeout (project over global over
+    // built-in default).
+    let (setup_command, setup_timeout) = resolve_setup(&project_worktree, &shared.config.worktree);
 
     // Build `<base>/<owner>/<project>/<uuid>` — consistent whether the base
     // comes from the XDG default or an explicit `worktrees_dir` override.
@@ -1146,12 +1224,53 @@ async fn new_worktree(
     shared.rebuild_watch_set().await;
     shared.broadcast_snapshot(snapshot).await;
 
-    // Optionally run the prompt body on the freshly-created worktree.
-    if let Some(body) = prompt_body {
-        if !body.trim().is_empty() {
-            run_prompt(Arc::clone(shared), canonical, body).await;
+    // Setup-then-prompt sequence, in a spawned task so the daemon isn't blocked.
+    //
+    // 1. If a setup command is configured, run it non-interactively to
+    //    completion or until the timeout (status → Running "running setup: …").
+    //    On failure/timeout: surface an error but STILL proceed.
+    // 2. Then, if a prompt was supplied, drive the agent on it; otherwise set
+    //    the worktree back to Idle.
+    let prompt_body = prompt_body.filter(|b| !b.trim().is_empty());
+    let task_shared = Arc::clone(shared);
+    tokio::spawn(async move {
+        if let Some(command) = setup_command {
+            task_shared
+                .set_status(
+                    &canonical,
+                    WorktreeStatus::Running,
+                    Some(format!("running setup: {}", truncate_command(&command))),
+                )
+                .await;
+            tracing::info!(
+                worktree = %canonical.display(),
+                "daemon: running worktree setup ({}s timeout)",
+                setup_timeout.as_secs()
+            );
+            match run_setup(&command, &canonical, setup_timeout).await {
+                Ok(()) => {
+                    tracing::info!(
+                        worktree = %canonical.display(),
+                        "daemon: worktree setup succeeded"
+                    );
+                }
+                Err(e) => {
+                    // Log + surface, but continue to the prompt regardless.
+                    task_shared.error(Some(canonical.clone()), format!("setup failed: {e}"));
+                }
+            }
         }
-    }
+
+        match prompt_body {
+            Some(body) => run_prompt(task_shared, canonical, body).await,
+            None => {
+                // No prompt → leave the worktree Idle once setup is done.
+                task_shared
+                    .set_status(&canonical, WorktreeStatus::Idle, None)
+                    .await;
+            }
+        }
+    });
 }
 
 /// `AddProject` — validate + register the git repo at `path`, build a
@@ -1266,6 +1385,193 @@ async fn remove_worktree(shared: &Arc<Shared>, path: &Path, _force: bool) {
     let snapshot = shared.rebuild_registry().await;
     shared.rebuild_watch_set().await;
     shared.broadcast_snapshot(snapshot).await;
+}
+
+// ---------------------------------------------------------------------------
+// Worktree setup: precedence resolver + non-interactive timed runner
+// ---------------------------------------------------------------------------
+
+/// Built-in default timeout (seconds) for the worktree setup command.
+const DEFAULT_SETUP_TIMEOUT_SECS: u64 = 300;
+
+/// Maximum number of stderr lines to retain from a setup command for error
+/// reporting (mirrors the agent-session bound).
+const SETUP_STDERR_MAX_LINES: usize = 100;
+/// Maximum total bytes of setup stderr to retain (older lines dropped first).
+const SETUP_STDERR_MAX_BYTES: usize = 8 * 1024;
+
+/// Resolve the effective worktree-setup config for one project, applying
+/// project-over-global-over-default precedence:
+///
+/// - `setup_command`  = `project.setup_command.or(global.setup_command)`
+/// - `setup_timeout`  = `project.setup_timeout_seconds.or(global.setup_timeout_seconds)
+///   .unwrap_or(300)` seconds.
+fn resolve_setup(
+    project: &WorktreeSettings,
+    global: &WorktreeSettings,
+) -> (Option<String>, std::time::Duration) {
+    let command = project
+        .setup_command
+        .clone()
+        .or_else(|| global.setup_command.clone());
+    let timeout_secs = project
+        .setup_timeout_seconds
+        .or(global.setup_timeout_seconds)
+        .unwrap_or(DEFAULT_SETUP_TIMEOUT_SECS);
+    (command, std::time::Duration::from_secs(timeout_secs))
+}
+
+/// Failure from [`run_setup`]: carries a human-readable message (a stderr tail
+/// for a non-zero exit, or a timeout notice).
+#[derive(Debug)]
+struct SetupError {
+    message: String,
+}
+
+impl std::fmt::Display for SetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Run a worktree setup command NON-INTERACTIVELY to completion or until
+/// `timeout`.
+///
+/// The command is launched as `sh -c "<command>"` with `cwd` as the working
+/// directory.  STDIN is closed (`/dev/null`) so an interactive/TUI command can
+/// never block waiting on input.  stdout + stderr are PIPED and drained
+/// concurrently (logged; a bounded stderr tail is retained, mirroring
+/// [`crate::agent::session`]).  `kill_on_drop(true)` plus an explicit kill on
+/// timeout guarantee no orphaned child survives.
+///
+/// stdout/stderr are NEVER inherited to the terminal.
+///
+/// - non-zero exit → `Err` carrying the captured stderr tail.
+/// - timeout       → child is killed; `Err("timed out after {secs}s")`.
+/// - success       → `Ok(())`.
+async fn run_setup(
+    command: &str,
+    cwd: &Path,
+    timeout: std::time::Duration,
+) -> std::result::Result<(), SetupError> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let mut child = match tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(SetupError {
+                message: format!("failed to spawn setup command: {e}"),
+            });
+        }
+    };
+
+    let cwd_owned = cwd.to_path_buf();
+
+    // Drain stdout concurrently (logged at debug; not retained).
+    let stdout_task = child.stdout.take().map(|stdout| {
+        let cwd = cwd_owned.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                tracing::debug!(worktree = %cwd.display(), "setup stdout: {line}");
+            }
+        })
+    });
+
+    // Drain stderr concurrently into a bounded tail.
+    let stderr_task = child.stderr.take().map(|stderr| {
+        let cwd = cwd_owned.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr).lines();
+            let mut lines: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+            let mut total_bytes: usize = 0;
+            while let Ok(Some(line)) = reader.next_line().await {
+                tracing::debug!(worktree = %cwd.display(), "setup stderr: {line}");
+                total_bytes += line.len() + 1;
+                lines.push_back(line);
+                while lines.len() > SETUP_STDERR_MAX_LINES || total_bytes > SETUP_STDERR_MAX_BYTES {
+                    if let Some(evicted) = lines.pop_front() {
+                        total_bytes = total_bytes.saturating_sub(evicted.len() + 1);
+                    } else {
+                        break;
+                    }
+                }
+            }
+            lines.into_iter().collect::<Vec<_>>().join("\n")
+        })
+    });
+
+    // Wait for exit, enforcing the timeout.
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Err(_elapsed) => {
+            // Timed out: kill the child (kill_on_drop also covers this) and fail.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            if let Some(t) = stdout_task {
+                t.abort();
+            }
+            if let Some(t) = stderr_task {
+                t.abort();
+            }
+            Err(SetupError {
+                message: format!("timed out after {}s", timeout.as_secs()),
+            })
+        }
+        Ok(wait_result) => {
+            if let Some(t) = stdout_task {
+                let _ = t.await;
+            }
+            let stderr_tail = if let Some(t) = stderr_task {
+                t.await.unwrap_or_default()
+            } else {
+                String::new()
+            };
+            match wait_result {
+                Ok(status) if status.success() => Ok(()),
+                Ok(status) => {
+                    let base = format!("setup command exited with status {status}");
+                    Err(SetupError {
+                        message: compose_setup_error(base, &stderr_tail),
+                    })
+                }
+                Err(e) => Err(SetupError {
+                    message: format!("failed to await setup command: {e}"),
+                }),
+            }
+        }
+    }
+}
+
+/// Compose a setup error from a base reason + optional stderr tail.
+fn compose_setup_error(base: String, stderr_tail: &str) -> String {
+    let tail = stderr_tail.trim();
+    if tail.is_empty() {
+        base
+    } else {
+        format!("{base}: {tail}")
+    }
+}
+
+/// Truncate a command for a status summary line (keeps the UI legible).
+fn truncate_command(command: &str) -> String {
+    const MAX: usize = 80;
+    let one_line = command.replace('\n', " ");
+    if one_line.chars().count() > MAX {
+        let t: String = one_line.chars().take(MAX).collect();
+        format!("{t}…")
+    } else {
+        one_line
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1522,9 +1828,12 @@ mod tests {
             branch: "feat".to_string(),
             prompt_slug: None,
             pr_number: pr,
+            pr_url: None,
+            pr_title: None,
             auto_continue_on_merge: auto_continue,
             status: WorktreeStatus::Idle,
             pr_status: crate::worktree::model::PrStatus::NoPr,
+            unresolved_comments: None,
             created_at: now,
             updated_at: now,
         };
@@ -1883,16 +2192,23 @@ mod tests {
                 worktree_path: path.clone(),
                 pr_status: PrStatus::ChecksPassing,
                 pr_number: Some(123),
+                pr_url: Some("https://github.com/owner/repo/pull/123".to_string()),
+                pr_title: None,
+                unresolved_comments: None,
             },
         )
         .await;
 
-        // Registry reflects the new pr_status + pr_number; agent status untouched.
+        // Registry reflects the new pr_status + pr_number + pr_url; agent status untouched.
         {
             let reg = shared.registry.lock().await;
             let v = reg.worktrees.get(&path).unwrap();
             assert_eq!(v.pr_status, PrStatus::ChecksPassing);
             assert_eq!(v.pr_number, Some(123));
+            assert_eq!(
+                v.pr_url,
+                Some("https://github.com/owner/repo/pull/123".to_string())
+            );
             assert_eq!(v.status, WorktreeStatus::Idle);
         }
         // Persisted to state.toml.
@@ -1900,6 +2216,180 @@ mod tests {
         let w = st.worktrees.iter().find(|w| w.path == path).unwrap();
         assert_eq!(w.pr_status, PrStatus::ChecksPassing);
         assert_eq!(w.pr_number, Some(123));
+        assert_eq!(
+            w.pr_url,
+            Some("https://github.com/owner/repo/pull/123".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn set_pr_status_stores_unresolved_and_clears_for_non_open() {
+        let (_dir, root) = make_temp_repo();
+        let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
+        let shared = make_shared(root.clone(), gh).await;
+
+        let path = PathBuf::from("/tmp/unresolved-wt");
+        seed_worktree(&shared, &path, false, None).await;
+
+        // Open PR with 3 unresolved comments → stored in registry + state.
+        shared
+            .set_pr_status(&path, PrStatus::Open, Some(7), None, None, Some(3))
+            .await;
+        {
+            let reg = shared.registry.lock().await;
+            assert_eq!(
+                reg.worktrees.get(&path).unwrap().unresolved_comments,
+                Some(3)
+            );
+        }
+        let st = state::load(&root).expect("load");
+        assert_eq!(
+            st.worktrees
+                .iter()
+                .find(|w| w.path == path)
+                .unwrap()
+                .unresolved_comments,
+            Some(3)
+        );
+
+        // Merged → unresolved is cleared to None even if a count is passed.
+        shared
+            .set_pr_status(&path, PrStatus::Merged, Some(7), None, None, Some(9))
+            .await;
+        {
+            let reg = shared.registry.lock().await;
+            assert_eq!(reg.worktrees.get(&path).unwrap().unresolved_comments, None);
+        }
+
+        // NoPr → also cleared.
+        shared
+            .set_pr_status(&path, PrStatus::Open, Some(7), None, None, Some(5))
+            .await;
+        shared
+            .set_pr_status(&path, PrStatus::NoPr, None, None, None, Some(5))
+            .await;
+        {
+            let reg = shared.registry.lock().await;
+            assert_eq!(reg.worktrees.get(&path).unwrap().unresolved_comments, None);
+        }
+        let st = state::load(&root).expect("load");
+        assert_eq!(
+            st.worktrees
+                .iter()
+                .find(|w| w.path == path)
+                .unwrap()
+                .unresolved_comments,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_nopr_clears_pr_url() {
+        let (_dir, root) = make_temp_repo();
+        let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
+        let shared = make_shared(root.clone(), gh).await;
+
+        let path = PathBuf::from("/tmp/nopr-clears-url-wt");
+        seed_worktree(&shared, &path, false, None).await;
+
+        // First: set a pr_url via a ChecksPassing event.
+        handle_watch_event(
+            &shared,
+            AppEvent::PrStatusChanged {
+                worktree_path: path.clone(),
+                pr_status: PrStatus::ChecksPassing,
+                pr_number: Some(7),
+                pr_url: Some("https://github.com/owner/repo/pull/7".to_string()),
+                pr_title: None,
+                unresolved_comments: None,
+            },
+        )
+        .await;
+        {
+            let reg = shared.registry.lock().await;
+            assert_eq!(
+                reg.worktrees.get(&path).unwrap().pr_url,
+                Some("https://github.com/owner/repo/pull/7".to_string())
+            );
+        }
+
+        // Now NoPr (no url) should clear pr_url.
+        handle_watch_event(
+            &shared,
+            AppEvent::PrStatusChanged {
+                worktree_path: path.clone(),
+                pr_status: PrStatus::NoPr,
+                pr_number: None,
+                pr_url: None,
+                pr_title: None,
+                unresolved_comments: None,
+            },
+        )
+        .await;
+        {
+            let reg = shared.registry.lock().await;
+            assert_eq!(reg.worktrees.get(&path).unwrap().pr_url, None);
+        }
+        let st = state::load(&root).expect("load");
+        let w = st.worktrees.iter().find(|w| w.path == path).unwrap();
+        assert_eq!(w.pr_url, None);
+    }
+
+    #[tokio::test]
+    async fn watcher_pr_title_stored_and_cleared_on_nopr() {
+        let (_dir, root) = make_temp_repo();
+        let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
+        let shared = make_shared(root.clone(), gh).await;
+
+        let path = PathBuf::from("/tmp/pr-title-wt");
+        seed_worktree(&shared, &path, false, None).await;
+
+        // Set pr_title via a PrStatusChanged event.
+        handle_watch_event(
+            &shared,
+            AppEvent::PrStatusChanged {
+                worktree_path: path.clone(),
+                pr_status: PrStatus::Open,
+                pr_number: Some(42),
+                pr_url: Some("https://github.com/owner/repo/pull/42".to_string()),
+                pr_title: Some("My shiny PR".to_string()),
+                unresolved_comments: Some(3),
+            },
+        )
+        .await;
+
+        // Registry reflects the title.
+        {
+            let reg = shared.registry.lock().await;
+            let v = reg.worktrees.get(&path).unwrap();
+            assert_eq!(v.pr_title, Some("My shiny PR".to_string()));
+        }
+        // Persisted to state.toml.
+        let st = state::load(&root).expect("load");
+        let w = st.worktrees.iter().find(|w| w.path == path).unwrap();
+        assert_eq!(w.pr_title, Some("My shiny PR".to_string()));
+
+        // NoPr clears the title.
+        handle_watch_event(
+            &shared,
+            AppEvent::PrStatusChanged {
+                worktree_path: path.clone(),
+                pr_status: PrStatus::NoPr,
+                pr_number: None,
+                pr_url: None,
+                pr_title: None,
+                unresolved_comments: None,
+            },
+        )
+        .await;
+
+        {
+            let reg = shared.registry.lock().await;
+            assert_eq!(reg.worktrees.get(&path).unwrap().pr_title, None);
+        }
+        let st = state::load(&root).expect("load after nopr");
+        let w = st.worktrees.iter().find(|w| w.path == path).unwrap();
+        assert_eq!(w.pr_title, None);
     }
 
     #[tokio::test]
@@ -1920,6 +2410,9 @@ mod tests {
                 worktree_path: path.clone(),
                 pr_status: PrStatus::Merged,
                 pr_number: Some(5),
+                pr_url: None,
+                pr_title: None,
+                unresolved_comments: None,
             },
         )
         .await;
@@ -1963,6 +2456,9 @@ mod tests {
                 worktree_path: path.clone(),
                 pr_status: PrStatus::Merged,
                 pr_number: Some(9),
+                pr_url: None,
+                pr_title: None,
+                unresolved_comments: None,
             },
         )
         .await;
@@ -1990,6 +2486,9 @@ mod tests {
                 worktree_path: path.clone(),
                 pr_status: PrStatus::Merged,
                 pr_number: Some(11),
+                pr_url: None,
+                pr_title: None,
+                unresolved_comments: None,
             },
         )
         .await;
@@ -2006,6 +2505,9 @@ mod tests {
                 worktree_path: path.clone(),
                 pr_status: PrStatus::Merged,
                 pr_number: Some(11),
+                pr_url: None,
+                pr_title: None,
+                unresolved_comments: None,
             },
         )
         .await;
@@ -2118,9 +2620,12 @@ mod tests {
             branch: "feat".to_string(),
             prompt_slug: None,
             pr_number: None,
+            pr_url: None,
+            pr_title: None,
             auto_continue_on_merge: false,
             status: WorktreeStatus::Idle,
             pr_status: crate::worktree::model::PrStatus::NoPr,
+            unresolved_comments: None,
             created_at: now,
             updated_at: now,
         };
@@ -2291,6 +2796,225 @@ mod tests {
 
         // The project count is unchanged (still just alpha).
         assert_eq!(shared.projects.lock().await.len(), 1);
+    }
+
+    // -- Worktree setup: precedence resolver ----------------------------------
+
+    #[test]
+    fn resolve_setup_project_wins_over_global() {
+        let project = WorktreeSettings {
+            setup_command: Some("project cmd".to_string()),
+            setup_timeout_seconds: Some(42),
+        };
+        let global = WorktreeSettings {
+            setup_command: Some("global cmd".to_string()),
+            setup_timeout_seconds: Some(99),
+        };
+        let (cmd, timeout) = resolve_setup(&project, &global);
+        assert_eq!(cmd.as_deref(), Some("project cmd"));
+        assert_eq!(timeout, Duration::from_secs(42));
+    }
+
+    #[test]
+    fn resolve_setup_global_is_fallback_when_project_unset() {
+        let project = WorktreeSettings::default();
+        let global = WorktreeSettings {
+            setup_command: Some("global cmd".to_string()),
+            setup_timeout_seconds: Some(150),
+        };
+        let (cmd, timeout) = resolve_setup(&project, &global);
+        assert_eq!(cmd.as_deref(), Some("global cmd"));
+        assert_eq!(timeout, Duration::from_secs(150));
+    }
+
+    #[test]
+    fn resolve_setup_neither_set_yields_none_and_default_timeout() {
+        let project = WorktreeSettings::default();
+        let global = WorktreeSettings::default();
+        let (cmd, timeout) = resolve_setup(&project, &global);
+        assert!(cmd.is_none());
+        assert_eq!(timeout, Duration::from_secs(DEFAULT_SETUP_TIMEOUT_SECS));
+        assert_eq!(timeout, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn resolve_setup_mixed_command_global_timeout_project() {
+        // Command only on global, timeout only on project.
+        let project = WorktreeSettings {
+            setup_command: None,
+            setup_timeout_seconds: Some(10),
+        };
+        let global = WorktreeSettings {
+            setup_command: Some("global cmd".to_string()),
+            setup_timeout_seconds: None,
+        };
+        let (cmd, timeout) = resolve_setup(&project, &global);
+        assert_eq!(cmd.as_deref(), Some("global cmd"));
+        assert_eq!(timeout, Duration::from_secs(10));
+    }
+
+    // -- Worktree setup: non-interactive timed runner -------------------------
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn run_setup_success_is_ok() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let r = run_setup("exit 0", dir.path(), Duration::from_secs(5)).await;
+        assert!(r.is_ok(), "expected Ok, got {r:?}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn run_setup_nonzero_exit_carries_stderr() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let r = run_setup("echo boom 1>&2; exit 1", dir.path(), Duration::from_secs(5)).await;
+        match r {
+            Err(e) => assert!(
+                e.message.contains("boom"),
+                "expected 'boom' in error, got: {}",
+                e.message
+            ),
+            Ok(()) => panic!("expected Err for non-zero exit"),
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn run_setup_times_out_promptly_and_kills() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let start = std::time::Instant::now();
+        // `sleep 2` with a 150ms timeout must fail quickly (well under 2s).
+        let r = run_setup("sleep 2", dir.path(), Duration::from_millis(150)).await;
+        let elapsed = start.elapsed();
+        match r {
+            Err(e) => assert!(
+                e.message.contains("timed out"),
+                "expected timeout error, got: {}",
+                e.message
+            ),
+            Ok(()) => panic!("expected timeout Err"),
+        }
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "run_setup should return promptly on timeout, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn run_setup_runs_in_cwd() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("setup-ran");
+        // Write a marker file in the cwd; succeeds only if cwd is correct.
+        let r = run_setup("touch setup-ran", dir.path(), Duration::from_secs(5)).await;
+        assert!(r.is_ok(), "expected Ok, got {r:?}");
+        assert!(
+            marker.exists(),
+            "setup command should run in the worktree cwd"
+        );
+    }
+
+    // -- NewWorktree runs setup before the (mock) agent ----------------------
+
+    #[tokio::test]
+    async fn new_worktree_runs_setup_before_prompt() {
+        let (_dir, root) = make_temp_repo();
+        let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
+
+        // Configure a setup command on the project that drops a marker file.
+        // The marker path is derived per-worktree below; here we use a command
+        // that records the running-setup summary ordering via the broadcast.
+        let mut runtime = make_runtime("proj", root.clone());
+        runtime.project_config.worktree = WorktreeSettings {
+            setup_command: Some("true".to_string()),
+            setup_timeout_seconds: Some(5),
+        };
+        let shared = make_shared_with(vec![runtime], gh).await;
+
+        let mut sub = shared.events.subscribe();
+
+        handle_client_msg(
+            &shared,
+            ClientMsg::NewWorktree {
+                project: "proj".to_string(),
+                prompt_slug: Some("refactor".to_string()),
+                prompt_body: Some("do the refactor".to_string()),
+            },
+        )
+        .await;
+
+        // The first StatusChanged must be the "running setup: …" Running update,
+        // BEFORE the agent's own Running update (setup-first, agent-second).
+        let mut saw_setup_summary = false;
+        let mut saw_running = false;
+        for _ in 0..10 {
+            match tokio::time::timeout(Duration::from_secs(3), sub.recv()).await {
+                Ok(Ok(SupervisorMsg::StatusChanged {
+                    status: WorktreeStatus::Running,
+                    summary,
+                    ..
+                })) => {
+                    if let Some(s) = summary {
+                        if s.starts_with("running setup:") {
+                            saw_setup_summary = true;
+                            continue;
+                        }
+                    }
+                    // A Running with no setup summary = the agent run.
+                    saw_running = true;
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(
+            saw_setup_summary,
+            "expected a 'running setup:' Running status first"
+        );
+        assert!(saw_running, "expected the agent Running status after setup");
+    }
+
+    #[tokio::test]
+    async fn new_worktree_setup_no_prompt_ends_idle() {
+        let (_dir, root) = make_temp_repo();
+        let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
+
+        let mut runtime = make_runtime("proj", root.clone());
+        runtime.project_config.worktree = WorktreeSettings {
+            setup_command: Some("true".to_string()),
+            setup_timeout_seconds: Some(5),
+        };
+        let shared = make_shared_with(vec![runtime], gh).await;
+
+        let mut sub = shared.events.subscribe();
+
+        handle_client_msg(
+            &shared,
+            ClientMsg::NewWorktree {
+                project: "proj".to_string(),
+                prompt_slug: None,
+                prompt_body: None,
+            },
+        )
+        .await;
+
+        // After setup (no prompt) the worktree must end Idle.
+        let mut saw_idle = false;
+        for _ in 0..10 {
+            match tokio::time::timeout(Duration::from_secs(3), sub.recv()).await {
+                Ok(Ok(SupervisorMsg::StatusChanged {
+                    status: WorktreeStatus::Idle,
+                    ..
+                })) => {
+                    saw_idle = true;
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(saw_idle, "expected Idle status after setup with no prompt");
     }
 
     // -- Shared::error helper -------------------------------------------------

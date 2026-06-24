@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 use tokio::time;
 
 use crate::app::AppEvent;
-use crate::github::pr_status::fetch_pr_status;
+use crate::github::pr_status::{fetch_pr_status, fetch_unresolved_count};
 use crate::github::GhRunner;
 use crate::worktree::model::PrStatus;
 
@@ -52,39 +52,50 @@ impl Default for WatcherConfig {
     }
 }
 
-/// A single entry in the shared watch-set: a worktree path.
+/// A single entry in the shared watch-set: a worktree path plus the GitHub
+/// coordinates (owner/repo) of its repository.
 ///
-/// PR discovery is by branch now (gh resolves the PR from the worktree's
-/// current branch), so no PR number is stored here.
+/// PR discovery is by branch (gh resolves the PR from the worktree's current
+/// branch), so no PR number is stored here.  `owner`/`repo` are computed ONCE
+/// by the daemon when building the watch-set (no per-tick `git` call) and are
+/// `None` when the repo has no parseable GitHub remote — in which case the
+/// unresolved-comment GraphQL call is skipped.
 #[derive(Debug, Clone)]
 pub struct WatchItem {
     pub worktree_path: PathBuf,
+    pub owner: Option<String>,
+    pub repo: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
 // Change-detection (pure, easily unit-tested)
 // ---------------------------------------------------------------------------
 
-/// An event produced when a worktree's observed [`PrStatus`] changes.
+/// An event produced when a worktree's observed [`PrStatus`] OR its unresolved
+/// review-comment count changes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WatchEvent {
     PrStatusChanged {
         worktree_path: PathBuf,
         pr_status: PrStatus,
         pr_number: Option<u64>,
+        pr_url: Option<String>,
+        pr_title: Option<String>,
+        unresolved_comments: Option<u64>,
     },
 }
 
 /// Pure change-detection: should we emit an event given the previous observed
-/// status (`None` on the first tick) and the current one?
+/// `(status, unresolved)` (`None` on the first tick) and the current pair?
 ///
-/// We emit on any real change.  The first observation emits only when it is not
-/// `NoPr` (a fresh worktree with no PR starts at the registry default `NoPr`, so
-/// re-announcing `NoPr` is noise).  Extracted so tests can cover transitions
-/// without any I/O.
-pub fn diff_pr(prev: Option<PrStatus>, curr: PrStatus) -> bool {
+/// We emit on any real change — EITHER the PR status OR the unresolved count
+/// changing (so a brand-new comment alone repaints).  The first observation
+/// (`prev == None`) always emits — the registry default is `Loading` (not
+/// `NoPr`), so even a `NoPr` result from the first poll must replace the
+/// `Loading` placeholder.  Extracted so tests can cover transitions without I/O.
+pub fn diff_pr(prev: Option<(PrStatus, Option<u64>)>, curr: (PrStatus, Option<u64>)) -> bool {
     match prev {
-        None => curr != PrStatus::NoPr,
+        None => true,
         Some(p) => p != curr,
     }
 }
@@ -131,8 +142,9 @@ pub fn spawn_watcher(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // Per-path last-observed PR status; initialised lazily on first tick.
-        let mut known: HashMap<PathBuf, PrStatus> = HashMap::new();
+        // Per-path last-observed (PR status, unresolved-count); initialised
+        // lazily on first tick.
+        let mut known: HashMap<PathBuf, (PrStatus, Option<u64>)> = HashMap::new();
 
         let mut interval = time::interval(config.interval);
         // Don't fire the first tick immediately — wait one full interval so the
@@ -163,24 +175,66 @@ pub fn spawn_watcher(
                             }
                         };
 
-                        let (curr, pr_number) = match info {
-                            Some(pr) => (pr.status, Some(pr.number)),
-                            None => (PrStatus::NoPr, None),
+                        let (curr, pr_number, pr_url, pr_title) = match info {
+                            Some(pr) => (pr.status, Some(pr.number), pr.url, pr.title),
+                            None => (PrStatus::NoPr, None, None, None),
                         };
 
+                        // Carry forward the previously-known unresolved count so a
+                        // transient GraphQL failure doesn't flap the badge.
                         let prev = known.get(&item.worktree_path).copied();
-                        if diff_pr(prev, curr) {
+                        let prev_unresolved = prev.and_then(|(_, u)| u);
+
+                        // SECOND gh call (GraphQL) ONLY for OPEN-ish PRs (Some PR,
+                        // not Merged/Closed) that have parseable owner/repo.
+                        let is_open_ish = pr_number.is_some()
+                            && !matches!(curr, PrStatus::Merged | PrStatus::Closed);
+                        let unresolved = match (
+                            is_open_ish,
+                            item.owner.as_deref(),
+                            item.repo.as_deref(),
+                            pr_number,
+                        ) {
+                            (true, Some(owner), Some(repo), Some(number)) => {
+                                match fetch_unresolved_count(
+                                    runner.as_ref(),
+                                    &item.worktree_path,
+                                    owner,
+                                    repo,
+                                    number,
+                                )
+                                .await
+                                {
+                                    Ok(n) => Some(n),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            worktree = %item.worktree_path.display(),
+                                            "watcher: fetch_unresolved_count error (carrying forward): {e}"
+                                        );
+                                        prev_unresolved
+                                    }
+                                }
+                            }
+                            // NoPr / Merged / Closed / missing owner-repo → no count.
+                            _ => None,
+                        };
+
+                        let curr_pair = (curr, unresolved);
+                        if diff_pr(prev, curr_pair) {
                             emit_event(
                                 &event_tx,
                                 WatchEvent::PrStatusChanged {
                                     worktree_path: item.worktree_path.clone(),
                                     pr_status: curr,
                                     pr_number,
+                                    pr_url,
+                                    pr_title,
+                                    unresolved_comments: unresolved,
                                 },
                             )
                             .await;
                         }
-                        known.insert(item.worktree_path.clone(), curr);
+                        known.insert(item.worktree_path.clone(), curr_pair);
                     }
                 }
 
@@ -205,10 +259,16 @@ async fn emit_event(tx: &tokio::sync::mpsc::Sender<AppEvent>, event: WatchEvent)
             worktree_path,
             pr_status,
             pr_number,
+            pr_url,
+            pr_title,
+            unresolved_comments,
         } => AppEvent::PrStatusChanged {
             worktree_path,
             pr_status,
             pr_number,
+            pr_url,
+            pr_title,
+            unresolved_comments,
         },
     };
     if tx.send(app_event).await.is_err() {
@@ -230,35 +290,98 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn diff_first_observation_nopr_is_noop() {
-        // Fresh worktree, still NoPr → no event (it already defaults to NoPr).
-        assert!(!diff_pr(None, PrStatus::NoPr));
+    fn diff_first_observation_nopr_emits() {
+        // First observation always emits: the registry default is now Loading (not
+        // NoPr), so even NoPr must be sent to replace the Loading placeholder.
+        assert!(diff_pr(None, (PrStatus::NoPr, None)));
     }
 
     #[test]
     fn diff_first_observation_open_emits() {
-        assert!(diff_pr(None, PrStatus::Open));
+        assert!(diff_pr(None, (PrStatus::Open, None)));
+    }
+
+    #[test]
+    fn diff_first_observation_loading_emits() {
+        // Loading differs from every real status; prev=None always emits.
+        assert!(diff_pr(None, (PrStatus::Loading, None)));
+    }
+
+    #[test]
+    fn diff_loading_to_nopr_emits() {
+        // The daemon starts worktrees at Loading; first poll returning NoPr must emit.
+        assert!(diff_pr(
+            Some((PrStatus::Loading, None)),
+            (PrStatus::NoPr, None)
+        ));
+    }
+
+    #[test]
+    fn diff_loading_to_open_emits() {
+        assert!(diff_pr(
+            Some((PrStatus::Loading, None)),
+            (PrStatus::Open, None)
+        ));
+    }
+
+    #[test]
+    fn diff_loading_to_merged_emits() {
+        assert!(diff_pr(
+            Some((PrStatus::Loading, None)),
+            (PrStatus::Merged, None)
+        ));
     }
 
     #[test]
     fn diff_nopr_to_open_emits() {
-        assert!(diff_pr(Some(PrStatus::NoPr), PrStatus::Open));
+        assert!(diff_pr(
+            Some((PrStatus::NoPr, None)),
+            (PrStatus::Open, None)
+        ));
     }
 
     #[test]
     fn diff_open_to_open_is_noop() {
-        assert!(!diff_pr(Some(PrStatus::Open), PrStatus::Open));
+        assert!(!diff_pr(
+            Some((PrStatus::Open, None)),
+            (PrStatus::Open, None)
+        ));
     }
 
     #[test]
     fn diff_open_to_merged_emits() {
-        assert!(diff_pr(Some(PrStatus::Open), PrStatus::Merged));
+        assert!(diff_pr(
+            Some((PrStatus::Open, None)),
+            (PrStatus::Merged, None)
+        ));
     }
 
     #[test]
     fn diff_merged_to_merged_is_noop() {
         // Once merged, staying merged must not re-emit (gate auto-continue edge).
-        assert!(!diff_pr(Some(PrStatus::Merged), PrStatus::Merged));
+        assert!(!diff_pr(
+            Some((PrStatus::Merged, None)),
+            (PrStatus::Merged, None)
+        ));
+    }
+
+    #[test]
+    fn diff_unresolved_count_change_emits_even_when_status_unchanged() {
+        // Same PR status (Open) but unresolved count changed → must emit.
+        assert!(diff_pr(
+            Some((PrStatus::Open, Some(0))),
+            (PrStatus::Open, Some(2))
+        ));
+        // Identical status + identical count → no-op.
+        assert!(!diff_pr(
+            Some((PrStatus::Open, Some(2))),
+            (PrStatus::Open, Some(2))
+        ));
+        // None → Some(n) at same status emits (first comment appears).
+        assert!(diff_pr(
+            Some((PrStatus::Open, None)),
+            (PrStatus::Open, Some(1))
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -290,6 +413,8 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(16);
         let watch_set = Arc::new(Mutex::new(vec![WatchItem {
             worktree_path: PathBuf::from("/tmp/wt-test"),
+            owner: None,
+            repo: None,
         }]));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -312,10 +437,234 @@ mod tests {
             AppEvent::PrStatusChanged {
                 pr_status,
                 pr_number,
+                pr_url,
                 ..
             } => {
                 assert_eq!(pr_status, PrStatus::Merged);
                 assert_eq!(pr_number, Some(99));
+                assert_eq!(pr_url, None);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    }
+
+    /// Verify that a worktree starting at Loading transitions to NoPr on the
+    /// first poll (MockGh returns "no pull requests found" → NoPr).
+    #[tokio::test]
+    async fn watcher_loading_to_nopr_on_first_poll() {
+        use crate::github::mock::MockGh;
+        use tokio::sync::mpsc;
+
+        // MockGh returns "no PR" error — simulates a worktree with no open PR.
+        let mock = Arc::new(MockGh::new(vec![(
+            "pr view --json",
+            Err(anyhow::anyhow!(
+                "no pull requests found for branch \"feat\""
+            )),
+        )]));
+
+        let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(16);
+        let watch_set = Arc::new(Mutex::new(vec![WatchItem {
+            worktree_path: PathBuf::from("/tmp/wt-loading-nopr"),
+            owner: None,
+            repo: None,
+        }]));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let handle = spawn_watcher(
+            mock,
+            event_tx,
+            watch_set,
+            WatcherConfig {
+                interval: Duration::from_millis(10),
+            },
+            shutdown_rx,
+        );
+
+        // First tick must emit PrStatusChanged{NoPr} to replace the Loading state.
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timeout: watcher did not emit Loading→NoPr transition")
+            .expect("channel closed");
+
+        match event {
+            AppEvent::PrStatusChanged {
+                pr_status,
+                pr_number,
+                ..
+            } => {
+                assert_eq!(pr_status, PrStatus::NoPr, "Loading→NoPr must emit NoPr");
+                assert_eq!(pr_number, None);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    }
+
+    /// Verify that a worktree starting at Loading transitions to Merged on the
+    /// first poll (MockGh returns a merged PR).
+    #[tokio::test]
+    async fn watcher_loading_to_merged_on_first_poll() {
+        use crate::github::mock::MockGh;
+        use tokio::sync::mpsc;
+
+        let pr_json = r#"{"number":7,"state":"MERGED","isDraft":false,"mergedAt":"2024-01-15T10:00:00Z","statusCheckRollup":[]}"#;
+        let mock = Arc::new(MockGh::new(vec![(
+            "pr view --json",
+            Ok(pr_json.to_string()),
+        )]));
+
+        let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(16);
+        let watch_set = Arc::new(Mutex::new(vec![WatchItem {
+            worktree_path: PathBuf::from("/tmp/wt-loading-merged"),
+            owner: None,
+            repo: None,
+        }]));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let handle = spawn_watcher(
+            mock,
+            event_tx,
+            watch_set,
+            WatcherConfig {
+                interval: Duration::from_millis(10),
+            },
+            shutdown_rx,
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timeout: watcher did not emit Loading→Merged transition")
+            .expect("channel closed");
+
+        match event {
+            AppEvent::PrStatusChanged {
+                pr_status,
+                pr_number,
+                ..
+            } => {
+                assert_eq!(
+                    pr_status,
+                    PrStatus::Merged,
+                    "Loading→Merged must emit Merged"
+                );
+                assert_eq!(pr_number, Some(7));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    }
+
+    /// An OPEN PR with owner/repo set triggers the SECOND (GraphQL) call and the
+    /// emitted event carries the unresolved count.
+    #[tokio::test]
+    async fn watcher_open_pr_triggers_unresolved_count() {
+        use crate::github::mock::MockGh;
+        use tokio::sync::mpsc;
+
+        let pr_json = r#"{"number":42,"state":"OPEN","isDraft":false,"mergedAt":null,"statusCheckRollup":[]}"#;
+        let graphql_json = r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":3,"nodes":[{"isResolved":false},{"isResolved":false},{"isResolved":true}]}}}}}"#;
+        let mock = Arc::new(MockGh::new(vec![
+            ("api graphql", Ok(graphql_json.to_string())),
+            ("pr view --json", Ok(pr_json.to_string())),
+        ]));
+
+        let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(16);
+        let watch_set = Arc::new(Mutex::new(vec![WatchItem {
+            worktree_path: PathBuf::from("/tmp/wt-open-unresolved"),
+            owner: Some("Owner".to_string()),
+            repo: Some("Repo".to_string()),
+        }]));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let handle = spawn_watcher(
+            mock,
+            event_tx,
+            watch_set,
+            WatcherConfig {
+                interval: Duration::from_millis(10),
+            },
+            shutdown_rx,
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timeout waiting for watcher event")
+            .expect("channel closed");
+
+        match event {
+            AppEvent::PrStatusChanged {
+                pr_status,
+                unresolved_comments,
+                ..
+            } => {
+                assert_eq!(pr_status, PrStatus::Open);
+                assert_eq!(unresolved_comments, Some(2));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    }
+
+    /// A MERGED PR (even with owner/repo set) does NOT make the GraphQL call:
+    /// the emitted event's unresolved count is `None`.  If the watcher had
+    /// erroneously called graphql, the MockGh (which DOES have a graphql entry
+    /// returning a non-zero count) would surface Some(n) instead of None.
+    #[tokio::test]
+    async fn watcher_merged_pr_skips_unresolved_count() {
+        use crate::github::mock::MockGh;
+        use tokio::sync::mpsc;
+
+        let pr_json = r#"{"number":7,"state":"MERGED","isDraft":false,"mergedAt":"2024-01-15T10:00:00Z","statusCheckRollup":[]}"#;
+        let graphql_json = r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"nodes":[{"isResolved":false}]}}}}}"#;
+        let mock = Arc::new(MockGh::new(vec![
+            ("api graphql", Ok(graphql_json.to_string())),
+            ("pr view --json", Ok(pr_json.to_string())),
+        ]));
+
+        let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(16);
+        let watch_set = Arc::new(Mutex::new(vec![WatchItem {
+            worktree_path: PathBuf::from("/tmp/wt-merged-skip"),
+            owner: Some("Owner".to_string()),
+            repo: Some("Repo".to_string()),
+        }]));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let handle = spawn_watcher(
+            mock,
+            event_tx,
+            watch_set,
+            WatcherConfig {
+                interval: Duration::from_millis(10),
+            },
+            shutdown_rx,
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timeout waiting for watcher event")
+            .expect("channel closed");
+
+        match event {
+            AppEvent::PrStatusChanged {
+                pr_status,
+                unresolved_comments,
+                ..
+            } => {
+                assert_eq!(pr_status, PrStatus::Merged);
+                assert_eq!(
+                    unresolved_comments, None,
+                    "merged PR must not fetch/report an unresolved count"
+                );
             }
             other => panic!("unexpected event: {other:?}"),
         }

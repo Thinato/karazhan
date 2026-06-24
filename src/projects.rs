@@ -265,6 +265,59 @@ fn owner_from_slash_path(path: &str) -> Option<String> {
     Some(sanitize_path_segment(owner))
 }
 
+/// Parse the repository-name segment from a git remote URL.
+///
+/// Symmetric with [`parse_owner`]: handles the same https / ssh-scheme / SCP
+/// forms and strips a trailing `.git`.  Returns the SECOND path segment
+/// (`Owner/Repo` → `Repo`).
+///
+/// Returns `None` when the URL doesn't match any recognised pattern or the
+/// extracted segment would be empty.
+pub fn parse_repo(remote_url: &str) -> Option<String> {
+    let url = remote_url.trim();
+    if url.is_empty() {
+        return None;
+    }
+
+    // Strip a trailing `.git` suffix.
+    let url = url.strip_suffix(".git").unwrap_or(url);
+
+    // URL-style: strip the scheme (everything up to and including `://`) first.
+    if let Some(scheme_end) = url.find("://") {
+        let after_scheme = &url[scheme_end + 3..];
+        let path_part = if let Some(slash) = after_scheme.find('/') {
+            &after_scheme[slash + 1..]
+        } else {
+            return None;
+        };
+        return repo_from_slash_path(path_part);
+    }
+
+    // SCP-style: git@host:Owner/Repo  (colon separates host from path, no `://`).
+    if let Some(colon_pos) = url.find(':') {
+        let before = &url[..colon_pos];
+        if !before.contains('/') {
+            let path = &url[colon_pos + 1..];
+            return repo_from_slash_path(path);
+        }
+    }
+
+    None
+}
+
+/// Extract the second path segment (repo) from a slash-separated path like
+/// `Owner/Repo` or `/Owner/Repo`.
+fn repo_from_slash_path(path: &str) -> Option<String> {
+    let path = path.strip_prefix('/').unwrap_or(path);
+    let mut segments = path.split('/');
+    let _owner = segments.next()?;
+    let repo = segments.next()?;
+    if repo.is_empty() {
+        return None;
+    }
+    Some(sanitize_path_segment(repo))
+}
+
 /// Sanitize a string so it is safe to use as a single path segment.
 ///
 /// Replaces any character that is not alphanumeric, `-`, `_`, or `.` with `_`.
@@ -307,6 +360,36 @@ pub fn git_owner(repo_root: &Path) -> String {
     };
 
     parse_owner(&url).unwrap_or_else(|| "local".to_string())
+}
+
+/// Return the `(owner, repo)` GitHub coordinates for `repo_root` by reading
+/// `remote.origin.url`.
+///
+/// Runs `git -C <repo_root> config --get remote.origin.url` ONCE and parses the
+/// result with [`parse_owner`] + [`parse_repo`].  Returns `None` when there is
+/// no remote, git is unavailable, or the URL is unparseable.
+///
+/// A linked/detached worktree shares its parent repo's remote, so this works
+/// when called with EITHER the project root OR a worktree path — the daemon may
+/// pass whichever is convenient.
+pub fn git_owner_repo(repo_root: &Path) -> Option<(String, String)> {
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(repo_root)
+        .args(["config", "--get", "remote.origin.url"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let owner = parse_owner(&url)?;
+    let repo = parse_repo(&url)?;
+    Some((owner, repo))
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +487,93 @@ mod tests {
         let result = parse_owner("https://host/My Owner/Repo.git");
         // Space → underscore
         assert_eq!(result, Some("My_Owner".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_repo — pure URL parser, no git spawning
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_repo_scp_style_github() {
+        assert_eq!(
+            parse_repo("git@github.com:Owner/Repo.git"),
+            Some("Repo".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_repo_https_style_github() {
+        assert_eq!(
+            parse_repo("https://github.com/Owner/Repo.git"),
+            Some("Repo".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_repo_ssh_scheme() {
+        assert_eq!(
+            parse_repo("ssh://git@host/Owner/Repo"),
+            Some("Repo".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_repo_scp_no_dot_git() {
+        assert_eq!(
+            parse_repo("git@github.com:Thinato/karazhan"),
+            Some("karazhan".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_repo_strips_dot_git_suffix() {
+        // The `.git` suffix must not survive into the parsed repo name.
+        assert_eq!(
+            parse_repo("https://github.com/Org/my-project.git"),
+            Some("my-project".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_repo_empty_string_returns_none() {
+        assert_eq!(parse_repo(""), None);
+    }
+
+    #[test]
+    fn parse_repo_garbage_returns_none() {
+        assert_eq!(parse_repo("not-a-url"), None);
+    }
+
+    #[test]
+    fn parse_repo_owner_only_returns_none() {
+        // A path with no second segment has no repo.
+        assert_eq!(parse_repo("git@github.com:Owner"), None);
+    }
+
+    #[test]
+    fn git_owner_repo_no_remote_returns_none() {
+        let (_dir, root) = make_temp_repo();
+        assert_eq!(git_owner_repo(&root), None);
+    }
+
+    #[test]
+    fn git_owner_repo_with_remote_parses_pair() {
+        let (_dir, root) = make_temp_repo();
+        let status = Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:TestOrg/testrepo.git",
+            ])
+            .current_dir(&root)
+            .status()
+            .expect("git remote add");
+        assert!(status.success());
+        assert_eq!(
+            git_owner_repo(&root),
+            Some(("TestOrg".to_string(), "testrepo".to_string()))
+        );
     }
 
     #[test]

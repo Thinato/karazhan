@@ -108,6 +108,9 @@ fn help_lines() -> Vec<Line<'static>> {
         kv("n       ", "new worktree (blank or from prompt)", key, desc),
         kv("N       ", "rename worktree", key, desc),
         kv("d       ", "delete worktree (asks y/N)", key, desc),
+        kv("o       ", "open PR in browser", key, desc),
+        kv("y       ", "copy PR URL to clipboard", key, desc),
+        kv("Y       ", "copy PR URL + title to clipboard", key, desc),
         kv("r       ", "refresh worktree list", key, desc),
         kv(
             "Q       ",

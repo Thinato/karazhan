@@ -204,7 +204,9 @@ impl GridView {
             truncate(&format!("{} {}", wt.name, dir_suffix), inner_w)
         };
 
-        // Line 2: prompt slug + PR number (combined, truncated).
+        // Line 2: prompt slug + PR number, with an optional unresolved-comment
+        // badge (` !{n}`) rendered in a distinct bright color.  The badge is shown
+        // only for open PRs with n > 0 (None / 0 → nothing).
         let mut meta_parts: Vec<String> = Vec::new();
         if let Some(slug) = &wt.prompt_slug {
             meta_parts.push(format!("p:{slug}"));
@@ -212,7 +214,18 @@ impl GridView {
         if let Some(pr) = wt.pr_number {
             meta_parts.push(format!("#{pr}"));
         }
-        let meta_label = truncate(&meta_parts.join(" "), inner_w);
+        let unresolved_badge = match wt.unresolved_comments {
+            Some(n) if n > 0 => Some(format!(" !{n}")),
+            _ => None,
+        };
+        // Reserve room for the badge so it survives truncation, then render it as
+        // its own colored span.
+        let badge_w = unresolved_badge
+            .as_ref()
+            .map(|b| b.chars().count())
+            .unwrap_or(0);
+        let base_w = inner_w.saturating_sub(badge_w);
+        let meta_base = truncate(&meta_parts.join(" "), base_w);
 
         // Status badge (short tag shown on line 3) — reflects the PR status.
         let status_tag = pr_status_label(&wt.pr_status).to_string();
@@ -247,10 +260,27 @@ impl GridView {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        // Build the meta line: base text in the label color, plus the optional
+        // unresolved-comment badge in a bright attention color.
+        let badge_style = if selected {
+            Style::default()
+                .fg(Color::LightRed)
+                .bg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD)
+        };
+        let mut meta_spans: Vec<Span> = vec![Span::styled(meta_base, label_style)];
+        if let Some(badge) = unresolved_badge {
+            meta_spans.push(Span::styled(badge, badge_style));
+        }
+
         // Render the text lines inside the border.
         let lines: Vec<Line> = vec![
             Line::from(Span::styled(name_label, label_style)),
-            Line::from(Span::styled(meta_label, label_style)),
+            Line::from(meta_spans),
             Line::from(Span::styled(status_tag, status_style)),
         ];
 
@@ -509,6 +539,7 @@ fn status_colors(status: &WorktreeStatus) -> (Color, Color) {
 /// Color for a PR status tag (per the fixed taxonomy).
 fn pr_status_colors(pr: &PrStatus) -> Color {
     match pr {
+        PrStatus::Loading => Color::Cyan,
         PrStatus::NoPr => Color::DarkGray,
         PrStatus::Draft => Color::DarkGray,
         PrStatus::Open => Color::Yellow,
@@ -524,12 +555,13 @@ fn pr_status_colors(pr: &PrStatus) -> Color {
 /// Short human-readable tag for a PR status (kept short for the ~22-wide cell).
 fn pr_status_label(pr: &PrStatus) -> &'static str {
     match pr {
+        PrStatus::Loading => "loading\u{2026}",
         PrStatus::NoPr => "no PR",
         PrStatus::Draft => "draft",
         PrStatus::Open => "PR open",
         PrStatus::ChecksRunning => "CI running",
-        PrStatus::ChecksFailing => "checks ✗",
-        PrStatus::ChecksPassing => "checks ✓",
+        PrStatus::ChecksFailing => "checks \u{2717}",
+        PrStatus::ChecksPassing => "checks \u{2713}",
         PrStatus::Approved => "approved",
         PrStatus::Merged => "merged",
         PrStatus::Closed => "closed",
@@ -568,9 +600,12 @@ mod tests {
             branch: "HEAD".to_string(),
             prompt_slug: None,
             pr_number: None,
+            pr_url: None,
+            pr_title: None,
             auto_continue_on_merge: false,
             status: WorktreeStatus::Idle,
             pr_status: PrStatus::NoPr,
+            unresolved_comments: None,
             last_summary: None,
             created_at: now,
             updated_at: now,
@@ -579,6 +614,20 @@ mod tests {
 
     fn names(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // Loading variant label + color
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pr_status_loading_label_is_loading_ellipsis() {
+        assert_eq!(pr_status_label(&PrStatus::Loading), "loading\u{2026}");
+    }
+
+    #[test]
+    fn pr_status_loading_color_is_cyan() {
+        assert_eq!(pr_status_colors(&PrStatus::Loading), Color::Cyan);
     }
 
     #[test]

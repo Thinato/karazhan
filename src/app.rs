@@ -55,6 +55,11 @@ pub enum AppEvent {
         worktree_path: PathBuf,
         pr_status: crate::worktree::model::PrStatus,
         pr_number: Option<u64>,
+        pr_url: Option<String>,
+        pr_title: Option<String>,
+        /// Count of UNRESOLVED PR review threads (open PRs only); `None` when no
+        /// open PR or the count could not be fetched this tick.
+        unresolved_comments: Option<u64>,
     },
 }
 
@@ -754,6 +759,64 @@ impl App {
                     self.set_status("no worktree selected");
                 }
             }
+            CommandId::OpenPr => {
+                self.view = View::Grid;
+                match self.worktrees.get(self.grid.selected) {
+                    None => self.set_status("no worktree selected"),
+                    Some(wt) => match &wt.pr_url {
+                        None => self.set_status("no PR for this worktree"),
+                        Some(url) => {
+                            if let Err(e) = open::that(url) {
+                                tracing::warn!("open PR in browser failed: {e}");
+                                self.set_status(format!("could not open browser: {e}"));
+                            }
+                        }
+                    },
+                }
+            }
+            CommandId::CopyPrUrl => {
+                self.view = View::Grid;
+                match self.worktrees.get(self.grid.selected) {
+                    None => self.set_status("no worktree selected"),
+                    Some(wt) => match wt.pr_url.clone() {
+                        None => self.set_status("no PR for this worktree"),
+                        Some(url) => {
+                            // Note: on X11/Wayland, arboard's clipboard contents may not
+                            // survive after the process exits unless a clipboard manager
+                            // holds them; while karazhan is running it works fine.
+                            match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(url)) {
+                                Ok(()) => self.set_status("PR URL copied to clipboard"),
+                                Err(e) => {
+                                    tracing::warn!("clipboard error: {e}");
+                                    self.set_status(format!("clipboard error: {e}"));
+                                }
+                            }
+                        }
+                    },
+                }
+            }
+            CommandId::CopyPrUrlWithTitle => {
+                self.view = View::Grid;
+                match self.worktrees.get(self.grid.selected) {
+                    None => self.set_status("no worktree selected"),
+                    Some(wt) => match wt.pr_url.clone() {
+                        None => self.set_status("no PR for this worktree"),
+                        Some(url) => {
+                            let text = match &wt.pr_title {
+                                Some(t) => format!("{url} - {t}"),
+                                None => url.clone(),
+                            };
+                            match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)) {
+                                Ok(()) => self.set_status("PR URL + title copied to clipboard"),
+                                Err(e) => {
+                                    tracing::warn!("clipboard error: {e}");
+                                    self.set_status(format!("clipboard error: {e}"));
+                                }
+                            }
+                        }
+                    },
+                }
+            }
         }
     }
 
@@ -970,6 +1033,21 @@ impl App {
             KeyCode::Char('d') => {
                 self.grid.clear_pending_count();
                 self.execute_command(CommandId::DeleteWorktree).await;
+            }
+
+            KeyCode::Char('o') => {
+                self.grid.clear_pending_count();
+                self.execute_command(CommandId::OpenPr).await;
+            }
+
+            KeyCode::Char('y') => {
+                self.grid.clear_pending_count();
+                self.execute_command(CommandId::CopyPrUrl).await;
+            }
+
+            KeyCode::Char('Y') => {
+                self.grid.clear_pending_count();
+                self.execute_command(CommandId::CopyPrUrlWithTitle).await;
             }
 
             KeyCode::Char('A') => {

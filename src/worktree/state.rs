@@ -150,6 +150,31 @@ impl State {
         }
     }
 
+    /// Set the PR URL for a worktree WITHOUT bumping `updated_at` (used by the
+    /// poller).  No-op if not found.
+    pub fn set_pr_url_no_touch(&mut self, path: &Path, url: Option<String>) {
+        if let Some(w) = self.worktrees.iter_mut().find(|w| w.path == path) {
+            w.pr_url = url;
+        }
+    }
+
+    /// Set the PR title for a worktree WITHOUT bumping `updated_at` (used by the
+    /// poller).  No-op if not found.
+    pub fn set_pr_title_no_touch(&mut self, path: &Path, title: Option<String>) {
+        if let Some(w) = self.worktrees.iter_mut().find(|w| w.path == path) {
+            w.pr_title = title;
+        }
+    }
+
+    /// Set the unresolved-review-comment count for a worktree WITHOUT bumping
+    /// `updated_at` (used by the poller — polling is not user/agent activity).
+    /// No-op if not found.
+    pub fn set_unresolved_no_touch(&mut self, path: &Path, unresolved: Option<u64>) {
+        if let Some(w) = self.worktrees.iter_mut().find(|w| w.path == path) {
+            w.unresolved_comments = unresolved;
+        }
+    }
+
     /// Prune any state entries whose paths are not in `live_paths`.
     ///
     /// Called after `git worktree list` so orphaned entries are removed.
@@ -175,9 +200,12 @@ mod tests {
             branch: branch.to_string(),
             prompt_slug: Some("my-prompt".to_string()),
             pr_number: Some(42),
+            pr_url: None,
+            pr_title: None,
             auto_continue_on_merge: true,
             status: WorktreeStatus::NeedsReview,
             pr_status: crate::worktree::model::PrStatus::NoPr,
+            unresolved_comments: None,
             created_at: now,
             updated_at: now,
         }
@@ -303,9 +331,12 @@ mod tests {
             branch: "branch-2".to_string(),
             prompt_slug: None,
             pr_number: None,
+            pr_url: None,
+            pr_title: None,
             auto_continue_on_merge: false,
             status: WorktreeStatus::Idle,
             pr_status: crate::worktree::model::PrStatus::NoPr,
+            unresolved_comments: None,
             created_at: now,
             updated_at: now,
         });
@@ -348,9 +379,12 @@ mod tests {
             branch: "main".to_string(),
             prompt_slug: None,
             pr_number: None,
+            pr_url: None,
+            pr_title: None,
             auto_continue_on_merge: false,
             status: WorktreeStatus::Idle,
             pr_status: crate::worktree::model::PrStatus::NoPr,
+            unresolved_comments: None,
             created_at: past,
             updated_at: past,
         };
@@ -379,9 +413,12 @@ mod tests {
             branch: "feat".to_string(),
             prompt_slug: None,
             pr_number: None,
+            pr_url: None,
+            pr_title: None,
             auto_continue_on_merge: false,
             status: WorktreeStatus::Idle,
             pr_status: crate::worktree::model::PrStatus::NoPr,
+            unresolved_comments: None,
             created_at: past,
             updated_at: past,
         });
@@ -409,9 +446,12 @@ mod tests {
             branch: "main".to_string(),
             prompt_slug: None,
             pr_number: None,
+            pr_url: None,
+            pr_title: None,
             auto_continue_on_merge: false,
             status: WorktreeStatus::Idle,
             pr_status: crate::worktree::model::PrStatus::NoPr,
+            unresolved_comments: None,
             created_at: past,
             updated_at: past,
         });
@@ -439,9 +479,12 @@ mod tests {
             branch: "main".to_string(),
             prompt_slug: None,
             pr_number: None,
+            pr_url: None,
+            pr_title: None,
             auto_continue_on_merge: false,
             status: WorktreeStatus::Idle,
             pr_status: crate::worktree::model::PrStatus::NoPr,
+            unresolved_comments: None,
             created_at: past,
             updated_at: past,
         });
@@ -462,6 +505,46 @@ mod tests {
     }
 
     #[test]
+    fn set_unresolved_no_touch_round_trips_and_does_not_bump() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+        let path = PathBuf::from("/tmp/unresolved-state-wt");
+        let past: DateTime<Utc> = "2023-05-01T00:00:00Z".parse().unwrap();
+
+        let mut state = State::default();
+        state.upsert_worktree(Worktree {
+            path: path.clone(),
+            name: "Unnamed".to_string(),
+            branch: "feat".to_string(),
+            prompt_slug: None,
+            pr_number: None,
+            pr_url: None,
+            pr_title: None,
+            auto_continue_on_merge: false,
+            status: WorktreeStatus::Idle,
+            pr_status: crate::worktree::model::PrStatus::Open,
+            unresolved_comments: None,
+            created_at: past,
+            updated_at: past,
+        });
+
+        state.set_unresolved_no_touch(&path, Some(4));
+
+        // updated_at must NOT move (polling is not user activity).
+        let w = &state.worktrees[0];
+        assert_eq!(w.unresolved_comments, Some(4));
+        assert_eq!(
+            w.updated_at, past,
+            "set_unresolved_no_touch must not bump updated_at"
+        );
+
+        // Persists and round-trips through TOML.
+        save(repo_root, &state).expect("save");
+        let loaded = load(repo_root).expect("load");
+        assert_eq!(loaded.worktrees[0].unresolved_comments, Some(4));
+    }
+
+    #[test]
     fn set_pr_number_bumps_updated_at_not_created_at() {
         let mut state = State::default();
         let path = PathBuf::from("/tmp/setpr-wt");
@@ -472,9 +555,12 @@ mod tests {
             branch: "feat".to_string(),
             prompt_slug: None,
             pr_number: None,
+            pr_url: None,
+            pr_title: None,
             auto_continue_on_merge: false,
             status: WorktreeStatus::Idle,
             pr_status: crate::worktree::model::PrStatus::NoPr,
+            unresolved_comments: None,
             created_at: past,
             updated_at: past,
         });

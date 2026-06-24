@@ -119,6 +119,28 @@ impl AgentConfig {
 }
 
 // ---------------------------------------------------------------------------
+// WorktreeSettings
+// ---------------------------------------------------------------------------
+
+/// Per-worktree behaviour configured under the `[worktree]` table.
+///
+/// Both fields are `Option` so a missing key is distinguishable from an
+/// explicit value.  This is shared between the global [`crate::config::Config`]
+/// and the per-project [`ProjectConfig`]; the daemon resolves the effective
+/// values with project-over-global-over-default precedence.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorktreeSettings {
+    /// Shell command run once (via `sh -c`) when a new worktree is created.
+    /// `None`/absent → no setup step.
+    pub setup_command: Option<String>,
+
+    /// Maximum time the setup command may run before it is killed.  `None`
+    /// falls back to the built-in default (300 seconds).
+    pub setup_timeout_seconds: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
 // ProjectConfig
 // ---------------------------------------------------------------------------
 
@@ -133,6 +155,9 @@ pub struct ProjectConfig {
     /// A relative path is resolved against the repo root.  When unset, the
     /// default is `<repo_root>/.karazhan/worktrees`.
     pub worktrees_dir: Option<PathBuf>,
+
+    /// Per-worktree setup behaviour (`[worktree]` table).
+    pub worktree: WorktreeSettings,
 }
 
 impl ProjectConfig {
@@ -394,6 +419,59 @@ continue_args = ["--resume", "--flag-b"]
             !base.starts_with(root),
             "default base {base:?} must not be inside repo root {root:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // [worktree] table parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_worktree_table_both_keys() {
+        let toml = r#"
+[worktree]
+setup_command = "npm install"
+setup_timeout_seconds = 120
+"#;
+        let cfg: ProjectConfig = toml::from_str(toml).expect("parse");
+        assert_eq!(cfg.worktree.setup_command.as_deref(), Some("npm install"));
+        assert_eq!(cfg.worktree.setup_timeout_seconds, Some(120));
+    }
+
+    #[test]
+    fn parse_missing_worktree_table_is_all_none() {
+        let toml = r#"
+[agent]
+command = "claude"
+"#;
+        let cfg: ProjectConfig = toml::from_str(toml).expect("parse");
+        assert!(cfg.worktree.setup_command.is_none());
+        assert!(cfg.worktree.setup_timeout_seconds.is_none());
+    }
+
+    #[test]
+    fn parse_worktree_table_partial_keys() {
+        // Only the command set → timeout stays None.
+        let toml = r#"
+[worktree]
+setup_command = "make setup"
+"#;
+        let cfg: ProjectConfig = toml::from_str(toml).expect("parse");
+        assert_eq!(cfg.worktree.setup_command.as_deref(), Some("make setup"));
+        assert!(cfg.worktree.setup_timeout_seconds.is_none());
+    }
+
+    #[test]
+    fn malformed_worktree_table_falls_back_to_default_no_panic() {
+        let dir = TempDir::new().unwrap();
+        let karazhan_dir = dir.path().join(".karazhan");
+        std::fs::create_dir_all(&karazhan_dir).unwrap();
+        let mut f = std::fs::File::create(karazhan_dir.join("config.toml")).unwrap();
+        write!(f, "[worktree]\nsetup_timeout_seconds = \"not a number\"").unwrap();
+
+        let cfg = ProjectConfig::load(dir.path());
+        // Must not panic; all worktree fields default to None.
+        assert!(cfg.worktree.setup_command.is_none());
+        assert!(cfg.worktree.setup_timeout_seconds.is_none());
     }
 
     #[test]

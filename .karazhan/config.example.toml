@@ -19,6 +19,24 @@
 # A relative path is resolved against the repo root; absolute used as-is.
 # worktrees_dir = "/some/path/outside/the/repo"
 
+# Per-worktree setup script. Runs ONCE when a new worktree is created, BEFORE
+# the prompt's agent (if any) starts. Both keys are optional.
+#
+# - setup_command: shell command run via `sh -c` with cwd = the new worktree.
+#   It runs NON-INTERACTIVELY (stdin is closed), so a command that prompts for
+#   input can't hang. Output is captured to the daemon log, never the terminal.
+#   Absent/unset = no setup step.
+# - setup_timeout_seconds: kill the setup command after this many seconds
+#   (default 300). On timeout/failure the error is surfaced but the agent still
+#   runs — setup never blocks your prompt.
+#
+# Precedence: this project value overrides the same key in the global config
+# (~/.config/karazhan/config.toml); the built-in default (300s) applies only
+# when neither sets it.
+# [worktree]
+# setup_command = "npm install"
+# setup_timeout_seconds = 300
+
 [agent]
 command = "claude"
 args = ["--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"]
