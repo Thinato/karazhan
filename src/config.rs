@@ -125,6 +125,10 @@ pub struct Config {
     /// Prompt sent to the agent when auto-continue fires after a PR merge.
     pub auto_continue_prompt: String,
 
+    /// Prompt sent when the user manually resumes a worktree's session (the `R`
+    /// command) to recover an errored / interrupted run.
+    pub resume_prompt: String,
+
     /// Per-status colour overrides.
     pub colors: ColorsConfig,
 
@@ -143,6 +147,8 @@ impl Default for Config {
             auto_continue_prompt:
                 "The PR for this worktree was merged. Continue with the next step of the task."
                     .to_string(),
+            resume_prompt: "Resume the previous task. Continue from where you left off."
+                .to_string(),
             colors: ColorsConfig::default(),
             worktree: WorktreeSettings::default(),
         }

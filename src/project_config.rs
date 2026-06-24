@@ -102,14 +102,31 @@ impl AgentConfig {
     ///
     /// Order: `base_flags...  [prompt_arg]  prompt`
     ///
-    /// `resume = false` → uses `args`; `resume = true` → uses `continue_args`.
-    pub fn build_args(&self, resume: bool, prompt: &str) -> Vec<String> {
-        let base = if resume {
-            &self.continue_args
+    /// - `resume = false` → uses `args` (fresh session).
+    /// - `resume = true`, `session_id = Some(id)` → resumes that SPECIFIC session:
+    ///   `--resume <id>` plus the streaming flags from `continue_args`, minus any
+    ///   bare session selector (`-c` / `--continue`) which would conflict with
+    ///   `--resume`.  This is deterministic regardless of what ran last in the dir.
+    /// - `resume = true`, `session_id = None` → falls back to `continue_args`
+    ///   verbatim (bare `-c` = "most recent session in this directory").
+    pub fn build_args(&self, resume: bool, session_id: Option<&str>, prompt: &str) -> Vec<String> {
+        let mut out: Vec<String> = if resume {
+            match session_id {
+                Some(id) => {
+                    let mut v = vec!["--resume".to_string(), id.to_string()];
+                    v.extend(
+                        self.continue_args
+                            .iter()
+                            .filter(|a| a.as_str() != "-c" && a.as_str() != "--continue")
+                            .cloned(),
+                    );
+                    v
+                }
+                None => self.continue_args.clone(),
+            }
         } else {
-            &self.args
+            self.args.clone()
         };
-        let mut out: Vec<String> = base.clone();
         if let Some(ref flag) = self.prompt_arg {
             out.push(flag.clone());
         }
@@ -291,7 +308,7 @@ continue_args = ["--resume", "--flag-b"]
     #[test]
     fn build_args_fresh_with_prompt_arg() {
         let agent = AgentConfig::default();
-        let args = agent.build_args(false, "do the thing");
+        let args = agent.build_args(false, None, "do the thing");
         assert_eq!(
             args,
             vec![
@@ -311,7 +328,7 @@ continue_args = ["--resume", "--flag-b"]
     #[test]
     fn build_args_resume_with_prompt_arg() {
         let agent = AgentConfig::default();
-        let args = agent.build_args(true, "continue the work");
+        let args = agent.build_args(true, None, "continue the work");
         assert_eq!(
             args,
             vec![
@@ -337,7 +354,7 @@ continue_args = ["--resume", "--flag-b"]
             prompt_arg: None,
             continue_args: vec!["--resume".to_string()],
         };
-        let args = agent.build_args(false, "my prompt");
+        let args = agent.build_args(false, None, "my prompt");
         assert_eq!(args, vec!["--stream", "my prompt"]);
     }
 
@@ -475,6 +492,35 @@ setup_command = "make setup"
     }
 
     #[test]
+    fn build_args_resume_with_session_id_swaps_dash_c() {
+        // With a session_id, `-c` is replaced by `--resume <id>` while the rest of
+        // continue_args (streaming flags) is preserved.
+        let agent = AgentConfig::default();
+        let args = agent.build_args(true, Some("sess-123"), "keep going");
+        assert_eq!(
+            args,
+            vec![
+                "--resume",
+                "sess-123",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "-p",
+                "keep going",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_args_resume_no_session_id_uses_bare_continue() {
+        // Without a session_id, fall back to continue_args verbatim (bare -c).
+        let agent = AgentConfig::default();
+        let args = agent.build_args(true, None, "keep going");
+        assert_eq!(args[0], "-c");
+        assert!(!args.iter().any(|a| a == "--resume"));
+    }
+
+    #[test]
     fn build_args_resume_positional_prompt() {
         let agent = AgentConfig {
             command: "myagent".to_string(),
@@ -482,7 +528,7 @@ setup_command = "make setup"
             prompt_arg: None,
             continue_args: vec!["--resume".to_string()],
         };
-        let args = agent.build_args(true, "resume prompt");
+        let args = agent.build_args(true, None, "resume prompt");
         assert_eq!(args, vec!["--resume", "resume prompt"]);
     }
 }

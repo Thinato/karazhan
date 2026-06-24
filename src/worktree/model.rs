@@ -112,6 +112,12 @@ pub struct Worktree {
     /// Serialises as RFC 3339.  Defaults to `now_utc()` for legacy entries.
     #[serde(default = "now_utc")]
     pub updated_at: DateTime<Utc>,
+    /// Most recent agent `session_id` (captured from the stream-json `init`
+    /// event).  Used to resume this worktree's session deterministically via
+    /// `--resume <id>` instead of the ambiguous bare `-c` (which picks whatever
+    /// ran last in the directory).  `None` until the first run reports one.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 impl Worktree {
@@ -133,6 +139,7 @@ impl Worktree {
             unresolved_comments: None,
             created_at: now,
             updated_at: now,
+            session_id: None,
         }
     }
 }

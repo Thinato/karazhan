@@ -64,6 +64,9 @@ pub enum CommandId {
     /// Create a new worktree from the selected library prompt in its own project
     /// (Library Normal mode; same as `Enter`).
     NewWorktreeFromPrompt,
+    /// Resume the selected worktree's agent session to recover an errored /
+    /// interrupted run (Grid; same as `R`).
+    ResumeSession,
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +238,13 @@ pub const ALL_COMMANDS: &[CommandSpec] = &[
         description: "create a worktree from the selected prompt (its project)",
         keybind: "Enter",
         context: CommandContext::Library,
+    },
+    CommandSpec {
+        id: CommandId::ResumeSession,
+        title: "Resume session",
+        description: "resume the worktree's session (recover an errored/interrupted run)",
+        keybind: "R",
+        context: CommandContext::Grid,
     },
 ];
 
@@ -641,6 +651,7 @@ mod tests {
             CopyPrUrl,
             CopyPrUrlWithTitle,
             NewWorktreeFromPrompt,
+            ResumeSession,
         ];
         // Exhaustive match: a new variant forces a compile error here.
         for id in all {
@@ -664,7 +675,8 @@ mod tests {
                 | OpenPr
                 | CopyPrUrl
                 | CopyPrUrlWithTitle
-                | NewWorktreeFromPrompt => {}
+                | NewWorktreeFromPrompt
+                | ResumeSession => {}
             }
         }
         all.to_vec()

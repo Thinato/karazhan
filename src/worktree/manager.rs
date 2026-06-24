@@ -96,6 +96,7 @@ impl WorktreeManager {
             unresolved_comments: None,
             created_at: now,
             updated_at: now,
+            session_id: None,
         };
 
         // Persist to state.
@@ -157,6 +158,7 @@ impl WorktreeManager {
             unresolved_comments: None,
             created_at: now,
             updated_at: now,
+            session_id: None,
         };
 
         // Persist to state.
@@ -213,6 +215,7 @@ impl WorktreeManager {
                 wt.pr_url = persisted.pr_url.clone();
                 wt.pr_title = persisted.pr_title.clone();
                 wt.unresolved_comments = persisted.unresolved_comments;
+                wt.session_id = persisted.session_id.clone();
                 wt.created_at = persisted.created_at;
                 wt.updated_at = persisted.updated_at;
             }

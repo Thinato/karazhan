@@ -55,7 +55,12 @@ impl AgentBackend for MockBackend {
         Ok(self.handle(worktree_path, "mock session complete"))
     }
 
-    async fn continue_session(&self, worktree_path: &Path, _prompt: &str) -> Result<SessionHandle> {
+    async fn continue_session(
+        &self,
+        worktree_path: &Path,
+        _session_id: Option<&str>,
+        _prompt: &str,
+    ) -> Result<SessionHandle> {
         tracing::info!(worktree = %worktree_path.display(), "mock agent session continued");
         Ok(self.handle(worktree_path, "mock session continued"))
     }

@@ -309,6 +309,37 @@ impl Shared {
         });
     }
 
+    /// Persist the agent `session_id` for a worktree to its project's state.toml
+    /// (no `updated_at` bump — captured mid-run, not a user action).  Used so the
+    /// session can later be resumed deterministically via `--resume <id>`.
+    async fn persist_session_id(&self, path: &Path, session_id: &str) {
+        let Some(root) = self.project_root_for(path).await else {
+            return;
+        };
+        match state::load(&root) {
+            Ok(mut st) => {
+                let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+                st.set_session_id_no_touch(&canonical, Some(session_id.to_string()));
+                st.set_session_id_no_touch(path, Some(session_id.to_string()));
+                if let Err(e) = state::save(&root, &st) {
+                    tracing::warn!("daemon: failed to persist session_id: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("daemon: failed to load state for session_id: {e}"),
+        }
+    }
+
+    /// Read the last persisted agent `session_id` for a worktree (for `--resume`).
+    async fn session_id_for(&self, path: &Path) -> Option<String> {
+        let root = self.project_root_for(path).await?;
+        let st = state::load(&root).ok()?;
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        st.worktrees
+            .iter()
+            .find(|w| w.path == path || w.path == canonical)
+            .and_then(|w| w.session_id.clone())
+    }
+
     /// Update a worktree's `pr_status` (+ optional `pr_number` + optional `pr_url`)
     /// in the registry and the OWNING project's `state.toml`, then broadcast a
     /// fresh Snapshot.
@@ -818,7 +849,11 @@ async fn handle_watch_event(shared: &Arc<Shared>, event: AppEvent) {
                         worktree = %worktree_path.display(),
                         "daemon: PR merged + auto_continue_on_merge=true — starting continue session"
                     );
-                    run_continue_session(Arc::clone(shared), worktree_path);
+                    run_continue_session(
+                        Arc::clone(shared),
+                        worktree_path,
+                        shared.config.auto_continue_prompt.clone(),
+                    );
                 }
             }
         }
@@ -983,6 +1018,13 @@ async fn handle_client_msg(shared: &Arc<Shared>, msg: ClientMsg) {
                 remove_worktree(&shared, &path, force).await;
             });
         }
+        ClientMsg::ResumeSession { worktree_path } => {
+            run_continue_session(
+                Arc::clone(shared),
+                worktree_path,
+                shared.config.resume_prompt.clone(),
+            );
+        }
         ClientMsg::Shutdown => {
             // Handled by the caller (signals serve() to exit); nothing here.
         }
@@ -1015,7 +1057,13 @@ async fn run_prompt(shared: Arc<Shared>, worktree_path: PathBuf, prompt: String)
 
     tokio::spawn(async move {
         match backend.start(&path, &prompt).await {
-            Ok(handle) => drive_session(task_shared, path, handle).await,
+            Ok(handle) => {
+                // Resumes (on recoverable failure) use the continue prompt, not
+                // the original instruction — the session already has the context.
+                let continue_prompt = task_shared.config.resume_prompt.clone();
+                drive_with_retries(&task_shared, &path, &continue_prompt, backend.as_ref(), handle)
+                    .await
+            }
             Err(e) => {
                 tracing::error!("daemon: failed to start agent: {e}");
                 task_shared
@@ -1033,8 +1081,7 @@ async fn run_prompt(shared: Arc<Shared>, worktree_path: PathBuf, prompt: String)
 
 /// Continue the most recent session (auto-continue on merge) — mirrors
 /// `App::run_agent_continue`.
-fn run_continue_session(shared: Arc<Shared>, worktree_path: PathBuf) {
-    let prompt = shared.config.auto_continue_prompt.clone();
+fn run_continue_session(shared: Arc<Shared>, worktree_path: PathBuf, prompt: String) {
     let path = worktree_path.clone();
 
     tokio::spawn(async move {
@@ -1054,8 +1101,16 @@ fn run_continue_session(shared: Arc<Shared>, worktree_path: PathBuf) {
             .set_status(&path, WorktreeStatus::Running, None, None)
             .await;
 
-        match backend.continue_session(&path, &prompt).await {
-            Ok(handle) => drive_session(Arc::clone(&shared), path.clone(), handle).await,
+        // Resume the exact prior session when we have its id (deterministic);
+        // otherwise fall back to bare `-c` (most recent in the dir).
+        let session_id = shared.session_id_for(&path).await;
+        match backend
+            .continue_session(&path, session_id.as_deref(), &prompt)
+            .await
+        {
+            Ok(handle) => {
+                drive_with_retries(&shared, &path, &prompt, backend.as_ref(), handle).await
+            }
             Err(e) => {
                 tracing::error!("daemon: failed to start auto-continue session: {e}");
                 shared
@@ -1071,46 +1126,261 @@ fn run_continue_session(shared: Arc<Shared>, worktree_path: PathBuf) {
     });
 }
 
-/// Drive a [`SessionHandle`] to completion, mapping each [`StatusUpdate`] onto a
-/// registry + broadcast `StatusChanged`.  Shared by `run_prompt` and
-/// `run_continue_session`.
-async fn drive_session(shared: Arc<Shared>, path: PathBuf, handle: crate::agent::SessionHandle) {
+/// Drive a [`SessionHandle`] to completion.
+///
+/// Broadcasts every LIVE (`Running`/progress) update via `set_status` so the
+/// spinner/activity stay current, but does NOT broadcast the TERMINAL
+/// (`Done`/`Error`) status — it returns it instead, so the caller can decide
+/// whether to retry (transient failure) or commit the final status.  Also
+/// persists the `session_id` once, the first time the stream reports it.
+async fn drive_session(
+    shared: &Arc<Shared>,
+    handle: crate::agent::SessionHandle,
+) -> (AgentStatus, Option<String>) {
     let (status_tx, mut status_rx) = mpsc::channel::<StatusUpdate>(16);
 
     let runner = tokio::spawn(async move { run_session(handle, status_tx).await });
 
+    let mut persisted_sid: Option<String> = None;
+    let mut terminal: Option<(AgentStatus, Option<String>)> = None;
+
     while let Some(update) = status_rx.recv().await {
-        let wt_status = agent_status_to_worktree_status(&update.status);
-        let progress = Progress {
-            activity: update.activity.clone(),
-            turns: update.turns,
-            tokens: update.tokens,
-        };
-        shared
-            .set_status(
-                &update.worktree_path,
-                wt_status,
-                update.summary.clone(),
-                Some(progress),
-            )
-            .await;
+        if let Some(sid) = &update.session_id {
+            if persisted_sid.as_deref() != Some(sid.as_str()) {
+                shared.persist_session_id(&update.worktree_path, sid).await;
+                persisted_sid = Some(sid.clone());
+            }
+        }
         tracing::info!(
             worktree = %update.worktree_path.display(),
             "daemon: agent status: {:?}",
             update.status
         );
+        match update.status {
+            // Terminal: hold it; the caller commits or retries.  Do not broadcast.
+            AgentStatus::Done | AgentStatus::Error(_) => {
+                terminal = Some((update.status.clone(), update.summary.clone()));
+            }
+            // Live: broadcast progress so the UI stays alive.
+            _ => {
+                let progress = Progress {
+                    activity: update.activity.clone(),
+                    turns: update.turns,
+                    tokens: update.tokens,
+                };
+                shared
+                    .set_status(
+                        &update.worktree_path,
+                        agent_status_to_worktree_status(&update.status),
+                        update.summary.clone(),
+                        Some(progress),
+                    )
+                    .await;
+            }
+        }
     }
 
-    if let Ok(Err(e)) = runner.await {
-        tracing::error!("daemon: session runner failed: {e}");
+    if let Some(t) = terminal {
+        return t;
+    }
+    // No terminal update arrived (stream closed early) — derive from the runner.
+    match runner.await {
+        Ok(Err(e)) => {
+            tracing::error!("daemon: session runner failed: {e}");
+            (AgentStatus::Error(format!("{e}")), None)
+        }
+        _ => (AgentStatus::Done, None),
+    }
+}
+
+/// Max automatic retries for a session that ends in a TRANSIENT error.
+const MAX_AGENT_RETRIES: u32 = 2;
+
+/// Backoff before retry `attempt` (1-based).
+fn retry_backoff(attempt: u32) -> std::time::Duration {
+    let secs = match attempt {
+        1 => 3,
+        _ => 10,
+    };
+    std::time::Duration::from_secs(secs)
+}
+
+/// Heuristic: is this agent error worth an automatic retry?
+///
+/// Retries TRANSIENT infrastructure failures (rate limits, 5xx, connection /
+/// network blips, dropped streams).  Never retries PERMANENT failures — auth
+/// problems and context-limit errors, where a retry cannot help (context-limit
+/// is handled separately by resuming, which compacts).
+fn is_transient_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    const PERMANENT: &[&str] = &[
+        "context",
+        "too long",
+        "maximum context",
+        "401",
+        "403",
+        "unauthorized",
+        "invalid api key",
+        "authentication",
+        "permission",
+    ];
+    if PERMANENT.iter().any(|p| m.contains(p)) {
+        return false;
+    }
+    const TRANSIENT: &[&str] = &[
+        "429",
+        "rate limit",
+        "rate_limit",
+        "overloaded",
+        "529",
+        "502",
+        "503",
+        "504",
+        "internal server error",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "timeout",
+        "timed out",
+        "connection reset",
+        "connection refused",
+        "connection error",
+        "econnreset",
+        "broken pipe",
+        "network",
+        "temporarily unavailable",
+        "fetch failed",
+        "stream disconnected",
+        "unexpected eof",
+    ];
+    TRANSIENT.iter().any(|t| m.contains(t))
+}
+
+/// Max automatic resumes after a CONTEXT-LIMIT error (claude compacts on resume).
+const MAX_CONTEXT_RETRIES: u32 = 2;
+
+/// Why a finished session is being auto-resumed.
+enum RetryKind {
+    /// Transient infra failure (rate limit / 5xx / network) — back off + resume.
+    Transient,
+    /// Ran out of context window — resume so the agent compacts and continues.
+    ContextLimit,
+}
+
+/// Heuristic: did the agent fail because it ran out of context window?
+///
+/// Resuming compacts the session, so these are recoverable — distinct from the
+/// transient infra errors handled by [`is_transient_error`] (which excludes
+/// context errors) and from genuinely permanent failures.
+fn is_context_limit_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("prompt is too long")
+        || m.contains("maximum context")
+        || m.contains("context_length_exceeded")
+        || m.contains("context window")
+        || (m.contains("context")
+            && (m.contains("too long") || m.contains("exceed") || m.contains("limit")))
+}
+
+/// Drive a session through `drive_session`, auto-resuming on RECOVERABLE failures.
+///
+/// The initial `handle` was created by the caller (a fresh `start` for
+/// `run_prompt`, or a `--resume` for `run_continue_session`).  When a run ends in
+/// a recoverable error it is resumed via `continue_session` (with `continue_prompt`)
+/// so context is preserved:
+/// - TRANSIENT infra errors (rate limit / 5xx / network) → back off, up to
+///   [`MAX_AGENT_RETRIES`] times.
+/// - CONTEXT-LIMIT errors → resume immediately (claude compacts on resume), up to
+///   [`MAX_CONTEXT_RETRIES`] times.
+///
+/// Any other terminal status (success, permanent error, or budget exhausted) is
+/// committed via `set_status`.
+async fn drive_with_retries(
+    shared: &Arc<Shared>,
+    path: &Path,
+    continue_prompt: &str,
+    backend: &dyn AgentBackend,
+    mut handle: crate::agent::SessionHandle,
+) {
+    let mut transient_attempt: u32 = 0;
+    let mut context_attempt: u32 = 0;
+
+    loop {
+        let (terminal, summary) = drive_session(shared, handle).await;
+
+        let kind = if let AgentStatus::Error(msg) = &terminal {
+            if transient_attempt < MAX_AGENT_RETRIES && is_transient_error(msg) {
+                Some((RetryKind::Transient, msg.clone()))
+            } else if context_attempt < MAX_CONTEXT_RETRIES && is_context_limit_error(msg) {
+                Some((RetryKind::ContextLimit, msg.clone()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let Some((kind, err)) = kind else {
+            // Commit the terminal status (success, non-recoverable, or exhausted).
+            shared
+                .set_status(
+                    path,
+                    agent_status_to_worktree_status(&terminal),
+                    summary,
+                    None,
+                )
+                .await;
+            return;
+        };
+
+        let (delay, status_msg) = match kind {
+            RetryKind::Transient => {
+                transient_attempt += 1;
+                (
+                    retry_backoff(transient_attempt),
+                    format!("transient error — retrying ({transient_attempt}/{MAX_AGENT_RETRIES})…"),
+                )
+            }
+            RetryKind::ContextLimit => {
+                context_attempt += 1;
+                (
+                    std::time::Duration::from_secs(1),
+                    format!(
+                        "context limit — compacting & continuing ({context_attempt}/{MAX_CONTEXT_RETRIES})…"
+                    ),
+                )
+            }
+        };
+
+        tracing::warn!(
+            worktree = %path.display(),
+            "daemon: recoverable agent error, resuming in {}s: {err}",
+            delay.as_secs()
+        );
         shared
-            .set_status(
-                &path,
-                agent_status_to_worktree_status(&AgentStatus::Error(format!("{e}"))),
-                None,
-                None,
-            )
+            .set_status(path, WorktreeStatus::Running, Some(status_msg), None)
             .await;
+        tokio::time::sleep(delay).await;
+
+        // Resume the (now-captured) session so the retry keeps full context.
+        let session_id = shared.session_id_for(path).await;
+        match backend
+            .continue_session(path, session_id.as_deref(), continue_prompt)
+            .await
+        {
+            Ok(h) => handle = h,
+            Err(e) => {
+                shared
+                    .set_status(
+                        path,
+                        agent_status_to_worktree_status(&AgentStatus::Error(format!("{e}"))),
+                        None,
+                        None,
+                    )
+                    .await;
+                return;
+            }
+        }
     }
 }
 
@@ -1955,6 +2225,7 @@ mod tests {
             unresolved_comments: None,
             created_at: now,
             updated_at: now,
+            session_id: None,
         };
         {
             let mut reg = shared.registry.lock().await;
@@ -2029,6 +2300,102 @@ mod tests {
             reg.worktrees.get(&path).map(|v| v.status.clone()),
             Some(WorktreeStatus::NeedsReview)
         );
+    }
+
+    #[test]
+    fn transient_error_classifier() {
+        // Transient infra failures → retry.
+        for m in [
+            "API Error: 429 rate_limit_exceeded",
+            "Overloaded",
+            "API Error: 529",
+            "503 Service Unavailable",
+            "fetch failed: ECONNRESET",
+            "connection reset by peer",
+            "stream disconnected unexpectedly",
+            "request timed out",
+        ] {
+            assert!(is_transient_error(m), "expected transient: {m}");
+        }
+        // Permanent failures → never retry.
+        for m in [
+            "prompt is too long: exceeds maximum context window",
+            "401 Unauthorized",
+            "invalid api key",
+            "permission denied",
+            "the agent did the wrong thing",
+        ] {
+            assert!(!is_transient_error(m), "expected NOT transient: {m}");
+        }
+    }
+
+    #[test]
+    fn context_limit_classifier() {
+        for m in [
+            "prompt is too long: 250000 tokens > 200000 maximum",
+            "maximum context length exceeded",
+            "context_length_exceeded",
+            "the context window is full",
+            "context limit reached",
+        ] {
+            assert!(is_context_limit_error(m), "expected context-limit: {m}");
+            // Context-limit must NOT also be treated as a transient infra error
+            // (they take different recovery paths).
+            assert!(!is_transient_error(m), "context-limit must not be transient: {m}");
+        }
+        // Non-context errors.
+        for m in ["429 rate limit", "the agent failed the task"] {
+            assert!(!is_context_limit_error(m), "not context-limit: {m}");
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_session_drives_running_then_needs_review() {
+        let (_dir, root) = make_temp_repo();
+        let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
+        let shared = make_shared(root, gh).await;
+
+        let path = PathBuf::from("/tmp/resume-wt");
+        seed_worktree(&shared, &path, false, None).await;
+
+        let mut sub = shared.events.subscribe();
+
+        handle_client_msg(
+            &shared,
+            ClientMsg::ResumeSession {
+                worktree_path: path.clone(),
+            },
+        )
+        .await;
+
+        // First broadcast: Running.
+        let first = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("timeout")
+            .expect("recv");
+        assert!(matches!(
+            first,
+            SupervisorMsg::StatusChanged {
+                status: WorktreeStatus::Running,
+                ..
+            }
+        ));
+
+        // Eventually reaches NeedsReview (mock continue_session → Done).
+        let mut reached_review = false;
+        for _ in 0..5 {
+            match tokio::time::timeout(Duration::from_secs(2), sub.recv()).await {
+                Ok(Ok(SupervisorMsg::StatusChanged { status, .. })) => {
+                    if status == WorktreeStatus::NeedsReview {
+                        reached_review = true;
+                        break;
+                    }
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(reached_review, "expected NeedsReview after resumed session");
     }
 
     // -- SetAutoContinue ------------------------------------------------------
@@ -2743,6 +3110,7 @@ mod tests {
             unresolved_comments: None,
             created_at: now,
             updated_at: now,
+            session_id: None,
         };
         {
             let mut reg = shared.registry.lock().await;

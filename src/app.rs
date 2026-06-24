@@ -789,6 +789,10 @@ impl App {
                 self.view = View::Grid;
                 self.send_run_builtin(BuiltinKind::CheckCi).await;
             }
+            CommandId::ResumeSession => {
+                self.view = View::Grid;
+                self.send_resume_session().await;
+            }
             CommandId::ToggleAutoContinue => {
                 self.view = View::Grid;
                 self.send_toggle_auto_continue().await;
@@ -1137,6 +1141,11 @@ impl App {
                 self.execute_command(CommandId::CopyPrUrlWithTitle).await;
             }
 
+            KeyCode::Char('R') => {
+                self.grid.clear_pending_count();
+                self.execute_command(CommandId::ResumeSession).await;
+            }
+
             KeyCode::Char('A') => {
                 self.grid.clear_pending_count();
                 self.execute_command(CommandId::AddProject).await;
@@ -1187,6 +1196,18 @@ impl App {
                 kind,
             })
             .await;
+    }
+
+    /// Ask the daemon to resume the selected worktree's session (`R`).
+    async fn send_resume_session(&mut self) {
+        let Some(wt) = self.worktrees.get(self.grid.selected) else {
+            return;
+        };
+        let worktree_path = wt.path.clone();
+        self.client
+            .send(ClientMsg::ResumeSession { worktree_path })
+            .await;
+        self.set_status("resuming session…");
     }
 
     async fn send_set_worktree_name(&mut self, name: String) {

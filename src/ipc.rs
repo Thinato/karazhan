@@ -52,7 +52,7 @@ use crate::worktree::model::{PrStatus, Worktree, WorktreeStatus};
 /// the handshake request and a `ProtocolMismatch` reply even when every other
 /// wire-format item has changed. Do NOT reorder these two; only append new
 /// variants after `ProtocolMismatch`.
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// Maximum frame body size accepted by `read_frame_async` (64 MiB).
 const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
@@ -225,6 +225,13 @@ pub enum ClientMsg {
     RemoveWorktree {
         path: PathBuf,
         force: bool,
+    },
+    /// Resume the worktree's most recent agent session (recover an errored /
+    /// interrupted run with full context).  The daemon resumes via
+    /// `--resume <session_id>` when one was captured, else falls back to bare
+    /// `-c`.
+    ResumeSession {
+        worktree_path: PathBuf,
     },
     /// Ask the daemon to stop.
     Shutdown,
@@ -565,8 +572,8 @@ mod tests {
     // ── Protocol version + frozen wire format ─────────────────────────────────
 
     #[test]
-    fn protocol_version_is_fifteen() {
-        assert_eq!(PROTOCOL_VERSION, 15);
+    fn protocol_version_is_sixteen() {
+        assert_eq!(PROTOCOL_VERSION, 16);
     }
 
     #[test]
@@ -722,6 +729,13 @@ mod tests {
         rt(&ClientMsg::RemoveWorktree {
             path: PathBuf::from("/repo/old"),
             force: true,
+        });
+    }
+
+    #[test]
+    fn client_msg_resume_session() {
+        rt(&ClientMsg::ResumeSession {
+            worktree_path: PathBuf::from("/repo/wt"),
         });
     }
 
@@ -933,6 +947,7 @@ mod tests {
             unresolved_comments: Some(4),
             created_at: now,
             updated_at: now,
+            session_id: None,
         };
         let view = WorktreeView::from_worktree(&wt, "karazhan".into(), Some("summary here".into()));
         assert_eq!(view.path, wt.path);

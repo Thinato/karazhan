@@ -45,6 +45,8 @@ pub struct ParseState {
     pub turns: u32,
     /// Cumulative output tokens reported by the stream.
     pub tokens: u64,
+    /// Agent `session_id` from the stream-json `init` event, once seen.
+    pub session_id: Option<String>,
 }
 
 /// An update emitted by the session runner.
@@ -56,6 +58,8 @@ pub struct StatusUpdate {
     pub activity: Option<String>,
     pub turns: u32,
     pub tokens: u64,
+    /// Agent `session_id` (constant for the session, captured from `init`).
+    pub session_id: Option<String>,
 }
 
 /// A simulated run plan used by the mock backend (no real process).
@@ -97,7 +101,20 @@ pub fn parse_line(line: &str, state: &mut ParseState) -> bool {
         None => return false, // not a recognized stream object.
     };
 
-    match ty {
+    // Capture the session id once.  It appears on the `system`/`init` event (and
+    // most subsequent events); record the first non-empty value so the daemon can
+    // resume this worktree's session with `--resume <id>`.
+    let mut sid_changed = false;
+    if state.session_id.is_none() {
+        if let Some(sid) = value.get("session_id").and_then(|v| v.as_str()) {
+            if !sid.is_empty() {
+                state.session_id = Some(sid.to_string());
+                sid_changed = true;
+            }
+        }
+    }
+
+    let ty_changed = match ty {
         "result" => {
             let subtype = value.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
             let result_text = value
@@ -115,6 +132,7 @@ pub fn parse_line(line: &str, state: &mut ParseState) -> bool {
                     activity: None,
                     turns: state.turns,
                     tokens: state.tokens,
+                    session_id: state.session_id.clone(),
                 };
                 changed(state, new)
             } else {
@@ -124,6 +142,7 @@ pub fn parse_line(line: &str, state: &mut ParseState) -> bool {
                     activity: None,
                     turns: state.turns,
                     tokens: state.tokens,
+                    session_id: state.session_id.clone(),
                 };
                 changed(state, new)
             }
@@ -162,7 +181,8 @@ pub fn parse_line(line: &str, state: &mut ParseState) -> bool {
             true
         }
         _ => false, // unknown type — ignore.
-    }
+    };
+    ty_changed || sid_changed
 }
 
 /// Describe the human-facing action represented by a message's content blocks.
@@ -298,6 +318,7 @@ pub async fn run_session(mut handle: SessionHandle, tx: mpsc::Sender<StatusUpdat
             activity: None,
             turns: 0,
             tokens: 0,
+            session_id: None,
         })
         .await;
 
@@ -325,6 +346,7 @@ pub async fn run_session(mut handle: SessionHandle, tx: mpsc::Sender<StatusUpdat
                                 activity: state.activity.clone(),
                                 turns: state.turns,
                                 tokens: state.tokens,
+                                session_id: state.session_id.clone(),
                             })
                             .await;
                     }
@@ -394,6 +416,7 @@ pub async fn run_session(mut handle: SessionHandle, tx: mpsc::Sender<StatusUpdat
             activity: None,
             turns: state.turns,
             tokens: state.tokens,
+            session_id: state.session_id.clone(),
         })
         .await;
 
@@ -474,6 +497,7 @@ async fn run_simulated(
             activity: None,
             turns: 0,
             tokens: 0,
+            session_id: None,
         })
         .await;
 
@@ -487,6 +511,7 @@ async fn run_simulated(
             activity: None,
             turns: 0,
             tokens: 0,
+            session_id: None,
         })
         .await;
 
@@ -510,6 +535,26 @@ mod tests {
         let changed = parse_line(r#"{"type":"assistant","message":{}}"#, &mut st);
         assert!(!changed);
         assert_eq!(st.status, AgentStatus::Running);
+    }
+
+    #[test]
+    fn captures_session_id_from_init_and_keeps_it() {
+        let mut st = ParseState::default();
+        assert_eq!(st.session_id, None);
+
+        let changed = parse_line(
+            r#"{"type":"system","subtype":"init","session_id":"sess-abc"}"#,
+            &mut st,
+        );
+        assert!(changed);
+        assert_eq!(st.session_id.as_deref(), Some("sess-abc"));
+
+        // A later event with a different session_id does NOT overwrite the first.
+        parse_line(
+            r#"{"type":"assistant","session_id":"other","message":{}}"#,
+            &mut st,
+        );
+        assert_eq!(st.session_id.as_deref(), Some("sess-abc"));
     }
 
     #[test]

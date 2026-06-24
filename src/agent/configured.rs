@@ -44,7 +44,7 @@ impl ConfiguredBackend {
 impl AgentBackend for ConfiguredBackend {
     async fn start(&self, worktree_path: &Path, prompt: &str) -> Result<SessionHandle> {
         let mut cmd = self.base_command(worktree_path);
-        for arg in self.agent.build_args(false, prompt) {
+        for arg in self.agent.build_args(false, None, prompt) {
             cmd.arg(arg);
         }
 
@@ -65,9 +65,14 @@ impl AgentBackend for ConfiguredBackend {
         })
     }
 
-    async fn continue_session(&self, worktree_path: &Path, prompt: &str) -> Result<SessionHandle> {
+    async fn continue_session(
+        &self,
+        worktree_path: &Path,
+        session_id: Option<&str>,
+        prompt: &str,
+    ) -> Result<SessionHandle> {
         let mut cmd = self.base_command(worktree_path);
-        for arg in self.agent.build_args(true, prompt) {
+        for arg in self.agent.build_args(true, session_id, prompt) {
             cmd.arg(arg);
         }
 
@@ -102,7 +107,7 @@ mod tests {
     #[test]
     fn default_config_fresh_argv() {
         let agent = AgentConfig::default();
-        let args = agent.build_args(false, "do the thing");
+        let args = agent.build_args(false, None, "do the thing");
         assert_eq!(
             args,
             vec![
@@ -119,7 +124,7 @@ mod tests {
     #[test]
     fn default_config_continue_argv() {
         let agent = AgentConfig::default();
-        let args = agent.build_args(true, "keep going");
+        let args = agent.build_args(true, None, "keep going");
         assert_eq!(
             args,
             vec![
@@ -142,10 +147,10 @@ mod tests {
             prompt_arg: None,
             continue_args: vec!["--resume".to_string(), "--json".to_string()],
         };
-        let fresh = agent.build_args(false, "fresh prompt");
+        let fresh = agent.build_args(false, None, "fresh prompt");
         assert_eq!(fresh, vec!["--json", "--verbose", "fresh prompt"]);
 
-        let resume = agent.build_args(true, "resume prompt");
+        let resume = agent.build_args(true, None, "resume prompt");
         assert_eq!(resume, vec!["--resume", "--json", "resume prompt"]);
     }
 }

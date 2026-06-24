@@ -112,6 +112,12 @@ fn help_lines() -> Vec<Line<'static>> {
         kv("o       ", "open PR in browser", key, desc),
         kv("y       ", "copy PR URL to clipboard", key, desc),
         kv("Y       ", "copy PR URL + title to clipboard", key, desc),
+        kv(
+            "R       ",
+            "resume session (recover an errored/interrupted run)",
+            key,
+            desc,
+        ),
         kv("r       ", "refresh worktree list", key, desc),
         kv(
             "Q       ",

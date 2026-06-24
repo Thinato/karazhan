@@ -175,6 +175,15 @@ impl State {
         }
     }
 
+    /// Record the agent `session_id` for a worktree WITHOUT bumping `updated_at`
+    /// (the id is captured mid-run from the stream, not a user action).  No-op if
+    /// not found.
+    pub fn set_session_id_no_touch(&mut self, path: &Path, session_id: Option<String>) {
+        if let Some(w) = self.worktrees.iter_mut().find(|w| w.path == path) {
+            w.session_id = session_id;
+        }
+    }
+
     /// Prune any state entries whose paths are not in `live_paths`.
     ///
     /// Called after `git worktree list` so orphaned entries are removed.
@@ -208,6 +217,7 @@ mod tests {
             unresolved_comments: None,
             created_at: now,
             updated_at: now,
+            session_id: None,
         }
     }
 
@@ -257,6 +267,27 @@ mod tests {
 
         let loaded = load(repo_root).expect("load");
         assert_eq!(loaded.worktrees[0].name, "shiny-name");
+    }
+
+    #[test]
+    fn set_session_id_persists_round_trip_without_touching_updated_at() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+
+        let path = PathBuf::from("/tmp/wt-session");
+        let mut state = State::default();
+        state.upsert_worktree(make_worktree(&path, "feature-a"));
+        let before = state.worktrees[0].updated_at;
+
+        state.set_session_id_no_touch(&path, Some("sess-xyz".to_string()));
+        assert_eq!(
+            state.worktrees[0].updated_at, before,
+            "no_touch must not bump updated_at"
+        );
+        save(repo_root, &state).expect("save");
+
+        let loaded = load(repo_root).expect("load");
+        assert_eq!(loaded.worktrees[0].session_id.as_deref(), Some("sess-xyz"));
     }
 
     #[test]
@@ -339,6 +370,7 @@ mod tests {
             unresolved_comments: None,
             created_at: now,
             updated_at: now,
+            session_id: None,
         });
         assert_eq!(state.worktrees.len(), 1);
         assert_eq!(state.worktrees[0].branch, "branch-2");
@@ -387,6 +419,7 @@ mod tests {
             unresolved_comments: None,
             created_at: past,
             updated_at: past,
+            session_id: None,
         };
         state.upsert_worktree(wt);
 
@@ -421,6 +454,7 @@ mod tests {
             unresolved_comments: None,
             created_at: past,
             updated_at: past,
+            session_id: None,
         });
 
         let before = Utc::now();
@@ -454,6 +488,7 @@ mod tests {
             unresolved_comments: None,
             created_at: past,
             updated_at: past,
+            session_id: None,
         });
 
         let before = Utc::now();
@@ -487,6 +522,7 @@ mod tests {
             unresolved_comments: None,
             created_at: past,
             updated_at: past,
+            session_id: None,
         });
 
         let before = Utc::now();
@@ -526,6 +562,7 @@ mod tests {
             unresolved_comments: None,
             created_at: past,
             updated_at: past,
+            session_id: None,
         });
 
         state.set_unresolved_no_touch(&path, Some(4));
@@ -563,6 +600,7 @@ mod tests {
             unresolved_comments: None,
             created_at: past,
             updated_at: past,
+            session_id: None,
         });
 
         let before = Utc::now();

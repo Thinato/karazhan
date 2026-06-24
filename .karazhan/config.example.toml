@@ -1,46 +1,125 @@
-# karazhan project config — copy to .karazhan/config.toml and edit.
+# ============================================================================
+# karazhan PROJECT config — copy to .karazhan/config.toml and edit.
+# ============================================================================
 #
-# The agent is launched as:  command  args...  [prompt_arg]  prompt
+# This file configures ONE repository.  It lives at <repo>/.karazhan/config.toml.
+# A missing file = all defaults.  A malformed file = a warning in the daemon log
+# + defaults (karazhan never crashes on bad config).
+#
+# EVERY key is optional; an omitted key takes the default shown next to it.
+# The values below are the built-in defaults — copying this file as-is changes
+# nothing, it just documents what you can override.
+#
+# The agent is launched as:
+#
+#     command  args...  [prompt_arg]  prompt
 #
 # Status squares parse Claude's stream-json output, so keep the
-# --output-format stream-json --verbose flags in args/continue_args
-# if you want live per-worktree status (otherwise status stays coarse).
+# `--output-format stream-json --verbose` flags in args/continue_args if you
+# want live per-worktree status (otherwise status stays coarse).
 
+# ----------------------------------------------------------------------------
+# worktrees_dir  (top-level, optional)
+# ----------------------------------------------------------------------------
 # Base directory for worktrees created via the "new worktree" modal (key `n`).
 # Each new worktree is placed at <base>/<owner>/<project>/<uuid>/, where
 # <owner> is parsed from remote.origin.url (falls back to "local") and
 # <project> is the registry name of this repo.
 #
-# Default (unset): $XDG_DATA_HOME/karazhan/worktrees/<owner>/<project>/<uuid>/
-#                  (fallback: ~/.local/share/karazhan/worktrees/...)
+# - unset (default): $XDG_DATA_HOME/karazhan/worktrees/<owner>/<project>/<uuid>/
+#                    (fallback: ~/.local/share/karazhan/worktrees/...)
+# - relative path:   resolved against the repo root.
+# - absolute path:   used as-is.
 #
 # An explicit worktrees_dir is still namespaced by <owner>/<project>/<uuid>
 # underneath — the layout is consistent either way.
-# A relative path is resolved against the repo root; absolute used as-is.
+#
 # worktrees_dir = "/some/path/outside/the/repo"
 
-# Per-worktree setup script. Runs ONCE when a new worktree is created, BEFORE
-# the prompt's agent (if any) starts. Both keys are optional.
+# ----------------------------------------------------------------------------
+# [agent]  — how the daemon launches the AI agent
+# ----------------------------------------------------------------------------
+[agent]
+# Binary name or absolute path to invoke.
+command = "claude"
+
+# Flags for a FRESH session.  Must include any streaming flags needed for live
+# status parsing.
+args = ["--output-format", "stream-json", "--verbose"]
+
+# Flag placed immediately before the prompt text.  Set to a string (e.g. "-p"),
+# or remove/comment this line to pass the prompt POSITIONALLY (no preceding flag).
+prompt_arg = "-p"
+
+# Flags for a RESUMED session — used when auto-continuing after a PR merge
+# (resumes the prior session with `-c`).
+continue_args = ["-c", "--output-format", "stream-json", "--verbose"]
+
+# A common alternative (skip Claude's permission prompts for unattended runs):
+# args          = ["--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"]
+# continue_args = ["-c", "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"]
+
+# ----------------------------------------------------------------------------
+# [worktree]  — per-worktree setup script (runs once on creation)
+# ----------------------------------------------------------------------------
+# Runs ONCE when a new worktree is created, BEFORE the prompt's agent (if any)
+# starts.  Both keys are optional.
 #
 # - setup_command: shell command run via `sh -c` with cwd = the new worktree.
-#   It runs NON-INTERACTIVELY (stdin is closed), so a command that prompts for
-#   input can't hang. Output is captured to the daemon log, never the terminal.
+#   Runs NON-INTERACTIVELY (stdin closed), so a command that prompts for input
+#   can't hang.  Output is captured to the daemon log, never the terminal.
 #   Absent/unset = no setup step.
 # - setup_timeout_seconds: kill the setup command after this many seconds
-#   (default 300). On timeout/failure the error is surfaced but the agent still
+#   (default 300).  On timeout/failure the error is surfaced but the agent still
 #   runs — setup never blocks your prompt.
 #
-# Precedence: this project value overrides the same key in the global config
+# Precedence: this project value overrides the same key in the GLOBAL config
 # (~/.config/karazhan/config.toml); the built-in default (300s) applies only
 # when neither sets it.
+#
 # [worktree]
 # setup_command = "npm install"
 # setup_timeout_seconds = 300
 
-[agent]
-command = "claude"
-args = ["--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"]
-# flag placed immediately before the prompt text; omit/null if the agent takes the prompt positionally
-prompt_arg = "-p"
-# used when auto-continuing after a PR merge (resume the prior session)
-continue_args = ["-c", "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"]
+
+# ============================================================================
+# GLOBAL config reference — NOT read from this file.
+# ============================================================================
+#
+# The keys below belong in the per-USER global config, a DIFFERENT file:
+#     $XDG_CONFIG_HOME/karazhan/config.toml   (or ~/.config/karazhan/config.toml)
+#
+# They are documented here for completeness only.  Putting them in this project
+# file has no effect.  All are optional; defaults shown.
+#
+# # Background watcher polling interval, in seconds.
+# poll_interval_secs = 30
+#
+# # Directory to load prompt files from. Unset → <cwd>/prompts.
+# # prompt_dir = "/path/to/prompts"
+#
+# # Binary name or absolute path for the agent / GitHub CLI.
+# claude_bin = "claude"
+# gh_bin = "gh"
+#
+# # Prompt sent to the agent when auto-continue fires after a PR merge.
+# auto_continue_prompt = "The PR for this worktree was merged. Continue with the next step of the task."
+#
+# # [worktree] is also valid globally — it is the FALLBACK for projects that do
+# # not set their own setup_command / setup_timeout_seconds.
+# # [worktree]
+# # setup_command = "make bootstrap"
+# # setup_timeout_seconds = 300
+#
+# # [colors] — per-status grid color overrides.  Color names:
+# #   black, red, green, yellow, blue, magenta, cyan, gray, dark_gray,
+# #   light_red, light_green, light_yellow, light_blue, light_magenta,
+# #   light_cyan, white.  Unknown names fall back to gray.
+# # (The "deleting" status reuses the `error` color; it has no separate key.)
+# # [colors]
+# # idle         = "dark_gray"
+# # running      = "yellow"
+# # needs_review = "magenta"
+# # ci_failing   = "red"
+# # pr_merged    = "green"
+# # error        = "red"

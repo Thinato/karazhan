@@ -73,11 +73,18 @@ pub trait AgentBackend: Send + Sync {
     /// `prompt` text.
     async fn start(&self, worktree_path: &Path, prompt: &str) -> Result<SessionHandle>;
 
-    /// Resume the most recent session in `worktree_path` (Claude Code: `-c`).
-    // Wired into the watcher's PR-merge auto-continue flow in P6; defined now so
-    // every backend implements the full trait surface.
+    /// Resume an agent session in `worktree_path`.
+    ///
+    /// When `session_id` is `Some`, the backend resumes that exact session
+    /// (`--resume <id>`); when `None`, it falls back to "most recent session in
+    /// this directory" (Claude Code: `-c`).
     #[allow(dead_code)]
-    async fn continue_session(&self, worktree_path: &Path, prompt: &str) -> Result<SessionHandle>;
+    async fn continue_session(
+        &self,
+        worktree_path: &Path,
+        session_id: Option<&str>,
+        prompt: &str,
+    ) -> Result<SessionHandle>;
 }
 
 // ---------------------------------------------------------------------------
