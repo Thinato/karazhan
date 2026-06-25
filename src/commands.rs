@@ -67,6 +67,9 @@ pub enum CommandId {
     /// Resume the selected worktree's agent session to recover an errored /
     /// interrupted run (Grid; same as `R`).
     ResumeSession,
+    /// Copy a shell command that `cd`s into the worktree and resumes its agent
+    /// session, so the user can debug it in their own terminal (Grid; same as `s`).
+    CopyResumeCommand,
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +247,13 @@ pub const ALL_COMMANDS: &[CommandSpec] = &[
         title: "Resume session",
         description: "resume the worktree's session (recover an errored/interrupted run)",
         keybind: "R",
+        context: CommandContext::Grid,
+    },
+    CommandSpec {
+        id: CommandId::CopyResumeCommand,
+        title: "Copy resume command",
+        description: "copy a 'cd <worktree> && resume session' shell command to debug it yourself",
+        keybind: "s",
         context: CommandContext::Grid,
     },
 ];
@@ -652,6 +662,7 @@ mod tests {
             CopyPrUrlWithTitle,
             NewWorktreeFromPrompt,
             ResumeSession,
+            CopyResumeCommand,
         ];
         // Exhaustive match: a new variant forces a compile error here.
         for id in all {
@@ -676,7 +687,8 @@ mod tests {
                 | CopyPrUrl
                 | CopyPrUrlWithTitle
                 | NewWorktreeFromPrompt
-                | ResumeSession => {}
+                | ResumeSession
+                | CopyResumeCommand => {}
             }
         }
         all.to_vec()

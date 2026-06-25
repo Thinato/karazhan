@@ -407,6 +407,7 @@ mod tests {
             turns: 0,
             tokens: 0,
             run_started_at: None,
+            session_id: None,
             created_at: now,
             updated_at: now,
         }];

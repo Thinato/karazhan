@@ -899,6 +899,30 @@ impl App {
                     },
                 }
             }
+            CommandId::CopyResumeCommand => {
+                self.view = View::Grid;
+                match self.worktrees.get(self.grid.selected) {
+                    None => self.set_status("no worktree selected"),
+                    Some(wt) => {
+                        let path = wt.path.display().to_string();
+                        let bin = &self.config.claude_bin;
+                        // `--resume <id>` when we know the session; else bare `-c`
+                        // (most recent session in that directory).
+                        let resume = match &wt.session_id {
+                            Some(id) => format!("{bin} --resume {id}"),
+                            None => format!("{bin} -c"),
+                        };
+                        let cmd = format!("cd '{path}' && {resume}");
+                        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(cmd)) {
+                            Ok(()) => self.set_status("resume command copied — paste it in a terminal"),
+                            Err(e) => {
+                                tracing::warn!("clipboard error: {e}");
+                                self.set_status(format!("clipboard error: {e}"));
+                            }
+                        }
+                    }
+                }
+            }
             CommandId::NewWorktreeFromPrompt => match self.library.selected_prompt() {
                 Some(sp) => {
                     self.confirm_new_worktree = Some(ConfirmNewWorktree::from_selected(sp));
@@ -1144,6 +1168,11 @@ impl App {
             KeyCode::Char('R') => {
                 self.grid.clear_pending_count();
                 self.execute_command(CommandId::ResumeSession).await;
+            }
+
+            KeyCode::Char('s') => {
+                self.grid.clear_pending_count();
+                self.execute_command(CommandId::CopyResumeCommand).await;
             }
 
             KeyCode::Char('A') => {

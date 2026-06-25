@@ -118,6 +118,12 @@ fn help_lines() -> Vec<Line<'static>> {
             key,
             desc,
         ),
+        kv(
+            "s       ",
+            "copy 'cd <worktree> && resume' shell command (debug it yourself)",
+            key,
+            desc,
+        ),
         kv("r       ", "refresh worktree list", key, desc),
         kv(
             "Q       ",

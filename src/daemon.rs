@@ -313,20 +313,33 @@ impl Shared {
     /// (no `updated_at` bump — captured mid-run, not a user action).  Used so the
     /// session can later be resumed deterministically via `--resume <id>`.
     async fn persist_session_id(&self, path: &Path, session_id: &str) {
-        let Some(root) = self.project_root_for(path).await else {
-            return;
-        };
-        match state::load(&root) {
-            Ok(mut st) => {
-                let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-                st.set_session_id_no_touch(&canonical, Some(session_id.to_string()));
-                st.set_session_id_no_touch(path, Some(session_id.to_string()));
-                if let Err(e) = state::save(&root, &st) {
-                    tracing::warn!("daemon: failed to persist session_id: {e}");
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if let Some(root) = self.project_root_for(path).await {
+            match state::load(&root) {
+                Ok(mut st) => {
+                    st.set_session_id_no_touch(&canonical, Some(session_id.to_string()));
+                    st.set_session_id_no_touch(path, Some(session_id.to_string()));
+                    if let Err(e) = state::save(&root, &st) {
+                        tracing::warn!("daemon: failed to persist session_id: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("daemon: failed to load state for session_id: {e}"),
+            }
+        }
+
+        // Reflect in the in-memory view + push a Snapshot so the client's "copy
+        // resume command" (`s`) can build a `--resume <id>` line promptly, without
+        // waiting for the next registry rebuild.
+        let snapshot = {
+            let mut reg = self.registry.lock().await;
+            for key in [path, canonical.as_path()] {
+                if let Some(view) = reg.worktrees.get_mut(key) {
+                    view.session_id = Some(session_id.to_string());
                 }
             }
-            Err(e) => tracing::warn!("daemon: failed to load state for session_id: {e}"),
-        }
+            reg.snapshot()
+        };
+        self.broadcast_snapshot(snapshot).await;
     }
 
     /// Read the last persisted agent `session_id` for a worktree (for `--resume`).

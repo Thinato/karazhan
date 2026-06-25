@@ -52,7 +52,7 @@ use crate::worktree::model::{PrStatus, Worktree, WorktreeStatus};
 /// the handshake request and a `ProtocolMismatch` reply even when every other
 /// wire-format item has changed. Do NOT reorder these two; only append new
 /// variants after `ProtocolMismatch`.
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Maximum frame body size accepted by `read_frame_async` (64 MiB).
 const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
@@ -93,6 +93,9 @@ pub struct WorktreeView {
     /// Wall-clock start of the current run; `Some` only while Running so the
     /// client can render a live elapsed timer.  Ephemeral.
     pub run_started_at: Option<DateTime<Utc>>,
+    /// Most recent agent `session_id` (persisted).  Lets the client build a
+    /// "cd + resume" command so the user can jump into the session manually.
+    pub session_id: Option<String>,
     /// When the worktree was first created.
     pub created_at: DateTime<Utc>,
     /// When the worktree was last used (any status/name/PR/flag mutation).
@@ -117,6 +120,7 @@ impl WorktreeView {
             pr_status: wt.pr_status,
             unresolved_comments: wt.unresolved_comments,
             last_summary,
+            session_id: wt.session_id.clone(),
             // Progress fields are ephemeral runtime state, not derived from the
             // persisted Worktree; the daemon injects/preserves them at runtime.
             activity: None,
@@ -414,6 +418,7 @@ mod tests {
             turns: 0,
             tokens: 0,
             run_started_at: None,
+            session_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -441,6 +446,7 @@ mod tests {
             turns: 0,
             tokens: 0,
             run_started_at: None,
+            session_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -480,6 +486,7 @@ mod tests {
             turns: 0,
             tokens: 0,
             run_started_at: None,
+            session_id: None,
             created_at: now,
                 updated_at: now,
             };
@@ -508,6 +515,7 @@ mod tests {
             turns: 0,
             tokens: 0,
             run_started_at: None,
+            session_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -558,6 +566,7 @@ mod tests {
             turns: 0,
             tokens: 0,
             run_started_at: None,
+            session_id: None,
             created_at: now,
                 updated_at: now,
             }],
@@ -572,8 +581,8 @@ mod tests {
     // ── Protocol version + frozen wire format ─────────────────────────────────
 
     #[test]
-    fn protocol_version_is_sixteen() {
-        assert_eq!(PROTOCOL_VERSION, 16);
+    fn protocol_version_is_seventeen() {
+        assert_eq!(PROTOCOL_VERSION, 17);
     }
 
     #[test]
