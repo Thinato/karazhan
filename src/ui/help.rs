@@ -67,6 +67,7 @@ fn help_lines() -> Vec<Line<'static>> {
         kv("Enter   ", "new worktree from selected prompt", key, desc),
         kv("n / a   ", "create a new prompt", key, desc),
         kv("e       ", "edit selected prompt in $EDITOR", key, desc),
+        kv("r       ", "reload prompts from disk (pick up new ones)", key, desc),
         Line::from(""),
         Line::from(Span::styled(
             "  (filter mode)  Esc: clear filter  Backspace: delete char",
@@ -121,6 +122,12 @@ fn help_lines() -> Vec<Line<'static>> {
         kv(
             "s       ",
             "copy 'cd <worktree> && resume' shell command (debug it yourself)",
+            key,
+            desc,
+        ),
+        kv(
+            "< / >   ",
+            "widen / narrow the detail pane by 5 cols (Ctrl: 1 col)",
             key,
             desc,
         ),

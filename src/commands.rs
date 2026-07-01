@@ -39,6 +39,9 @@ pub enum CommandId {
     FilterPrompts,
     /// Re-scan worktrees (Grid; same as `r`).
     RefreshWorktrees,
+    /// Reload the prompt library from disk, picking up new/changed prompt files
+    /// (Library; same as `r`).
+    RefreshPrompts,
     /// Run a custom free-text prompt on the selected worktree (Grid; same as `c`).
     RunCustomPrompt,
     /// Address all open PR review comments on the selection (Grid; same as `p`).
@@ -70,6 +73,10 @@ pub enum CommandId {
     /// Copy a shell command that `cd`s into the worktree and resumes its agent
     /// session, so the user can debug it in their own terminal (Grid; same as `s`).
     CopyResumeCommand,
+    /// Widen the worktree-detail pane by 5 columns (Grid; same as `<`).
+    WidenDetail,
+    /// Narrow the worktree-detail pane by 5 columns (Grid; same as `>`).
+    NarrowDetail,
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +156,13 @@ pub const ALL_COMMANDS: &[CommandSpec] = &[
         title: "Filter Prompts",
         description: "Search the prompt library",
         keybind: "/",
+        context: CommandContext::Library,
+    },
+    CommandSpec {
+        id: CommandId::RefreshPrompts,
+        title: "Refresh prompts",
+        description: "reload the prompt library from disk (pick up new prompts)",
+        keybind: "r",
         context: CommandContext::Library,
     },
     CommandSpec {
@@ -254,6 +268,20 @@ pub const ALL_COMMANDS: &[CommandSpec] = &[
         title: "Copy resume command",
         description: "copy a 'cd <worktree> && resume session' shell command to debug it yourself",
         keybind: "s",
+        context: CommandContext::Grid,
+    },
+    CommandSpec {
+        id: CommandId::WidenDetail,
+        title: "Widen detail pane",
+        description: "widen the worktree-detail pane by 5 cols (Ctrl-< for 1)",
+        keybind: "<",
+        context: CommandContext::Grid,
+    },
+    CommandSpec {
+        id: CommandId::NarrowDetail,
+        title: "Narrow detail pane",
+        description: "narrow the worktree-detail pane by 5 cols (Ctrl-> for 1)",
+        keybind: ">",
         context: CommandContext::Grid,
     },
 ];
@@ -648,6 +676,7 @@ mod tests {
             NewPrompt,
             EditPrompt,
             FilterPrompts,
+            RefreshPrompts,
             RefreshWorktrees,
             RunCustomPrompt,
             AddressPrComments,
@@ -663,6 +692,8 @@ mod tests {
             NewWorktreeFromPrompt,
             ResumeSession,
             CopyResumeCommand,
+            WidenDetail,
+            NarrowDetail,
         ];
         // Exhaustive match: a new variant forces a compile error here.
         for id in all {
@@ -674,6 +705,7 @@ mod tests {
                 | NewPrompt
                 | EditPrompt
                 | FilterPrompts
+                | RefreshPrompts
                 | RefreshWorktrees
                 | RunCustomPrompt
                 | AddressPrComments
@@ -688,7 +720,9 @@ mod tests {
                 | CopyPrUrlWithTitle
                 | NewWorktreeFromPrompt
                 | ResumeSession
-                | CopyResumeCommand => {}
+                | CopyResumeCommand
+                | WidenDetail
+                | NarrowDetail => {}
             }
         }
         all.to_vec()

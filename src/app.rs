@@ -162,6 +162,12 @@ pub struct App {
     /// Monotonic counter advanced on every tick; drives the Running spinner
     /// animation.  Wraps harmlessly.
     spinner_frame: usize,
+    /// User-requested width (cols) of the Grid-view detail pane.  Adjustable with
+    /// `<`/`>` (±5) and `Ctrl-<`/`Ctrl->` (±1); clamped at use to [30, 80% term].
+    detail_width: u16,
+    /// Last rendered terminal width, captured each draw so width clamping in key
+    /// handlers (which have no frame) uses the current terminal size.
+    last_term_width: u16,
 }
 
 impl App {
@@ -196,6 +202,8 @@ impl App {
             pending_delete: None,
             confirm_new_worktree: None,
             spinner_frame: 0,
+            detail_width: crate::ui::detail::DEFAULT_DETAIL_WIDTH,
+            last_term_width: 120,
         }
     }
 
@@ -210,10 +218,13 @@ impl App {
         while self.running {
             terminal.draw(|frame| {
                 let area = frame.area();
+                // Remember terminal width so key handlers (no frame) can clamp
+                // the detail-pane width against the live size.
+                self.last_term_width = area.width;
                 match self.view {
                     View::Library => self.library.render(frame),
                     View::Grid => {
-                        let (grid_area, detail_area) = split_grid_detail(area);
+                        let (grid_area, detail_area) = split_grid_detail(area, self.detail_width);
 
                         // The grid groups by project NAME; derive the ordered
                         // name list from the ProjectInfo snapshot.
@@ -506,7 +517,7 @@ impl App {
 
             match self.view {
                 View::Library => self.handle_library_key(code, modifiers).await,
-                View::Grid => self.handle_grid_key(code).await,
+                View::Grid => self.handle_grid_key(code, modifiers).await,
             }
         }
     }
@@ -772,6 +783,24 @@ impl App {
                 self.client.send(ClientMsg::Refresh).await;
                 self.set_status("refreshing…");
             }
+            CommandId::RefreshPrompts => {
+                self.view = View::Library;
+                let before = self.library.prompt_count();
+                self.library.reload_keep_selection();
+                let after = self.library.prompt_count();
+                let msg = match after.cmp(&before) {
+                    std::cmp::Ordering::Greater => {
+                        format!("prompts refreshed — {} new ({after} total)", after - before)
+                    }
+                    std::cmp::Ordering::Less => {
+                        format!("prompts refreshed — {} removed ({after} total)", before - after)
+                    }
+                    std::cmp::Ordering::Equal => {
+                        format!("prompts refreshed — no change ({after} total)")
+                    }
+                };
+                self.library.status = Some(msg);
+            }
             CommandId::RunCustomPrompt => {
                 self.view = View::Grid;
                 if self.selected_worktree_path().is_some() {
@@ -899,6 +928,14 @@ impl App {
                     },
                 }
             }
+            CommandId::WidenDetail => {
+                self.view = View::Grid;
+                self.adjust_detail_width(5);
+            }
+            CommandId::NarrowDetail => {
+                self.view = View::Grid;
+                self.adjust_detail_width(-5);
+            }
             CommandId::CopyResumeCommand => {
                 self.view = View::Grid;
                 match self.worktrees.get(self.grid.selected) {
@@ -966,6 +1003,7 @@ impl App {
                     self.execute_command(CommandId::NewPrompt).await
                 }
                 KeyCode::Char('e') => self.execute_command(CommandId::EditPrompt).await,
+                KeyCode::Char('r') => self.execute_command(CommandId::RefreshPrompts).await,
                 KeyCode::Char('A') => self.execute_command(CommandId::AddProject).await,
                 _ => {}
             },
@@ -1002,7 +1040,7 @@ impl App {
     // Grid key handling
     // -----------------------------------------------------------------------
 
-    async fn handle_grid_key(&mut self, code: KeyCode) {
+    async fn handle_grid_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         // Name-input sub-mode intercepts all keys first.
         if self.grid_mode == GridMode::NameInput {
             match code {
@@ -1058,12 +1096,12 @@ impl App {
         }
 
         // Derive `cols` from the grid PANE width (not the full terminal width)
-        // so motion and render use the exact same column count.
-        // `split_grid_detail` reserves 36 columns for the detail pane on the
-        // right, so grid_width = terminal_width - 36, floored at CELL_W (22).
+        // so motion and render use the exact same column count.  The detail pane
+        // takes `effective_detail_width(...)` columns (the same value the renderer
+        // uses), so grid_width = terminal_width - detail_width, floored at CELL_W.
         let cols = {
             let (term_w, _) = crossterm::terminal::size().unwrap_or((80, 24));
-            let detail_w: u16 = 36;
+            let detail_w = crate::ui::detail::effective_detail_width(term_w, self.detail_width);
             let grid_w = term_w.saturating_sub(detail_w).max(crate::ui::grid::CELL_W);
             crate::ui::grid::GridView::cols_for_width(grid_w)
         };
@@ -1175,6 +1213,25 @@ impl App {
                 self.execute_command(CommandId::CopyResumeCommand).await;
             }
 
+            // Detail-pane resize.  `<` widens / `>` narrows by 5 cols; with Ctrl,
+            // by 1 col (fine).  `<` = wider (the divider moves left).
+            KeyCode::Char('<') => {
+                self.grid.clear_pending_count();
+                if modifiers.contains(KeyModifiers::CONTROL) {
+                    self.adjust_detail_width(1);
+                } else {
+                    self.execute_command(CommandId::WidenDetail).await;
+                }
+            }
+            KeyCode::Char('>') => {
+                self.grid.clear_pending_count();
+                if modifiers.contains(KeyModifiers::CONTROL) {
+                    self.adjust_detail_width(-1);
+                } else {
+                    self.execute_command(CommandId::NarrowDetail).await;
+                }
+            }
+
             KeyCode::Char('A') => {
                 self.grid.clear_pending_count();
                 self.execute_command(CommandId::AddProject).await;
@@ -1237,6 +1294,15 @@ impl App {
             .send(ClientMsg::ResumeSession { worktree_path })
             .await;
         self.set_status("resuming session…");
+    }
+
+    /// Nudge the detail-pane width by `delta` cols, clamped to
+    /// [30, 80% of the current terminal width].
+    fn adjust_detail_width(&mut self, delta: i32) {
+        let hi = crate::ui::detail::effective_detail_width(self.last_term_width, u16::MAX);
+        let new = (self.detail_width as i32 + delta).clamp(30, hi as i32) as u16;
+        self.detail_width = new;
+        self.set_status(format!("detail width: {new} cols"));
     }
 
     async fn send_set_worktree_name(&mut self, name: String) {

@@ -391,11 +391,26 @@ pub fn humanize_since(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
 
 /// Split `area` into [grid_area, detail_area] side by side.
 ///
-/// The detail pane is a fixed 36 columns wide; the grid takes the remainder.
-pub fn split_grid_detail(area: Rect) -> (Rect, Rect) {
+/// Default detail-pane width in columns.
+pub const DEFAULT_DETAIL_WIDTH: u16 = 36;
+
+/// Resolve the effective detail-pane width: the user-requested width clamped to
+/// a minimum of 30 columns and a maximum of 80% of the terminal width.  The same
+/// value MUST be used for rendering and for grid-motion column math, or the two
+/// disagree and the selection drifts on resize.
+pub fn effective_detail_width(term_w: u16, requested: u16) -> u16 {
+    let hi = ((term_w as u32 * 4) / 5).max(30) as u16;
+    requested.clamp(30, hi)
+}
+
+/// Split `area` into (grid, detail).  The detail pane is `requested_detail_width`
+/// columns wide (clamped by [`effective_detail_width`]); the grid takes the
+/// remainder (at least 20 columns).
+pub fn split_grid_detail(area: Rect, requested_detail_width: u16) -> (Rect, Rect) {
+    let dw = effective_detail_width(area.width, requested_detail_width);
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(36)])
+        .constraints([Constraint::Min(20), Constraint::Length(dw)])
         .split(area);
     (chunks[0], chunks[1])
 }
@@ -410,6 +425,18 @@ mod tests {
 
     fn ts(rfc3339: &str) -> DateTime<Utc> {
         rfc3339.parse().unwrap()
+    }
+
+    #[test]
+    fn effective_detail_width_clamps() {
+        // Within bounds → unchanged.
+        assert_eq!(effective_detail_width(200, 36), 36);
+        // Below the 30-col floor → 30.
+        assert_eq!(effective_detail_width(200, 10), 30);
+        // Above the 80% cap (160) → 160.
+        assert_eq!(effective_detail_width(200, 999), 160);
+        // Tiny terminal: 80% (24) is below the floor, so the 30 floor wins.
+        assert_eq!(effective_detail_width(30, 36), 30);
     }
 
     #[test]

@@ -157,6 +157,11 @@ impl LibraryView {
         self.restore_selection(prev);
     }
 
+    /// Total number of prompts loaded across all projects (ignores any filter).
+    pub fn prompt_count(&self) -> usize {
+        self.projects.iter().map(|p| p.prompts.len()).sum()
+    }
+
     /// The (project_name, slug) of the current selection, if any.
     fn selected_project_slug(&self) -> Option<(String, String)> {
         let r = self.flat.get(self.selected?)?;
