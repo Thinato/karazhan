@@ -371,6 +371,23 @@ pub fn logfile_path(sock: &Path) -> PathBuf {
         .join("supervisor.log")
 }
 
+/// Path to the standalone watcher's PID file (sibling of the socket).
+///
+/// The watcher runs as its OWN process (separate from the supervisor daemon), so
+/// it owns a distinct pidfile for single-instance detection.
+pub fn watcher_pidfile_path(sock: &Path) -> PathBuf {
+    sock.parent()
+        .unwrap_or_else(|| Path::new("/tmp"))
+        .join("watcher.pid")
+}
+
+/// Path to the standalone watcher's log file (sibling of the socket).
+pub fn watcher_logfile_path(sock: &Path) -> PathBuf {
+    sock.parent()
+        .unwrap_or_else(|| Path::new("/tmp"))
+        .join("watcher.log")
+}
+
 /// Read and parse a pidfile into a PID.
 ///
 /// Returns `None` if the file is missing, empty, or does not contain a valid

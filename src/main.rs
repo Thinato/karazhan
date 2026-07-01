@@ -8,6 +8,7 @@ mod pr_status_store;
 mod project_config;
 mod projects;
 mod watcher;
+mod watcher_proc;
 
 // TODO Phase 1
 mod prompts;
@@ -103,6 +104,13 @@ fn main() -> Result<()> {
     // the daemon entry point and never run any TUI/terminal setup.
     if std::env::args().any(|a| a == "--supervisor") {
         return daemon::run_supervisor();
+    }
+
+    // Watcher branch: the standalone GitHub-polling watcher process.  Like
+    // `--supervisor`, it builds its OWN runtime, so it must be handled before the
+    // client runtime is constructed (nesting runtimes panics).
+    if std::env::args().any(|a| a == "--watcher") {
+        return watcher_proc::run_watcher();
     }
 
     // Stop-daemon branch: cleanly stop any running supervisor and exit without
