@@ -16,11 +16,12 @@
 //! - [`spawn_supervisor`] — double-fork autostart helper (used by 8c).
 //! - [`wait_for_socket`]  — poll-connect helper (used by 8c).
 //!
-//! Watcher event rehoming: the watcher still emits its pure [`watcher::diff_state`]
-//! events, but instead of reaching the TUI's `App`, they reach a daemon-side
-//! handler ([`handle_watch_event`]) via the App event channel the watcher already
-//! speaks.  We drain that channel in [`serve`]'s select loop and apply the same
-//! PR-merged / CI-status logic that previously lived in `app.rs`.
+//! PR/CI status: the daemon no longer polls GitHub itself.  The standalone
+//! `--watcher` process (see [`crate::watcher_proc`]) shells `gh` and writes each
+//! project's `pr_status.toml`.  Here, [`spawn_pr_status_poller`] reads those
+//! files on an interval and feeds changes through [`handle_watch_event`] — the
+//! same daemon-side handler (PR-merged auto-continue, snapshot broadcast) that
+//! the in-daemon watcher used to drive.
 
 #![allow(dead_code)]
 
@@ -43,9 +44,9 @@ use crate::github::commands::{build_address_pr_comments_prompt, build_check_ci_p
 use crate::github::pr::pr_for_current_branch;
 use crate::github::{GhRunner, RealGh};
 use crate::ipc::{self, BuiltinKind, ClientMsg, HandshakeReq, HandshakeResp, SupervisorMsg};
+use crate::pr_status_store;
 use crate::project_config::{ProjectConfig, WorktreeSettings};
 use crate::projects;
-use crate::watcher::{spawn_watcher, WatchItem, WatcherConfig};
 use crate::worktree::model::PrStatus;
 use crate::worktree::{state, WorktreeManager, WorktreeStatus};
 
@@ -145,7 +146,6 @@ pub struct Shared {
     pub gh: Arc<dyn GhRunner>,
     pub config: Config,
     pub events: broadcast::Sender<SupervisorMsg>,
-    pub watch_set: Arc<Mutex<Vec<WatchItem>>>,
 }
 
 impl Shared {
@@ -427,64 +427,6 @@ impl Shared {
         prev
     }
 
-    /// Rebuild the shared watch-set from the registry: EVERY worktree across
-    /// ALL projects (PR discovery is by branch now, so no pr_number filter).
-    ///
-    /// The GitHub `(owner, repo)` coordinates are computed ONCE per worktree here
-    /// (via `git config --get remote.origin.url` against the owning project root)
-    /// and stored on each [`WatchItem`], so the watcher never shells `git` on the
-    /// hot per-tick path.  Results are cached per project root within this rebuild
-    /// so each project's remote is parsed at most once.
-    async fn rebuild_watch_set(&self) {
-        // Snapshot (path, owning-project-name) pairs without holding locks across
-        // the blocking git calls below.
-        let entries: Vec<(PathBuf, Option<String>)> = {
-            let reg = self.registry.lock().await;
-            reg.worktrees
-                .values()
-                .map(|v| (v.path.clone(), reg.project_of.get(&v.path).cloned()))
-                .collect()
-        };
-        // name -> root for resolving the owning project's repo root.
-        let roots: HashMap<String, PathBuf> = {
-            let projects = self.projects.lock().await;
-            projects
-                .iter()
-                .map(|p| (p.name.clone(), p.root.clone()))
-                .collect()
-        };
-
-        // Cache (owner, repo) per project root so we parse each remote once.
-        let mut owner_repo_cache: HashMap<PathBuf, Option<(String, String)>> = HashMap::new();
-        let mut items: Vec<WatchItem> = Vec::with_capacity(entries.len());
-        for (path, project_name) in entries {
-            // Prefer the owning project's root; fall back to the worktree path
-            // itself (a linked worktree shares the repo remote, so either works).
-            let root = project_name
-                .as_ref()
-                .and_then(|n| roots.get(n).cloned())
-                .unwrap_or_else(|| path.clone());
-
-            let owner_repo = owner_repo_cache
-                .entry(root.clone())
-                .or_insert_with(|| projects::git_owner_repo(&root))
-                .clone();
-            let (owner, repo) = match owner_repo {
-                Some((o, r)) => (Some(o), Some(r)),
-                None => (None, None),
-            };
-            items.push(WatchItem {
-                worktree_path: path,
-                project_root: root,
-                owner,
-                repo,
-            });
-        }
-
-        let mut guard = self.watch_set.lock().await;
-        *guard = items;
-    }
-
     /// The ordered list of managed projects (name + root path), in the same
     /// order the daemon uses for the registry/grid grouping (the `projects` vec
     /// order).
@@ -652,7 +594,6 @@ async fn serve() -> Result<()> {
         bin: config.gh_bin.clone(),
     });
     let (events, _initial_rx) = broadcast::channel::<SupervisorMsg>(BROADCAST_CAP);
-    let watch_set = Arc::new(Mutex::new(Vec::<WatchItem>::new()));
 
     let shared = Arc::new(Shared {
         projects: Mutex::new(runtimes),
@@ -660,24 +601,21 @@ async fn serve() -> Result<()> {
         gh,
         config,
         events,
-        watch_set,
     });
 
-    // Build the initial registry across all projects + seed the watch-set.
+    // Build the initial registry across all projects.
     shared.rebuild_registry().await;
-    shared.rebuild_watch_set().await;
 
-    // Spawn the watcher.  It emits AppEvents into `watch_event_tx`; the daemon
-    // drains them in the select loop below (rehoming the app.rs handling).
+    // The daemon no longer polls GitHub itself — that lives in the standalone
+    // `--watcher` process, which writes each project's `pr_status.toml`.  Here we
+    // poll THOSE files (cheap local reads) and feed changes through the same
+    // `handle_watch_event` path the in-daemon watcher used to drive.
     let (watch_event_tx, mut watch_event_rx) = mpsc::channel::<AppEvent>(64);
     let (watcher_shutdown_tx, watcher_shutdown_rx) = tokio::sync::watch::channel(false);
-    let watcher_handle = spawn_watcher(
-        Arc::clone(&shared.gh),
+    let watcher_handle = spawn_pr_status_poller(
+        Arc::clone(&shared),
         watch_event_tx,
-        Arc::clone(&shared.watch_set),
-        WatcherConfig {
-            interval: std::time::Duration::from_secs(shared.config.poll_interval_secs),
-        },
+        std::time::Duration::from_secs(shared.config.poll_interval_secs),
         watcher_shutdown_rx,
     );
 
@@ -810,6 +748,77 @@ fn init_daemon_tracing(logfile: &Path) -> Result<tracing_appender::non_blocking:
 // ---------------------------------------------------------------------------
 // Watcher event handling (rehomed from app.rs)
 // ---------------------------------------------------------------------------
+
+/// Poll every project's `pr_status.toml` (written by the standalone `--watcher`
+/// process) on `interval`, emitting an [`AppEvent::PrStatusChanged`] for each
+/// worktree whose PR state has changed since the last tick.
+///
+/// This replaces the in-daemon GitHub watcher: instead of shelling `gh`, the
+/// daemon reads cheap local files.  A per-path `known` map suppresses no-op
+/// re-emits so the client only repaints on real changes (and `handle_watch_event`
+/// only fires auto-continue on the actual merge edge).  The first tick fires
+/// immediately so badges populate promptly on startup.
+fn spawn_pr_status_poller(
+    shared: Arc<Shared>,
+    tx: mpsc::Sender<AppEvent>,
+    interval: std::time::Duration,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    type Observed = (
+        PrStatus,
+        Option<u64>,
+        Option<String>,
+        Option<String>,
+        Option<u64>,
+    );
+    tokio::spawn(async move {
+        let mut known: HashMap<PathBuf, Observed> = HashMap::new();
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let roots: Vec<PathBuf> = {
+                        let projects = shared.projects.lock().await;
+                        projects.iter().map(|p| p.root.clone()).collect()
+                    };
+                    for root in roots {
+                        let file = pr_status_store::load(&root);
+                        for e in file.worktree {
+                            let obs: Observed = (
+                                e.pr_status,
+                                e.pr_number,
+                                e.pr_url.clone(),
+                                e.pr_title.clone(),
+                                e.unresolved_comments,
+                            );
+                            if known.get(&e.path) == Some(&obs) {
+                                continue; // unchanged since last tick — no repaint.
+                            }
+                            known.insert(e.path.clone(), obs);
+                            let _ = tx
+                                .send(AppEvent::PrStatusChanged {
+                                    worktree_path: e.path,
+                                    pr_status: e.pr_status,
+                                    pr_number: e.pr_number,
+                                    pr_url: e.pr_url,
+                                    pr_title: e.pr_title,
+                                    unresolved_comments: e.unresolved_comments,
+                                })
+                                .await;
+                        }
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        tracing::info!("pr_status poller: shutdown signal received, exiting");
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
 
 /// Apply a watcher [`AppEvent`] to the daemon's registry + state, broadcasting
 /// the resulting Snapshot.  This is the daemon-side handler for the watcher's
@@ -980,7 +989,6 @@ async fn handle_client_msg(shared: &Arc<Shared>, msg: ClientMsg) {
     match msg {
         ClientMsg::Refresh => {
             let snapshot = shared.rebuild_registry().await;
-            shared.rebuild_watch_set().await;
             shared.broadcast_snapshot(snapshot).await;
         }
         ClientMsg::RunPrompt {
@@ -1509,7 +1517,6 @@ async fn set_pr_number(shared: &Arc<Shared>, path: &Path, pr: Option<u64>) {
             path.display()
         );
     }
-    shared.rebuild_watch_set().await;
     let snapshot = {
         let reg = shared.registry.lock().await;
         reg.snapshot()
@@ -1593,7 +1600,6 @@ async fn new_worktree(
     }
 
     let snapshot = shared.rebuild_registry().await;
-    shared.rebuild_watch_set().await;
     shared.broadcast_snapshot(snapshot).await;
 
     // Setup-then-prompt sequence, in a spawned task so the daemon isn't blocked.
@@ -1663,7 +1669,6 @@ async fn add_project(shared: &Arc<Shared>, path: &Path) {
             }
             tracing::info!(project = %project.name, "daemon: added project");
             let snapshot = shared.rebuild_registry().await;
-            shared.rebuild_watch_set().await;
             shared.broadcast_snapshot(snapshot).await;
         }
         Err(e) => {
@@ -1786,7 +1791,6 @@ async fn remove_worktree(shared: &Arc<Shared>, path: &Path, _force: bool) {
     }
 
     let snapshot = shared.rebuild_registry().await;
-    shared.rebuild_watch_set().await;
     shared.broadcast_snapshot(snapshot).await;
 }
 
@@ -2191,7 +2195,6 @@ mod tests {
             gh,
             config: Config::default(),
             events,
-            watch_set: Arc::new(Mutex::new(Vec::new())),
         });
         shared.rebuild_registry().await;
         shared
@@ -2448,26 +2451,69 @@ mod tests {
         );
     }
 
-    // -- watch-set includes every worktree (discovery is by branch now) ------
+    // -- pr_status poller reads pr_status.toml and emits changes -------------
 
     #[tokio::test]
-    async fn watch_set_includes_every_worktree_by_path() {
+    async fn pr_status_poller_emits_from_file_then_suppresses_noop() {
         let (_dir, root) = make_temp_repo();
         let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
-        let shared = make_shared(root, gh).await;
+        let shared = make_shared(root.clone(), gh).await;
 
-        let path = PathBuf::from("/tmp/pr-wt");
-        // Seed a worktree with NO pr_number — it must still be watched (the
-        // watcher resolves the PR from the branch each tick).
-        seed_worktree(&shared, &path, false, None).await;
+        let wt_path = PathBuf::from("/tmp/poller-wt");
+        seed_worktree(&shared, &wt_path, false, None).await;
 
-        shared.rebuild_watch_set().await;
-        let ws = shared.watch_set.lock().await;
-        // The seeded worktree is watched even though it has no pr_number.
-        assert!(
-            ws.iter().any(|item| item.worktree_path == path),
-            "seeded worktree must be in the watch-set regardless of pr_number"
+        // The standalone watcher would have written this file; emulate it.
+        let mut file = crate::pr_status_store::PrStatusFile::default();
+        file.upsert(crate::pr_status_store::PrStatusEntry {
+            path: wt_path.clone(),
+            pr_status: PrStatus::Open,
+            pr_number: Some(42),
+            pr_url: Some("https://github.com/o/r/pull/42".to_string()),
+            pr_title: Some("A PR".to_string()),
+            unresolved_comments: Some(2),
+            updated_at: chrono::Utc::now(),
+        });
+        crate::pr_status_store::save(&root, &file).expect("save pr_status.toml");
+
+        let (tx, mut rx) = mpsc::channel::<AppEvent>(16);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = spawn_pr_status_poller(
+            Arc::clone(&shared),
+            tx,
+            std::time::Duration::from_millis(10),
+            shutdown_rx,
         );
+
+        // First tick emits the file's contents.
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for poller emit")
+            .expect("channel closed");
+        match ev {
+            AppEvent::PrStatusChanged {
+                worktree_path,
+                pr_status,
+                pr_number,
+                unresolved_comments,
+                ..
+            } => {
+                assert_eq!(worktree_path, wt_path);
+                assert_eq!(pr_status, PrStatus::Open);
+                assert_eq!(pr_number, Some(42));
+                assert_eq!(unresolved_comments, Some(2));
+            }
+            other => panic!("expected PrStatusChanged, got {other:?}"),
+        }
+
+        // The file is unchanged, so subsequent ticks must NOT re-emit.
+        let noop = tokio::time::timeout(std::time::Duration::from_millis(80), rx.recv()).await;
+        assert!(
+            noop.is_err(),
+            "unchanged pr_status.toml must not produce a repeat emit"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
     }
 
     // -- Refresh rebuilds from a real temp repo ------------------------------
