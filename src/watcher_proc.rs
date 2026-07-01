@@ -190,6 +190,140 @@ fn init_watcher_tracing(logfile: &Path) -> Result<tracing_appender::non_blocking
 }
 
 // ---------------------------------------------------------------------------
+// Client-side lifecycle: spawn / ensure / stop the watcher process
+// ---------------------------------------------------------------------------
+
+/// Ensure a watcher process is running, spawning one if not.
+///
+/// Called by the TUI client on startup (after it attaches to the daemon).  The
+/// watcher's lifetime is deliberately INDEPENDENT of the session daemon: it is
+/// spawned detached (double-fork, no `kill_on_drop`) so restarting or crashing
+/// the daemon never touches it, and vice-versa.  Double-spawns are harmless — the
+/// watcher's own single-instance guard makes any extra instance exit.
+pub fn ensure_watcher_running() -> Result<()> {
+    let sock_dir = ipc::ensure_sock_dir().context("failed to create socket directory")?;
+    let pidfile = ipc::watcher_pidfile_path(&sock_dir.join("sock"));
+    if another_watcher_alive(&pidfile) {
+        tracing::debug!("client: watcher already running");
+        return Ok(());
+    }
+    tracing::info!("client: no watcher running — spawning one");
+    spawn_watcher_process()
+}
+
+/// Spawn a detached `karazhan --watcher` process (double-fork + setsid so it is
+/// reparented to init and outlives this process).  Mirrors
+/// [`crate::daemon::spawn_supervisor`] but for the watcher, and — crucially — the
+/// child is NOT `kill_on_drop`, so the watcher survives the client and the
+/// daemon independently.
+pub fn spawn_watcher_process() -> Result<()> {
+    use nix::sys::wait::waitpid;
+    use nix::unistd::{fork, ForkResult};
+
+    let sock_dir = ipc::ensure_sock_dir().context("failed to create socket directory")?;
+    let logfile = ipc::watcher_logfile_path(&sock_dir.join("sock"));
+
+    // SAFETY: between fork() and exec()/_exit() only async-signal-safe operations
+    // run (fork, setsid, open, dup2, exec) plus pre-resolved owned paths.
+    match unsafe { fork() }.context("first fork failed")? {
+        ForkResult::Parent { child } => {
+            let _ = waitpid(child, None);
+            Ok(())
+        }
+        ForkResult::Child => {
+            if nix::unistd::setsid().is_err() {
+                unsafe { libc_exit(1) };
+            }
+            match unsafe { fork() } {
+                Ok(ForkResult::Parent { .. }) => unsafe { libc_exit(0) },
+                Ok(ForkResult::Child) => {
+                    redirect_std_to_log(&logfile);
+                    let _ = exec_self_watcher();
+                    unsafe { libc_exit(1) };
+                }
+                Err(_) => unsafe { libc_exit(1) },
+            }
+        }
+    }
+}
+
+/// `exec` the current executable with `--watcher` (returns only on error).
+fn exec_self_watcher() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let exe = std::env::current_exe().context("cannot resolve current_exe")?;
+    let err = std::process::Command::new(exe).arg("--watcher").exec();
+    Err(anyhow::anyhow!("exec --watcher failed: {err}"))
+}
+
+/// Redirect stdin←/dev/null and stdout/stderr→logfile in the current process.
+fn redirect_std_to_log(logfile: &Path) {
+    use std::os::unix::io::AsRawFd;
+
+    if let Ok(devnull) = std::fs::OpenOptions::new().read(true).open("/dev/null") {
+        let _ = nix::unistd::dup2(devnull.as_raw_fd(), 0);
+    }
+    if let Ok(log) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(logfile)
+    {
+        let fd = log.as_raw_fd();
+        let _ = nix::unistd::dup2(fd, 1);
+        let _ = nix::unistd::dup2(fd, 2);
+        std::mem::forget(log);
+    }
+}
+
+/// Async-signal-safe `_exit` for forked child branches.
+unsafe fn libc_exit(code: i32) -> ! {
+    nix::libc::_exit(code)
+}
+
+/// Cleanly stop a running watcher process, if any (`--stop-watcher`).
+///
+/// SIGTERMs the pid named in `watcher.pid`, polls ~2s for exit, escalates to
+/// SIGKILL, then removes the pidfile.  Missing/dead pid is a no-op.
+pub async fn stop_running_watcher() -> Result<()> {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+
+    let sock_dir = ipc::ensure_sock_dir().context("failed to create socket directory")?;
+    let pidfile = ipc::watcher_pidfile_path(&sock_dir.join("sock"));
+
+    let pid_raw = match ipc::read_pidfile(&pidfile) {
+        Some(p) => p,
+        None => {
+            tracing::info!("no watcher pidfile — nothing to stop");
+            return Ok(());
+        }
+    };
+    let pid = Pid::from_raw(pid_raw);
+
+    if kill(pid, None).is_err() {
+        let _ = std::fs::remove_file(&pidfile);
+        return Ok(());
+    }
+
+    let _ = kill(pid, Signal::SIGTERM);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut exited = false;
+    while std::time::Instant::now() < deadline {
+        if kill(pid, None).is_err() {
+            exited = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if !exited && kill(pid, None).is_ok() {
+        let _ = kill(pid, Signal::SIGKILL);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = std::fs::remove_file(&pidfile);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

@@ -119,6 +119,11 @@ fn main() -> Result<()> {
         return stop_daemon();
     }
 
+    // Stop-watcher branch: cleanly stop the standalone watcher process and exit.
+    if std::env::args().any(|a| a == "--stop-watcher") {
+        return stop_watcher();
+    }
+
     // Otherwise build the client runtime and run the existing async TUI logic.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -142,6 +147,18 @@ fn stop_daemon() -> Result<()> {
             Some(p) => println!("stopped karazhan daemon (pid {p})"),
             None => println!("no running daemon"),
         }
+        Ok(())
+    })
+}
+
+/// Cleanly stop the running watcher process (the `--stop-watcher` flag).
+fn stop_watcher() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        watcher_proc::stop_running_watcher().await?;
+        println!("stopped karazhan watcher (if it was running)");
         Ok(())
     })
 }
@@ -194,8 +211,15 @@ async fn run_client() -> Result<()> {
     });
 
     // Connect to the supervisor daemon (auto-spawning it on first launch).  The
-    // daemon owns the agent backend, the watcher, and all state.toml writes.
+    // daemon owns the agent backend and all state.toml writes.
     let client = client::connect(event_tx.clone()).await?;
+
+    // Ensure the standalone watcher process is running (spawned detached, with a
+    // lifetime independent of the daemon).  Best-effort: a spawn failure only
+    // means PR/CI badges won't auto-update — it must never block the TUI.
+    if let Err(e) = watcher_proc::ensure_watcher_running() {
+        tracing::warn!("client: could not ensure watcher is running: {e}");
+    }
 
     // The library now reads prompts per-project from each project's
     // <project>/.karazhan/prompts/ dir (populated on the first Snapshot), so no
