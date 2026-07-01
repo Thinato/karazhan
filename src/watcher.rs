@@ -32,6 +32,7 @@ use tokio::time;
 use crate::app::AppEvent;
 use crate::github::pr_status::{fetch_pr_status, fetch_unresolved_count};
 use crate::github::GhRunner;
+use crate::pr_status_store::{self, PrStatusEntry};
 use crate::worktree::model::PrStatus;
 
 // ---------------------------------------------------------------------------
@@ -63,6 +64,10 @@ impl Default for WatcherConfig {
 #[derive(Debug, Clone)]
 pub struct WatchItem {
     pub worktree_path: PathBuf,
+    /// Owning project's repo root.  The watcher persists this worktree's PR
+    /// status under `<project_root>/.karazhan/pr_status.toml` so a separate
+    /// session daemon can read it without calling `gh` itself.
+    pub project_root: PathBuf,
     pub owner: Option<String>,
     pub repo: Option<String>,
 }
@@ -221,6 +226,23 @@ pub fn spawn_watcher(
 
                         let curr_pair = (curr, unresolved);
                         if diff_pr(prev, curr_pair) {
+                            // Persist to the owning project's pr_status.toml so a
+                            // separate session daemon can read PR state without
+                            // calling `gh`.  Best-effort: a write failure is logged
+                            // and never stops the poll.
+                            persist_pr_status(
+                                &item.project_root,
+                                PrStatusEntry {
+                                    path: item.worktree_path.clone(),
+                                    pr_status: curr,
+                                    pr_number,
+                                    pr_url: pr_url.clone(),
+                                    pr_title: pr_title.clone(),
+                                    unresolved_comments: unresolved,
+                                    updated_at: chrono::Utc::now(),
+                                },
+                            );
+
                             emit_event(
                                 &event_tx,
                                 WatchEvent::PrStatusChanged {
@@ -273,6 +295,22 @@ async fn emit_event(tx: &tokio::sync::mpsc::Sender<AppEvent>, event: WatchEvent)
     };
     if tx.send(app_event).await.is_err() {
         tracing::debug!("watcher: event_tx closed, app shutting down");
+    }
+}
+
+/// Persist a single worktree's PR status into its project's `pr_status.toml`.
+///
+/// Loads the current file (missing/malformed → empty), upserts this worktree's
+/// entry, and atomically writes it back.  Best-effort: any error is logged and
+/// swallowed so a failed write never crashes the watcher or stops the poll.
+fn persist_pr_status(project_root: &std::path::Path, entry: PrStatusEntry) {
+    let mut file = pr_status_store::load(project_root);
+    file.upsert(entry);
+    if let Err(e) = pr_status_store::save(project_root, &file) {
+        tracing::warn!(
+            project = %project_root.display(),
+            "watcher: failed to persist pr_status.toml: {e}"
+        );
     }
 }
 
@@ -413,6 +451,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(16);
         let watch_set = Arc::new(Mutex::new(vec![WatchItem {
             worktree_path: PathBuf::from("/tmp/wt-test"),
+            project_root: PathBuf::from("/tmp/wt-test"),
             owner: None,
             repo: None,
         }]));
@@ -469,6 +508,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(16);
         let watch_set = Arc::new(Mutex::new(vec![WatchItem {
             worktree_path: PathBuf::from("/tmp/wt-loading-nopr"),
+            project_root: PathBuf::from("/tmp/wt-loading-nopr"),
             owner: None,
             repo: None,
         }]));
@@ -522,6 +562,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(16);
         let watch_set = Arc::new(Mutex::new(vec![WatchItem {
             worktree_path: PathBuf::from("/tmp/wt-loading-merged"),
+            project_root: PathBuf::from("/tmp/wt-loading-merged"),
             owner: None,
             repo: None,
         }]));
@@ -579,6 +620,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(16);
         let watch_set = Arc::new(Mutex::new(vec![WatchItem {
             worktree_path: PathBuf::from("/tmp/wt-open-unresolved"),
+            project_root: PathBuf::from("/tmp/wt-open-unresolved"),
             owner: Some("Owner".to_string()),
             repo: Some("Repo".to_string()),
         }]));
@@ -634,6 +676,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(16);
         let watch_set = Arc::new(Mutex::new(vec![WatchItem {
             worktree_path: PathBuf::from("/tmp/wt-merged-skip"),
+            project_root: PathBuf::from("/tmp/wt-merged-skip"),
             owner: Some("Owner".to_string()),
             repo: Some("Repo".to_string()),
         }]));
@@ -671,5 +714,63 @@ mod tests {
 
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    }
+
+    /// The watcher persists each observed PR status to the owning project's
+    /// `pr_status.toml` (the hand-off file the future standalone daemon reads).
+    #[tokio::test]
+    async fn watcher_persists_pr_status_to_toml() {
+        use crate::github::mock::MockGh;
+        use crate::pr_status_store;
+        use tokio::sync::mpsc;
+
+        // Project root is a real tempdir so the watcher's write lands somewhere
+        // inspectable and is cleaned up with the test.
+        let project = tempfile::tempdir().expect("tempdir");
+        let wt_path = project.path().join("wt-persist");
+
+        let pr_json = r#"{"number":123,"state":"OPEN","isDraft":false,"mergedAt":null,"statusCheckRollup":[]}"#;
+        let graphql_json = r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":2,"nodes":[{"isResolved":false},{"isResolved":true}]}}}}}"#;
+        let mock = Arc::new(MockGh::new(vec![
+            ("api graphql", Ok(graphql_json.to_string())),
+            ("pr view --json", Ok(pr_json.to_string())),
+        ]));
+
+        let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(16);
+        let watch_set = Arc::new(Mutex::new(vec![WatchItem {
+            worktree_path: wt_path.clone(),
+            project_root: project.path().to_path_buf(),
+            owner: Some("Owner".to_string()),
+            repo: Some("Repo".to_string()),
+        }]));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let handle = spawn_watcher(
+            mock,
+            event_tx,
+            watch_set,
+            WatcherConfig {
+                interval: Duration::from_millis(10),
+            },
+            shutdown_rx,
+        );
+
+        // Wait for the emit so we know a full tick (incl. the persist) ran.
+        let _ = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timeout waiting for watcher event")
+            .expect("channel closed");
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+
+        // The file must now hold this worktree's entry with the observed values.
+        let file = pr_status_store::load(project.path());
+        let entry = file
+            .get(&wt_path)
+            .expect("pr_status.toml must contain the worktree entry");
+        assert_eq!(entry.pr_status, PrStatus::Open);
+        assert_eq!(entry.pr_number, Some(123));
+        assert_eq!(entry.unresolved_comments, Some(1));
     }
 }

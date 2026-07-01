@@ -475,6 +475,7 @@ impl Shared {
             };
             items.push(WatchItem {
                 worktree_path: path,
+                project_root: root,
                 owner,
                 repo,
             });
