@@ -4,6 +4,7 @@ mod commands;
 mod config;
 pub mod daemon;
 pub mod ipc;
+mod pr_status_store;
 mod project_config;
 mod projects;
 mod watcher;
