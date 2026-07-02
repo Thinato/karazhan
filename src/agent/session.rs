@@ -154,7 +154,10 @@ pub fn parse_line(line: &str, state: &mut ParseState) -> bool {
                 changed_any = true;
             }
             let msg = value.get("message");
-            if let Some(content) = msg.and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+            if let Some(content) = msg
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+            {
                 if !content.is_empty() {
                     state.turns += 1;
                     changed_any = true;
@@ -196,7 +199,10 @@ fn describe_activity(content: &[serde_json::Value]) -> Option<String> {
         match block.get("type").and_then(|t| t.as_str()) {
             Some("tool_use") => {
                 let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                let input = block.get("input").cloned().unwrap_or(serde_json::Value::Null);
+                let input = block
+                    .get("input")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 last_tool = Some(describe_tool(name, &input));
             }
             Some("text") => has_text = true,

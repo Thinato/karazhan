@@ -476,8 +476,7 @@ impl Shared {
         for (project_name, list) in &listed {
             for wt in list {
                 let summary = reg.summaries.get(&wt.path).cloned();
-                let mut view =
-                    ipc::WorktreeView::from_worktree(wt, project_name.clone(), summary);
+                let mut view = ipc::WorktreeView::from_worktree(wt, project_name.clone(), summary);
                 // `from_worktree` defaults the ephemeral progress fields, which
                 // would wipe a worktree mid-run.  Preserve them when the previous
                 // view was Running so the spinner/activity/timer survive a rebuild.
@@ -1083,8 +1082,14 @@ async fn run_prompt(shared: Arc<Shared>, worktree_path: PathBuf, prompt: String)
                 // Resumes (on recoverable failure) use the continue prompt, not
                 // the original instruction — the session already has the context.
                 let continue_prompt = task_shared.config.resume_prompt.clone();
-                drive_with_retries(&task_shared, &path, &continue_prompt, backend.as_ref(), handle)
-                    .await
+                drive_with_retries(
+                    &task_shared,
+                    &path,
+                    &continue_prompt,
+                    backend.as_ref(),
+                    handle,
+                )
+                .await
             }
             Err(e) => {
                 tracing::error!("daemon: failed to start agent: {e}");
@@ -1360,7 +1365,9 @@ async fn drive_with_retries(
                 transient_attempt += 1;
                 (
                     retry_backoff(transient_attempt),
-                    format!("transient error — retrying ({transient_attempt}/{MAX_AGENT_RETRIES})…"),
+                    format!(
+                        "transient error — retrying ({transient_attempt}/{MAX_AGENT_RETRIES})…"
+                    ),
                 )
             }
             RetryKind::ContextLimit => {
@@ -2358,7 +2365,10 @@ mod tests {
             assert!(is_context_limit_error(m), "expected context-limit: {m}");
             // Context-limit must NOT also be treated as a transient infra error
             // (they take different recovery paths).
-            assert!(!is_transient_error(m), "context-limit must not be transient: {m}");
+            assert!(
+                !is_transient_error(m),
+                "context-limit must not be transient: {m}"
+            );
         }
         // Non-context errors.
         for m in ["429 rate limit", "the agent failed the task"] {

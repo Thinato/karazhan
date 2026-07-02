@@ -793,7 +793,10 @@ impl App {
                         format!("prompts refreshed — {} new ({after} total)", after - before)
                     }
                     std::cmp::Ordering::Less => {
-                        format!("prompts refreshed — {} removed ({after} total)", before - after)
+                        format!(
+                            "prompts refreshed — {} removed ({after} total)",
+                            before - after
+                        )
                     }
                     std::cmp::Ordering::Equal => {
                         format!("prompts refreshed — no change ({after} total)")
@@ -951,7 +954,9 @@ impl App {
                         };
                         let cmd = format!("cd '{path}' && {resume}");
                         match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(cmd)) {
-                            Ok(()) => self.set_status("resume command copied — paste it in a terminal"),
+                            Ok(()) => {
+                                self.set_status("resume command copied — paste it in a terminal")
+                            }
                             Err(e) => {
                                 tracing::warn!("clipboard error: {e}");
                                 self.set_status(format!("clipboard error: {e}"));
