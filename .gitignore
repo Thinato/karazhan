@@ -7,6 +7,10 @@
 # per-user project config (committed example lives at .karazhan/config.example.toml)
 .karazhan/config.toml
 
+# generated per-project PR/CI status cache, rewritten continuously by the
+# standalone `--watcher` process (see src/pr_status_store.rs). Machine-local.
+.karazhan/pr_status.toml
+
 # NOTE: .karazhan/prompts/ is intentionally NOT ignored — project-specific
 # prompts are committed and ship with the repo.
 
