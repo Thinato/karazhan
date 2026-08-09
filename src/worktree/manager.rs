@@ -542,8 +542,11 @@ mod tests {
 
         // Clobber the state file with garbage — live git worktrees must still
         // be listed (with default metadata), never an empty project.
-        std::fs::write(root.join(".karazhan").join("state.toml"), "not = valid = toml")
-            .expect("write garbage");
+        std::fs::write(
+            root.join(".karazhan").join("state.toml"),
+            "not = valid = toml",
+        )
+        .expect("write garbage");
 
         let list = mgr.list().expect("list must not fail on corrupt state");
         assert!(
