@@ -228,14 +228,8 @@ impl Shared {
             tracing::warn!("daemon: no owning project for {} (status)", path.display());
             return;
         };
-        match state::load(&root) {
-            Ok(mut st) => {
-                st.set_status(path, status.clone());
-                if let Err(e) = state::save(&root, &st) {
-                    tracing::warn!("daemon: failed to persist worktree status: {e}");
-                }
-            }
-            Err(e) => tracing::warn!("daemon: failed to load state for status update: {e}"),
+        if let Err(e) = state::update(&root, |st| st.set_status(path, status.clone())) {
+            tracing::warn!("daemon: failed to persist worktree status: {e}");
         }
     }
 
@@ -315,15 +309,12 @@ impl Shared {
     async fn persist_session_id(&self, path: &Path, session_id: &str) {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         if let Some(root) = self.project_root_for(path).await {
-            match state::load(&root) {
-                Ok(mut st) => {
-                    st.set_session_id_no_touch(&canonical, Some(session_id.to_string()));
-                    st.set_session_id_no_touch(path, Some(session_id.to_string()));
-                    if let Err(e) = state::save(&root, &st) {
-                        tracing::warn!("daemon: failed to persist session_id: {e}");
-                    }
-                }
-                Err(e) => tracing::warn!("daemon: failed to load state for session_id: {e}"),
+            let result = state::update(&root, |st| {
+                st.set_session_id_no_touch(&canonical, Some(session_id.to_string()));
+                st.set_session_id_no_touch(path, Some(session_id.to_string()));
+            });
+            if let Err(e) = result {
+                tracing::warn!("daemon: failed to persist session_id: {e}");
             }
         }
 
@@ -396,20 +387,17 @@ impl Shared {
         };
 
         if let Some(root) = self.project_root_for(path).await {
-            match state::load(&root) {
-                Ok(mut st) => {
-                    st.set_pr_status(path, pr_status);
-                    if let Some(n) = pr_number {
-                        st.set_pr_number_no_touch(path, Some(n));
-                    }
-                    st.set_pr_url_no_touch(path, pr_url);
-                    st.set_pr_title_no_touch(path, pr_title);
-                    st.set_unresolved_no_touch(path, unresolved);
-                    if let Err(e) = state::save(&root, &st) {
-                        tracing::warn!("daemon: failed to persist pr_status: {e}");
-                    }
+            let result = state::update(&root, |st| {
+                st.set_pr_status(path, pr_status);
+                if let Some(n) = pr_number {
+                    st.set_pr_number_no_touch(path, Some(n));
                 }
-                Err(e) => tracing::warn!("daemon: failed to load state for pr_status: {e}"),
+                st.set_pr_url_no_touch(path, pr_url);
+                st.set_pr_title_no_touch(path, pr_title);
+                st.set_unresolved_no_touch(path, unresolved);
+            });
+            if let Err(e) = result {
+                tracing::warn!("daemon: failed to persist pr_status: {e}");
             }
         } else {
             tracing::warn!(
@@ -1478,14 +1466,8 @@ async fn set_auto_continue(shared: &Arc<Shared>, path: &Path, enabled: bool) {
         }
     }
     if let Some(root) = shared.project_root_for(path).await {
-        match state::load(&root) {
-            Ok(mut st) => {
-                st.set_auto_continue(path, enabled);
-                if let Err(e) = state::save(&root, &st) {
-                    tracing::warn!("daemon: failed to persist auto_continue: {e}");
-                }
-            }
-            Err(e) => tracing::warn!("daemon: failed to load state for auto_continue: {e}"),
+        if let Err(e) = state::update(&root, |st| st.set_auto_continue(path, enabled)) {
+            tracing::warn!("daemon: failed to persist auto_continue: {e}");
         }
     } else {
         tracing::warn!(
@@ -1509,14 +1491,8 @@ async fn set_pr_number(shared: &Arc<Shared>, path: &Path, pr: Option<u64>) {
         }
     }
     if let Some(root) = shared.project_root_for(path).await {
-        match state::load(&root) {
-            Ok(mut st) => {
-                st.set_pr_number(path, pr);
-                if let Err(e) = state::save(&root, &st) {
-                    tracing::warn!("daemon: failed to persist pr_number: {e}");
-                }
-            }
-            Err(e) => tracing::warn!("daemon: failed to load state for pr_number: {e}"),
+        if let Err(e) = state::update(&root, |st| st.set_pr_number(path, pr)) {
+            tracing::warn!("daemon: failed to persist pr_number: {e}");
         }
     } else {
         tracing::warn!(
@@ -1593,16 +1569,13 @@ async fn new_worktree(
     // Record the prompt slug onto the project's persisted state (name stays
     // "Unnamed").
     if prompt_slug.is_some() {
-        match state::load(&root) {
-            Ok(mut st) => {
-                if let Some(w) = st.worktrees.iter_mut().find(|w| w.path == canonical) {
-                    w.prompt_slug = prompt_slug.clone();
-                }
-                if let Err(e) = state::save(&root, &st) {
-                    tracing::warn!("daemon: failed to persist new worktree prompt_slug: {e}");
-                }
+        let result = state::update(&root, |st| {
+            if let Some(w) = st.worktrees.iter_mut().find(|w| w.path == canonical) {
+                w.prompt_slug = prompt_slug.clone();
             }
-            Err(e) => tracing::warn!("daemon: failed to load state for new worktree: {e}"),
+        });
+        if let Err(e) = result {
+            tracing::warn!("daemon: failed to persist new worktree prompt_slug: {e}");
         }
     }
 
@@ -1694,14 +1667,8 @@ async fn set_worktree_name(shared: &Arc<Shared>, path: &Path, name: String) {
         }
     }
     if let Some(root) = shared.project_root_for(path).await {
-        match state::load(&root) {
-            Ok(mut st) => {
-                st.set_name(path, name);
-                if let Err(e) = state::save(&root, &st) {
-                    tracing::warn!("daemon: failed to persist worktree name: {e}");
-                }
-            }
-            Err(e) => tracing::warn!("daemon: failed to load state for name update: {e}"),
+        if let Err(e) = state::update(&root, |st| st.set_name(path, name)) {
+            tracing::warn!("daemon: failed to persist worktree name: {e}");
         }
     } else {
         tracing::warn!("daemon: no owning project for {} (name)", path.display());
@@ -1772,16 +1739,13 @@ async fn remove_worktree(shared: &Arc<Shared>, path: &Path, _force: bool) {
     // Drop the entry from the owning project's state.toml.  Use the canonical
     // path if possible; fall back to the raw path so stale entries are pruned.
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    match state::load(&root) {
-        Ok(mut st) => {
-            st.remove_worktree(&canonical);
-            // Also try the raw path in case canonicalization diverged.
-            st.remove_worktree(path);
-            if let Err(e) = state::save(&root, &st) {
-                tracing::warn!("daemon: failed to persist worktree removal: {e}");
-            }
-        }
-        Err(e) => tracing::warn!("daemon: failed to load state for removal: {e}"),
+    let result = state::update(&root, |st| {
+        st.remove_worktree(&canonical);
+        // Also try the raw path in case canonicalization diverged.
+        st.remove_worktree(path);
+    });
+    if let Err(e) = result {
+        tracing::warn!("daemon: failed to persist worktree removal: {e}");
     }
 
     // Drop from in-memory registry maps so the snapshot is clean even before

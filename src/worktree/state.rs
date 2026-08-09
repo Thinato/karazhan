@@ -1,6 +1,9 @@
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -29,6 +32,28 @@ fn state_path(repo_root: &Path) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// Per-root serialization
+// ---------------------------------------------------------------------------
+
+/// Process-wide lock table keyed by (canonicalized) repo root.
+///
+/// The daemon runs many concurrent load→mutate→save tasks against the same
+/// state file; without serialization two tasks can read the same base state
+/// and one clobbers the other's update.  The critical section is pure sync
+/// filesystem work (no `.await` while held), so a std mutex is safe from
+/// async callers.
+static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn lock_for(repo_root: &Path) -> Arc<Mutex<()>> {
+    let key = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let table = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = table.lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(map.entry(key).or_default())
+}
+
+// ---------------------------------------------------------------------------
 // Load / Save
 // ---------------------------------------------------------------------------
 
@@ -51,18 +76,53 @@ pub fn load(repo_root: &Path) -> Result<State> {
     Ok(state)
 }
 
+/// Load state, degrading gracefully when the file is unreadable or corrupt.
+///
+/// A worktree's *existence* comes from live git output; this file only holds
+/// metadata, so a corrupt state file must never take a whole project down.
+/// On failure the bad file is renamed aside to `state.toml.corrupt` (so it can
+/// be inspected and so the next save starts clean) and an empty `State` is
+/// returned.
+pub fn load_or_recover(repo_root: &Path) -> State {
+    match load(repo_root) {
+        Ok(state) => state,
+        Err(e) => {
+            let path = state_path(repo_root);
+            let quarantine = path.with_extension("toml.corrupt");
+            tracing::warn!(
+                "state: cannot load {:?} ({e:#}); moving it to {:?} and starting fresh",
+                path,
+                quarantine
+            );
+            if let Err(rename_err) = std::fs::rename(&path, &quarantine) {
+                tracing::warn!("state: failed to quarantine corrupt state file: {rename_err}");
+            }
+            State::default()
+        }
+    }
+}
+
 /// Atomically write `state` to `<repo_root>/.karazhan/state.toml`.
 ///
 /// Creates the `.karazhan/` directory if it does not exist.
-/// Uses a temp-file + rename approach to avoid partial writes.
+/// Uses a temp-file + rename approach to avoid partial writes.  The temp file
+/// name is unique per writer (pid + sequence number): a fixed shared name lets
+/// two concurrent savers interleave their writes into one temp file and
+/// publish a spliced, unparseable hybrid.
 pub fn save(repo_root: &Path, state: &State) -> Result<()> {
+    static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+
     let dir = repo_root.join(".karazhan");
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create state dir {:?}", dir))?;
 
     let final_path = dir.join("state.toml");
 
     // Write to a sibling temp file first, then rename atomically.
-    let tmp_path = dir.join("state.toml.tmp");
+    let tmp_path = dir.join(format!(
+        "state.toml.{}.{}.tmp",
+        std::process::id(),
+        SAVE_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let content = toml::to_string_pretty(state).context("cannot serialise state to TOML")?;
     std::fs::write(&tmp_path, &content)
         .with_context(|| format!("cannot write temp state file {:?}", tmp_path))?;
@@ -70,6 +130,22 @@ pub fn save(repo_root: &Path, state: &State) -> Result<()> {
         .with_context(|| format!("cannot rename {:?} -> {:?}", tmp_path, final_path))?;
 
     Ok(())
+}
+
+/// Serialized read-modify-write of a project's state file.
+///
+/// Takes the per-root lock, loads (recovering from corruption if needed),
+/// applies `mutate`, saves, and returns the resulting state.  All daemon-side
+/// state mutations must go through here so concurrent tasks cannot lose each
+/// other's updates.
+pub fn update<F: FnOnce(&mut State)>(repo_root: &Path, mutate: F) -> Result<State> {
+    let lock = lock_for(repo_root);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut state = load_or_recover(repo_root);
+    mutate(&mut state);
+    save(repo_root, &state)?;
+    Ok(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +424,87 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = load(dir.path()).expect("load");
         assert!(state.worktrees.is_empty());
+    }
+
+    #[test]
+    fn load_or_recover_quarantines_corrupt_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+        let karazhan_dir = repo_root.join(".karazhan");
+        std::fs::create_dir_all(&karazhan_dir).expect("mkdir");
+
+        // A spliced file like the one produced by the temp-path race:
+        // valid prefix + orphaned tail of a longer previous version
+        // (duplicate key → parse error).
+        let corrupt = "[[worktrees]]\n\
+                       path = \"/tmp/wt-a\"\n\
+                       branch = \"feat\"\n\
+                       status = \"idle\"\n\
+                       atus = \"running\"\n\
+                       status = \"running\"\n";
+        std::fs::write(karazhan_dir.join("state.toml"), corrupt).expect("write");
+
+        let state = load_or_recover(repo_root);
+        assert!(state.worktrees.is_empty(), "corrupt file → default state");
+        assert!(
+            !karazhan_dir.join("state.toml").exists(),
+            "corrupt file must be moved aside"
+        );
+        assert!(
+            karazhan_dir.join("state.toml.corrupt").exists(),
+            "corrupt file must be preserved for inspection"
+        );
+
+        // A subsequent save + load round-trips normally.
+        save(repo_root, &state).expect("save after recovery");
+        assert!(load(repo_root).expect("load").worktrees.is_empty());
+    }
+
+    #[test]
+    fn concurrent_updates_never_corrupt_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path().to_path_buf();
+
+        // Seed with one entry so every update rewrites real content.
+        let mut seed = State::default();
+        seed.upsert_worktree(make_worktree("/tmp/seed", "seed"));
+        save(&repo_root, &seed).expect("seed save");
+
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let root = repo_root.clone();
+                std::thread::spawn(move || {
+                    for i in 0..50 {
+                        update(&root, |st| {
+                            st.upsert_worktree(make_worktree(
+                                format!("/tmp/wt-{t}-{i}"),
+                                "stress",
+                            ));
+                        })
+                        .expect("update");
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("thread");
+        }
+
+        // The file must parse, contain every update (no lost writes), and no
+        // temp litter may remain.
+        let final_state = load(&repo_root).expect("final file must parse");
+        assert_eq!(
+            final_state.worktrees.len(),
+            1 + 8 * 50,
+            "every concurrent update must be retained"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(repo_root.join(".karazhan"))
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
     }
 
     #[test]
