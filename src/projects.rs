@@ -230,12 +230,8 @@ pub fn parse_owner(remote_url: &str) -> Option<String> {
     if let Some(scheme_end) = url.find("://") {
         let after_scheme = &url[scheme_end + 3..];
         // Drop the host[:port] (everything before the first `/`).
-        let path_part = if let Some(slash) = after_scheme.find('/') {
-            &after_scheme[slash + 1..]
-        } else {
-            return None;
-        };
-        return owner_from_slash_path(path_part);
+        let slash = after_scheme.find('/')?;
+        return owner_from_slash_path(&after_scheme[slash + 1..]);
     }
 
     // SCP-style: git@host:Owner/Repo  (colon separates host from path, no `://`).
@@ -285,12 +281,8 @@ pub fn parse_repo(remote_url: &str) -> Option<String> {
     // URL-style: strip the scheme (everything up to and including `://`) first.
     if let Some(scheme_end) = url.find("://") {
         let after_scheme = &url[scheme_end + 3..];
-        let path_part = if let Some(slash) = after_scheme.find('/') {
-            &after_scheme[slash + 1..]
-        } else {
-            return None;
-        };
-        return repo_from_slash_path(path_part);
+        let slash = after_scheme.find('/')?;
+        return repo_from_slash_path(&after_scheme[slash + 1..]);
     }
 
     // SCP-style: git@host:Owner/Repo  (colon separates host from path, no `://`).
