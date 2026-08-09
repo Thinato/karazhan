@@ -100,9 +100,7 @@ impl WorktreeManager {
         };
 
         // Persist to state.
-        let mut st = state::load(&self.repo_root)?;
-        st.upsert_worktree(worktree.clone());
-        state::save(&self.repo_root, &st)?;
+        state::update(&self.repo_root, |st| st.upsert_worktree(worktree.clone()))?;
 
         Ok(worktree)
     }
@@ -162,9 +160,7 @@ impl WorktreeManager {
         };
 
         // Persist to state.
-        let mut st = state::load(&self.repo_root)?;
-        st.upsert_worktree(worktree.clone());
-        state::save(&self.repo_root, &st)?;
+        state::update(&self.repo_root, |st| st.upsert_worktree(worktree.clone()))?;
 
         Ok(worktree)
     }
@@ -194,10 +190,12 @@ impl WorktreeManager {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut live = parse_porcelain(&stdout);
 
-        // Load persisted state and prune orphaned entries.
+        // Load persisted state and prune orphaned entries.  This goes through
+        // `state::update` (which recovers from a corrupt file by starting
+        // fresh): a bad metadata file must degrade to "live worktrees with
+        // default metadata", never to an empty project.
         let live_paths: Vec<PathBuf> = live.iter().map(|w| w.path.clone()).collect();
-        let mut st = state::load(&self.repo_root)?;
-        st.prune_missing(&live_paths);
+        let st = state::update(&self.repo_root, |st| st.prune_missing(&live_paths))?;
 
         // Overlay persisted metadata onto live worktrees.
         for wt in &mut live {
@@ -220,9 +218,6 @@ impl WorktreeManager {
                 wt.updated_at = persisted.updated_at;
             }
         }
-
-        // Persist pruned state back so orphans are removed on disk.
-        state::save(&self.repo_root, &st)?;
 
         Ok(live)
     }
@@ -532,6 +527,36 @@ mod tests {
             "new worktree should appear in list; got: {:?}",
             list.iter().map(|w| &w.path).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn list_survives_corrupt_state_file() {
+        let (_dir, root) = make_temp_repo();
+        let wt_dir = tempfile::tempdir().expect("wt tempdir");
+        let wt_path = wt_dir.path().to_path_buf();
+
+        let mgr = WorktreeManager::new(&root);
+        mgr.create(None, "feature-corrupt", &wt_path)
+            .expect("create");
+        let canonical_wt = wt_path.canonicalize().expect("canonicalize wt_path");
+
+        // Clobber the state file with garbage — live git worktrees must still
+        // be listed (with default metadata), never an empty project.
+        std::fs::write(
+            root.join(".karazhan").join("state.toml"),
+            "not = valid = toml",
+        )
+        .expect("write garbage");
+
+        let list = mgr.list().expect("list must not fail on corrupt state");
+        assert!(
+            list.iter().any(|w| w.path == canonical_wt),
+            "live worktree must survive a corrupt state file; got: {:?}",
+            list.iter().map(|w| &w.path).collect::<Vec<_>>()
+        );
+        // The corrupt file was quarantined and a fresh one written back.
+        assert!(root.join(".karazhan").join("state.toml.corrupt").exists());
+        state::load(&root).expect("state must parse again after recovery");
     }
 
     // -----------------------------------------------------------------------
