@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::hooks::HookRule;
+
 // ---------------------------------------------------------------------------
 // XDG data directory resolution
 // ---------------------------------------------------------------------------
@@ -175,6 +177,10 @@ pub struct ProjectConfig {
 
     /// Per-worktree setup behaviour (`[worktree]` table).
     pub worktree: WorktreeSettings,
+
+    /// Project-scoped state-predicate hooks (`[[hooks]]`), concatenated with
+    /// the global ones.
+    pub hooks: Vec<HookRule>,
 }
 
 impl ProjectConfig {
@@ -241,6 +247,24 @@ impl ProjectConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_project_hooks() {
+        let toml = r#"
+[[hooks]]
+status = "needs_review"
+run = "make deploy-preview"
+"#;
+        let cfg: ProjectConfig = toml::from_str(toml).expect("parse");
+        assert_eq!(cfg.hooks.len(), 1);
+        assert_eq!(cfg.hooks[0].run, "make deploy-preview");
+    }
+
+    #[test]
+    fn project_config_without_hooks_still_parses() {
+        let cfg: ProjectConfig = toml::from_str("worktrees_dir = \"wt\"").expect("parse");
+        assert!(cfg.hooks.is_empty());
+    }
     use std::io::Write;
     use tempfile::TempDir;
 

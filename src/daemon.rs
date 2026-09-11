@@ -43,6 +43,7 @@ use crate::config::Config;
 use crate::github::commands::{build_address_pr_comments_prompt, build_check_ci_prompt};
 use crate::github::pr::pr_for_current_branch;
 use crate::github::{GhRunner, RealGh};
+use crate::hooks::{self, Hook};
 use crate::ipc::{self, BuiltinKind, ClientMsg, HandshakeReq, HandshakeResp, SupervisorMsg};
 use crate::pr_status_store;
 use crate::project_config::{ProjectConfig, WorktreeSettings};
@@ -66,6 +67,9 @@ pub struct ProjectRuntime {
     pub project_config: ProjectConfig,
     pub backend: Arc<dyn AgentBackend>,
     pub backend_name: &'static str,
+    /// Validated `[[hooks]]` from this project's `.karazhan/config.toml`.
+    /// Compiled once at load so a bad rule warns once, not on every transition.
+    pub hooks: Vec<Hook>,
 }
 
 impl ProjectRuntime {
@@ -76,6 +80,14 @@ impl ProjectRuntime {
         let root = project.path.clone();
         let project_config = ProjectConfig::load(&root);
         let (backend, backend_name) = select_backend(project_config.clone());
+        let hooks = hooks::compile(
+            &project_config.hooks,
+            &root
+                .join(".karazhan")
+                .join("config.toml")
+                .display()
+                .to_string(),
+        );
         tracing::info!(
             project = %project.name,
             root = %root.display(),
@@ -88,6 +100,7 @@ impl ProjectRuntime {
             project_config,
             backend,
             backend_name,
+            hooks,
         }
     }
 }
@@ -146,15 +159,152 @@ pub struct Shared {
     pub gh: Arc<dyn GhRunner>,
     pub config: Config,
     pub events: broadcast::Sender<SupervisorMsg>,
+    /// Validated global `[[hooks]]`, concatenated with each project's own.
+    pub hooks: Vec<Hook>,
 }
 
 impl Shared {
+    /// Assemble the shared daemon state, compiling the global `[[hooks]]` once.
+    fn new(
+        projects: Vec<ProjectRuntime>,
+        gh: Arc<dyn GhRunner>,
+        config: Config,
+        events: broadcast::Sender<SupervisorMsg>,
+    ) -> Self {
+        let hooks = hooks::compile(&config.hooks, "config.toml");
+        Self {
+            projects: Mutex::new(projects),
+            registry: Mutex::new(Registry::empty()),
+            gh,
+            config,
+            events,
+            hooks,
+        }
+    }
+
     /// Broadcast a `SupervisorMsg` to all connected clients + internal listeners.
     ///
     /// A send error simply means there are no subscribers right now; that is
     /// fine (the daemon runs headless).
     fn broadcast(&self, msg: SupervisorMsg) {
         let _ = self.events.send(msg);
+    }
+
+    /// The hooks that apply to `path`: the global ones followed by those of
+    /// the OWNING project.  Both lists run — hooks are additive rules, unlike
+    /// the single-slot `setup_command`, which uses project-over-global.
+    async fn hooks_for(&self, path: &Path) -> Vec<Hook> {
+        if self.hooks.is_empty() && !self.any_project_hooks().await {
+            return Vec::new();
+        }
+        let mut out = self.hooks.clone();
+        let name = {
+            let reg = self.registry.lock().await;
+            reg.project_of.get(path).cloned()
+        };
+        let projects = self.projects.lock().await;
+        let owner = if let Some(name) = name {
+            projects.iter().find(|p| p.name == name)
+        } else {
+            projects
+                .iter()
+                .filter(|p| path.starts_with(&p.root))
+                .max_by_key(|p| p.root.as_os_str().len())
+        };
+        if let Some(p) = owner {
+            out.extend(p.hooks.iter().cloned());
+        }
+        out
+    }
+
+    /// Cheap check so the common "nobody configured hooks" case costs one
+    /// registry-free scan instead of a clone + two lock acquisitions.
+    async fn any_project_hooks(&self) -> bool {
+        self.projects
+            .lock()
+            .await
+            .iter()
+            .any(|p| !p.hooks.is_empty())
+    }
+
+    /// Run every configured hook whose predicate flipped `false → true` across
+    /// the transition `before` → `after` for `path`.
+    ///
+    /// Each hook is spawned detached, so a slow command never blocks the
+    /// registry, the poller, or another worktree.  A hook that fails is logged
+    /// and surfaced to clients; it NEVER changes the worktree's status.
+    async fn fire_hooks(
+        &self,
+        path: &Path,
+        before: Option<(WorktreeStatus, PrStatus)>,
+        after: (WorktreeStatus, PrStatus),
+    ) {
+        let all = self.hooks_for(path).await;
+        if all.is_empty() {
+            return;
+        }
+        let fired: Vec<Hook> = all
+            .into_iter()
+            .filter(|h| h.fires(before.as_ref(), &after))
+            .collect();
+        if fired.is_empty() {
+            return;
+        }
+
+        // Snapshot the worktree once so every hook gets the same environment.
+        let view = {
+            let reg = self.registry.lock().await;
+            reg.worktrees.get(path).cloned()
+        };
+        let Some(view) = view else {
+            tracing::warn!(
+                "hooks: {} is not in the registry — skipping {} hook(s)",
+                path.display(),
+                fired.len()
+            );
+            return;
+        };
+
+        for hook in fired {
+            let env: Vec<(&'static str, String)> = vec![
+                ("KARAZHAN_WORKTREE", view.path.display().to_string()),
+                ("KARAZHAN_PROJECT", view.project.clone()),
+                ("KARAZHAN_BRANCH", view.branch.clone()),
+                ("KARAZHAN_STATUS", hooks::name_of(&after.0)),
+                ("KARAZHAN_PR_STATUS", hooks::name_of(&after.1)),
+                (
+                    "KARAZHAN_PR_NUMBER",
+                    view.pr_number.map(|n| n.to_string()).unwrap_or_default(),
+                ),
+                ("KARAZHAN_PR_URL", view.pr_url.clone().unwrap_or_default()),
+                ("KARAZHAN_HOOK", hook.name.clone()),
+            ];
+            let cwd = view.path.clone();
+            let events = self.events.clone();
+            tracing::info!(
+                worktree = %cwd.display(),
+                hook = %hook.name,
+                "hooks: firing `{}`",
+                hook.run
+            );
+            tokio::spawn(async move {
+                match run_shell(&hook.run, &cwd, hook.timeout, &env).await {
+                    Ok(()) => tracing::info!(
+                        worktree = %cwd.display(),
+                        hook = %hook.name,
+                        "hooks: exited 0"
+                    ),
+                    Err(e) => {
+                        let message = format!("hook `{}` failed: {}", hook.name, e.message);
+                        tracing::warn!(worktree = %cwd.display(), "hooks: {message}");
+                        let _ = events.send(SupervisorMsg::Error {
+                            worktree_path: Some(cwd.clone()),
+                            message,
+                        });
+                    }
+                }
+            });
+        }
     }
 
     /// Log **and** broadcast a `SupervisorMsg::Error`.
@@ -248,9 +398,15 @@ impl Shared {
     ) {
         let now = chrono::Utc::now();
         let (activity, turns, tokens, run_started_at);
+        // State pair before/after this transition, for hook edge detection.
+        // `None` when the worktree is not in the registry (nothing to fire on).
+        let mut hook_before: Option<(WorktreeStatus, PrStatus)> = None;
+        let mut hook_after: Option<(WorktreeStatus, PrStatus)> = None;
         {
             let mut reg = self.registry.lock().await;
             if let Some(view) = reg.worktrees.get_mut(path) {
+                hook_before = Some((view.status.clone(), view.pr_status));
+                hook_after = Some((status.clone(), view.pr_status));
                 let was_running = matches!(view.status, WorktreeStatus::Running);
                 view.status = status.clone();
                 if let Some(s) = &summary {
@@ -301,6 +457,9 @@ impl Shared {
             tokens,
             run_started_at,
         });
+        if let Some(after) = hook_after {
+            self.fire_hooks(path, hook_before, after).await;
+        }
     }
 
     /// Persist the agent `session_id` for a worktree to its project's state.toml
@@ -366,10 +525,14 @@ impl Shared {
             _ => unresolved,
         };
 
+        let mut hook_before: Option<(WorktreeStatus, PrStatus)> = None;
+        let mut hook_after: Option<(WorktreeStatus, PrStatus)> = None;
         let prev = {
             let mut reg = self.registry.lock().await;
             if let Some(view) = reg.worktrees.get_mut(path) {
                 let prev = view.pr_status;
+                hook_before = Some((view.status.clone(), prev));
+                hook_after = Some((view.status.clone(), pr_status));
                 view.pr_status = pr_status;
                 if let Some(n) = pr_number {
                     view.pr_number = Some(n);
@@ -411,6 +574,10 @@ impl Shared {
             reg.snapshot()
         };
         self.broadcast_snapshot(snapshot).await;
+
+        if let Some(after) = hook_after {
+            self.fire_hooks(path, hook_before, after).await;
+        }
 
         prev
     }
@@ -582,13 +749,7 @@ async fn serve() -> Result<()> {
     });
     let (events, _initial_rx) = broadcast::channel::<SupervisorMsg>(BROADCAST_CAP);
 
-    let shared = Arc::new(Shared {
-        projects: Mutex::new(runtimes),
-        registry: Mutex::new(Registry::empty()),
-        gh,
-        config,
-        events,
-    });
+    let shared = Arc::new(Shared::new(runtimes, gh, config, events));
 
     // Build the initial registry across all projects.
     shared.rebuild_registry().await;
@@ -1606,7 +1767,7 @@ async fn new_worktree(
                 "daemon: running worktree setup ({}s timeout)",
                 setup_timeout.as_secs()
             );
-            match run_setup(&command, &canonical, setup_timeout).await {
+            match run_shell(&command, &canonical, setup_timeout, &[]).await {
                 Ok(()) => {
                     tracing::info!(
                         worktree = %canonical.display(),
@@ -1799,7 +1960,7 @@ fn resolve_setup(
     (command, std::time::Duration::from_secs(timeout_secs))
 }
 
-/// Failure from [`run_setup`]: carries a human-readable message (a stderr tail
+/// Failure from [`run_shell`]: carries a human-readable message (a stderr tail
 /// for a non-zero exit, or a timeout notice).
 #[derive(Debug)]
 struct SetupError {
@@ -1827,10 +1988,11 @@ impl std::fmt::Display for SetupError {
 /// - non-zero exit → `Err` carrying the captured stderr tail.
 /// - timeout       → child is killed; `Err("timed out after {secs}s")`.
 /// - success       → `Ok(())`.
-async fn run_setup(
+async fn run_shell(
     command: &str,
     cwd: &Path,
     timeout: std::time::Duration,
+    env: &[(&str, String)],
 ) -> std::result::Result<(), SetupError> {
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -1839,6 +2001,7 @@ async fn run_setup(
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
+        .envs(env.iter().map(|(k, v)| (*k, v)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1848,7 +2011,7 @@ async fn run_setup(
         Ok(c) => c,
         Err(e) => {
             return Err(SetupError {
-                message: format!("failed to spawn setup command: {e}"),
+                message: format!("failed to spawn command: {e}"),
             });
         }
     };
@@ -1861,7 +2024,7 @@ async fn run_setup(
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                tracing::debug!(worktree = %cwd.display(), "setup stdout: {line}");
+                tracing::debug!(worktree = %cwd.display(), "stdout: {line}");
             }
         })
     });
@@ -1874,7 +2037,7 @@ async fn run_setup(
             let mut lines: std::collections::VecDeque<String> = std::collections::VecDeque::new();
             let mut total_bytes: usize = 0;
             while let Ok(Some(line)) = reader.next_line().await {
-                tracing::debug!(worktree = %cwd.display(), "setup stderr: {line}");
+                tracing::debug!(worktree = %cwd.display(), "stderr: {line}");
                 total_bytes += line.len() + 1;
                 lines.push_back(line);
                 while lines.len() > SETUP_STDERR_MAX_LINES || total_bytes > SETUP_STDERR_MAX_BYTES {
@@ -2153,20 +2316,24 @@ mod tests {
                 delay: Duration::from_millis(5),
             }),
             backend_name: "Mock",
+            hooks: Vec::new(),
         }
     }
 
     /// Build a `Shared` over one or more temp-repo projects with a MockGh.
     /// The registry is built across all supplied projects.
     async fn make_shared_with(projects: Vec<ProjectRuntime>, gh: Arc<dyn GhRunner>) -> Arc<Shared> {
+        make_shared_with_config(projects, gh, Config::default()).await
+    }
+
+    /// `make_shared_with`, with an explicit global [`Config`] (for hook tests).
+    async fn make_shared_with_config(
+        projects: Vec<ProjectRuntime>,
+        gh: Arc<dyn GhRunner>,
+        config: Config,
+    ) -> Arc<Shared> {
         let (events, _rx) = broadcast::channel::<SupervisorMsg>(BROADCAST_CAP);
-        let shared = Arc::new(Shared {
-            projects: Mutex::new(projects),
-            registry: Mutex::new(Registry::empty()),
-            gh,
-            config: Config::default(),
-            events,
-        });
+        let shared = Arc::new(Shared::new(projects, gh, config, events));
         shared.rebuild_registry().await;
         shared
     }
@@ -3374,9 +3541,207 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn hook_fires_when_both_conditions_hold() {
+        let (_tmp, root) = make_temp_repo();
+        let cfg = Config {
+            hooks: vec![crate::hooks::HookRule {
+                name: Some("ship".to_string()),
+                status: Some("needs_review".to_string()),
+                pr_status: Some("checks_passing".to_string()),
+                run: "touch \"$KARAZHAN_WORKTREE/fired\"".to_string(),
+                timeout_seconds: Some(5),
+            }],
+            ..Config::default()
+        };
+        let shared = make_shared_with_config(
+            vec![make_runtime("proj", root.clone())],
+            Arc::new(MockGh::new(vec![])),
+            cfg,
+        )
+        .await;
+
+        let wt = root.join("wt-hook");
+        std::fs::create_dir_all(&wt).unwrap();
+        seed_worktree(&shared, &wt, false, None).await;
+
+        // Checks go green first: the agent is still Running, so nothing fires.
+        shared
+            .set_pr_status(&wt, PrStatus::ChecksPassing, None, None, None, None)
+            .await;
+        assert!(
+            !wt.join("fired").exists(),
+            "hook must not fire while only one condition holds"
+        );
+
+        // Agent finishes -> predicate flips false->true.
+        shared
+            .set_status(&wt, WorktreeStatus::NeedsReview, None, None)
+            .await;
+        assert!(
+            wait_for_file(&wt.join("fired"), Duration::from_secs(5)).await,
+            "hook did not run within 5s"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_does_not_refire_while_state_holds() {
+        let (_tmp, root) = make_temp_repo();
+        let cfg = Config {
+            hooks: vec![crate::hooks::HookRule {
+                name: None,
+                status: Some("needs_review".to_string()),
+                pr_status: None,
+                run: "echo x >> \"$KARAZHAN_WORKTREE/count\"".to_string(),
+                timeout_seconds: Some(5),
+            }],
+            ..Config::default()
+        };
+        let shared = make_shared_with_config(
+            vec![make_runtime("proj", root.clone())],
+            Arc::new(MockGh::new(vec![])),
+            cfg,
+        )
+        .await;
+
+        let wt = root.join("wt-edge");
+        std::fs::create_dir_all(&wt).unwrap();
+        seed_worktree(&shared, &wt, false, None).await;
+
+        shared
+            .set_status(&wt, WorktreeStatus::NeedsReview, None, None)
+            .await;
+        assert!(wait_for_file(&wt.join("count"), Duration::from_secs(5)).await);
+
+        // Two more transitions that leave the predicate TRUE throughout: a
+        // repeated set_status and a PR poll tick.  Neither is a rising edge.
+        shared
+            .set_status(&wt, WorktreeStatus::NeedsReview, None, None)
+            .await;
+        shared
+            .set_pr_status(&wt, PrStatus::ChecksPassing, None, None, None, None)
+            .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let runs = std::fs::read_to_string(wt.join("count")).unwrap();
+        assert_eq!(runs.lines().count(), 1, "hook re-fired: {runs:?}");
+    }
+
+    #[tokio::test]
+    async fn hook_receives_worktree_environment() {
+        let (_tmp, root) = make_temp_repo();
+        let cfg = Config {
+            hooks: vec![crate::hooks::HookRule {
+                name: Some("env".to_string()),
+                status: Some("needs_review".to_string()),
+                pr_status: None,
+                run: "printenv | grep ^KARAZHAN_ | sort > \"$KARAZHAN_WORKTREE/env\"".to_string(),
+                timeout_seconds: Some(5),
+            }],
+            ..Config::default()
+        };
+        let shared = make_shared_with_config(
+            vec![make_runtime("proj", root.clone())],
+            Arc::new(MockGh::new(vec![])),
+            cfg,
+        )
+        .await;
+
+        let wt = root.join("wt-env");
+        std::fs::create_dir_all(&wt).unwrap();
+        seed_worktree(&shared, &wt, false, Some(42)).await;
+        shared
+            .set_pr_status(&wt, PrStatus::ChecksPassing, Some(42), None, None, None)
+            .await;
+        shared
+            .set_status(&wt, WorktreeStatus::NeedsReview, None, None)
+            .await;
+        assert!(wait_for_file(&wt.join("env"), Duration::from_secs(5)).await);
+
+        let env = std::fs::read_to_string(wt.join("env")).unwrap();
+        for expected in [
+            format!("KARAZHAN_WORKTREE={}", wt.display()),
+            "KARAZHAN_PROJECT=proj".to_string(),
+            "KARAZHAN_BRANCH=feat".to_string(),
+            "KARAZHAN_STATUS=needs_review".to_string(),
+            "KARAZHAN_PR_STATUS=checks_passing".to_string(),
+            "KARAZHAN_PR_NUMBER=42".to_string(),
+            "KARAZHAN_HOOK=env".to_string(),
+        ] {
+            assert!(env.contains(&expected), "missing {expected} in:\n{env}");
+        }
+    }
+
+    #[tokio::test]
+    async fn failing_hook_does_not_change_worktree_status() {
+        let (_tmp, root) = make_temp_repo();
+        let cfg = Config {
+            hooks: vec![crate::hooks::HookRule {
+                name: Some("boom".to_string()),
+                status: Some("needs_review".to_string()),
+                pr_status: None,
+                run: "touch \"$KARAZHAN_WORKTREE/ran\"; exit 3".to_string(),
+                timeout_seconds: Some(5),
+            }],
+            ..Config::default()
+        };
+        let shared = make_shared_with_config(
+            vec![make_runtime("proj", root.clone())],
+            Arc::new(MockGh::new(vec![])),
+            cfg,
+        )
+        .await;
+
+        let wt = root.join("wt-fail");
+        std::fs::create_dir_all(&wt).unwrap();
+        seed_worktree(&shared, &wt, false, None).await;
+        shared
+            .set_status(&wt, WorktreeStatus::NeedsReview, None, None)
+            .await;
+        assert!(wait_for_file(&wt.join("ran"), Duration::from_secs(5)).await);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let reg = shared.registry.lock().await;
+        assert_eq!(
+            reg.worktrees.get(&wt).unwrap().status,
+            WorktreeStatus::NeedsReview,
+            "a failing hook must never rewrite the worktree status"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_hooks_configured_is_a_no_op() {
+        let (_tmp, root) = make_temp_repo();
+        let shared = make_shared(root.clone(), Arc::new(MockGh::new(vec![]))).await;
+        let wt = root.join("wt-none");
+        std::fs::create_dir_all(&wt).unwrap();
+        seed_worktree(&shared, &wt, false, None).await;
+        shared
+            .set_status(&wt, WorktreeStatus::NeedsReview, None, None)
+            .await;
+        let reg = shared.registry.lock().await;
+        assert_eq!(
+            reg.worktrees.get(&wt).unwrap().status,
+            WorktreeStatus::NeedsReview
+        );
+    }
+
+    /// Poll for `path` to appear, up to `limit`.  Hooks are spawned detached,
+    /// so the assertion cannot be made synchronously after the transition.
+    async fn wait_for_file(path: &Path, limit: Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if path.exists() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
     async fn run_setup_success_is_ok() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let r = run_setup("exit 0", dir.path(), Duration::from_secs(5)).await;
+        let r = run_shell("exit 0", dir.path(), Duration::from_secs(5), &[]).await;
         assert!(r.is_ok(), "expected Ok, got {r:?}");
     }
 
@@ -3384,7 +3749,13 @@ mod tests {
     #[cfg(unix)]
     async fn run_setup_nonzero_exit_carries_stderr() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let r = run_setup("echo boom 1>&2; exit 1", dir.path(), Duration::from_secs(5)).await;
+        let r = run_shell(
+            "echo boom 1>&2; exit 1",
+            dir.path(),
+            Duration::from_secs(5),
+            &[],
+        )
+        .await;
         match r {
             Err(e) => assert!(
                 e.message.contains("boom"),
@@ -3401,7 +3772,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let start = std::time::Instant::now();
         // `sleep 2` with a 150ms timeout must fail quickly (well under 2s).
-        let r = run_setup("sleep 2", dir.path(), Duration::from_millis(150)).await;
+        let r = run_shell("sleep 2", dir.path(), Duration::from_millis(150), &[]).await;
         let elapsed = start.elapsed();
         match r {
             Err(e) => assert!(
@@ -3413,7 +3784,7 @@ mod tests {
         }
         assert!(
             elapsed < Duration::from_millis(1500),
-            "run_setup should return promptly on timeout, took {elapsed:?}"
+            "run_shell should return promptly on timeout, took {elapsed:?}"
         );
     }
 
@@ -3423,7 +3794,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let marker = dir.path().join("setup-ran");
         // Write a marker file in the cwd; succeeds only if cwd is correct.
-        let r = run_setup("touch setup-ran", dir.path(), Duration::from_secs(5)).await;
+        let r = run_shell("touch setup-ran", dir.path(), Duration::from_secs(5), &[]).await;
         assert!(r.is_ok(), "expected Ok, got {r:?}");
         assert!(
             marker.exists(),

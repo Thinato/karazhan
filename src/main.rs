@@ -3,6 +3,7 @@ pub mod client;
 mod commands;
 mod config;
 pub mod daemon;
+mod hooks;
 pub mod ipc;
 mod pr_status_store;
 mod project_config;

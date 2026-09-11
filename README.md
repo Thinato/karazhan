@@ -14,6 +14,7 @@ raw transcript.
 - 🧑‍✈️ **Background daemon** — a supervisor owns the agent sessions and filesystem watcher; the TUI can quit and reattach while agents keep running.
 - 🔌 **Pluggable agent backend** — Claude Code headless CLI by default; automatic offline **Mock** fallback when `claude` isn't on `PATH`.
 - 🐙 **GitHub integration** — polls `gh` for PR state and CI; built-in commands compose context-rich prompts from open review comments or failing CI logs.
+- 🪝 **Hooks** — run any script when a worktree enters a state you care about (agent done + CI green → `~/scripts/ship.sh`).
 - 📂 **Multi-project** — register several repos and see all their worktrees in one grid, grouped by project.
 - ⌨️ **Vim-style navigation** + a `Ctrl-p` command palette for everything.
 
@@ -191,6 +192,61 @@ Commit the changes with a clear message referencing the comment thread.
 - `tags` (string array, optional) — for filtering.
 - `vars` (string array, optional) — variable placeholders (future use).
 - Everything after the closing `+++` is the prompt body sent to the agent.
+
+### Hooks
+
+Run a shell script whenever a worktree's state enters a condition you care
+about — "the agent finished **and** CI is green", say:
+
+```toml
+[[hooks]]
+name            = "ship-it"          # optional label (logs + $KARAZHAN_HOOK)
+status          = "needs_review"     # optional — agent-activity status
+pr_status       = "checks_passing"   # optional — PR/CI status
+run             = "~/scripts/x.sh"   # required — passed to `sh -c`
+timeout_seconds = 120                # optional, default 300
+```
+
+Every field you **specify** must match (AND); a field you leave out is a
+wildcard. Several `[[hooks]]` entries give you OR.
+
+A hook fires on the **edge** — the moment the condition goes from false to
+true — not on every poll tick, so a worktree that simply sits in
+`needs_review` does not re-run the script every 30 seconds.
+
+Because the agent-activity status and the PR/CI status are updated by
+different parts of karazhan, minutes apart and in either order, the condition
+is evaluated against the worktree's *current* state on every transition. It
+does not matter whether the agent finishes first or CI goes green first — the
+hook runs when both hold.
+
+| `status` | `pr_status` |
+|---|---|
+| `idle`, `running`, `needs_review`, `ci_failing`, `pr_merged`, `error` | `loading`, `no_pr`, `draft`, `open`, `checks_running`, `checks_failing`, `checks_passing`, `approved`, `merged`, `closed` |
+
+`[[hooks]]` is accepted in the global config **and** in a repo's
+`.karazhan/config.toml`; the two lists are concatenated, so both run. (Note
+that a project-scoped hook means a cloned repo can ship a command that runs on
+your machine — the same exposure `worktree.setup_command` already has.)
+
+The command runs with the worktree as its working directory, `stdin` closed,
+and its output logged to `.karazhan/` rather than the TUI. It is killed at the
+timeout. A hook that fails is logged and shown as an error in the UI, but never
+changes the worktree's status. These variables are exported:
+
+| Variable | Value |
+|---|---|
+| `KARAZHAN_WORKTREE` | Absolute path to the worktree |
+| `KARAZHAN_PROJECT` | Owning project name |
+| `KARAZHAN_BRANCH` | Branch name |
+| `KARAZHAN_STATUS` | New agent-activity status |
+| `KARAZHAN_PR_STATUS` | New PR/CI status |
+| `KARAZHAN_PR_NUMBER` | PR number (empty if none) |
+| `KARAZHAN_PR_URL` | PR URL (empty if none) |
+| `KARAZHAN_HOOK` | The hook's `name` |
+
+A hook with no condition at all, or with a misspelled status name, is skipped
+with a warning in the log — the rest of your config keeps working.
 
 ### State & logs
 
