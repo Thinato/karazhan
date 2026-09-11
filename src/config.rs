@@ -10,6 +10,7 @@ use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::hooks::HookRule;
 use crate::project_config::WorktreeSettings;
 use crate::worktree::WorktreeStatus;
 
@@ -135,6 +136,11 @@ pub struct Config {
     /// Global per-worktree setup defaults (`[worktree]` table).  Used as the
     /// fallback when a project does not set its own values.
     pub worktree: WorktreeSettings,
+
+    /// Global state-predicate hooks (`[[hooks]]`).  CONCATENATED with a
+    /// project's own hooks rather than overridden — hooks are additive rules,
+    /// not a single slot like `setup_command`.
+    pub hooks: Vec<HookRule>,
 }
 
 impl Default for Config {
@@ -151,6 +157,7 @@ impl Default for Config {
                 .to_string(),
             colors: ColorsConfig::default(),
             worktree: WorktreeSettings::default(),
+            hooks: Vec::new(),
         }
     }
 }
@@ -351,6 +358,38 @@ setup_timeout_seconds = 600
         let cfg: Config = toml::from_str(toml).expect("parse");
         assert_eq!(cfg.worktree.setup_command.as_deref(), Some("pnpm install"));
         assert_eq!(cfg.worktree.setup_timeout_seconds, Some(600));
+    }
+
+    // -----------------------------------------------------------------------
+    // Global [[hooks]] parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_global_hooks() {
+        let toml = r#"
+[[hooks]]
+name = "ship-it"
+status = "needs_review"
+pr_status = "checks_passing"
+run = "~/scripts/x.sh"
+timeout_seconds = 120
+
+[[hooks]]
+status = "error"
+run = "notify-send failed"
+"#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        assert_eq!(cfg.hooks.len(), 2);
+        assert_eq!(cfg.hooks[0].name.as_deref(), Some("ship-it"));
+        assert_eq!(cfg.hooks[0].pr_status.as_deref(), Some("checks_passing"));
+        assert_eq!(cfg.hooks[0].timeout_seconds, Some(120));
+        assert!(cfg.hooks[1].pr_status.is_none());
+    }
+
+    #[test]
+    fn config_without_hooks_still_parses() {
+        let cfg: Config = toml::from_str(r#"poll_interval_secs = 10"#).expect("parse");
+        assert!(cfg.hooks.is_empty());
     }
 
     #[test]
