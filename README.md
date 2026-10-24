@@ -93,7 +93,7 @@ Press `?` any time for the in-app keybinding overlay, or `Ctrl-p` for the comman
 | `o` / `y` / `Y` | Open PR in browser / copy PR URL / copy URL + title |
 | `R` | Resume session (recover an errored/interrupted run) |
 | `s` | Copy a `cd <worktree> && resume` shell command to debug it yourself |
-| `<` / `>` | Widen / narrow the detail pane by 5 cols (`Ctrl` for 1) |
+| `<` / `>` | Widen / narrow the terminal pane by 5% (`Ctrl` for 1%) |
 | `r` | Refresh the worktree list |
 
 ### Worktree status colors

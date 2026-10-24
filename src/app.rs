@@ -7,6 +7,9 @@ use crossterm::terminal::{
 };
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Style};
+use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
@@ -16,10 +19,10 @@ use crate::client::SupervisorClient;
 use crate::commands::{self, CommandId, NewWorktreeModal, Palette, WorktreeChoice};
 use crate::config::Config;
 use crate::ipc::{BuiltinKind, ClientMsg, ProjectInfo, WorktreeView};
-use crate::ui::detail::{split_grid_detail, DetailView};
 use crate::ui::grid::GridView;
 use crate::ui::keymap::{clamp_selection, Motion};
 use crate::ui::library::{LibraryMode, LibraryView, SelectedPrompt};
+use crate::ui::terminal::split_grid_pane;
 use crate::worktree::WorktreeStatus;
 
 #[derive(Debug)]
@@ -125,7 +128,6 @@ pub struct App {
     grid: GridView,
     grid_mode: GridMode,
     prompt_input: String,
-    detail: DetailView,
     /// Local cache of worktree views pushed by the daemon.
     worktrees: Vec<WorktreeView>,
     /// Authoritative ordered project list pushed by the daemon.  Drives grid
@@ -162,11 +164,11 @@ pub struct App {
     /// Monotonic counter advanced on every tick; drives the Running spinner
     /// animation.  Wraps harmlessly.
     spinner_frame: usize,
-    /// User-requested width (cols) of the Grid-view detail pane.  Adjustable with
-    /// `<`/`>` (±5) and `Ctrl-<`/`Ctrl->` (±1); clamped at use to [30, 80% term].
-    detail_width: u16,
-    /// Last rendered terminal width, captured each draw so width clamping in key
-    /// handlers (which have no frame) uses the current terminal size.
+    /// Width of the Grid-view terminal pane in percent of the terminal width.
+    /// Adjustable with `<`/`>` (±5) and `Ctrl-<`/`Ctrl->` (±1), within 10..=80.
+    pane_pct: u16,
+    /// Last rendered terminal width, captured each draw so the grid column math
+    /// in key handlers (which have no frame) matches the rendered split.
     last_term_width: u16,
 }
 
@@ -188,7 +190,6 @@ impl App {
             grid: GridView::new(),
             grid_mode: GridMode::Normal,
             prompt_input: String::new(),
-            detail: DetailView::new(),
             worktrees: Vec::new(),
             projects: Vec::new(),
             status_message: None,
@@ -202,7 +203,7 @@ impl App {
             pending_delete: None,
             confirm_new_worktree: None,
             spinner_frame: 0,
-            detail_width: crate::ui::detail::DEFAULT_DETAIL_WIDTH,
+            pane_pct: crate::ui::terminal::DEFAULT_PANE_PCT,
             last_term_width: 120,
         }
     }
@@ -218,13 +219,16 @@ impl App {
         while self.running {
             terminal.draw(|frame| {
                 let area = frame.area();
-                // Remember terminal width so key handlers (no frame) can clamp
-                // the detail-pane width against the live size.
+                // Remember terminal width so key handlers (no frame) compute the
+                // same grid split as the renderer.
                 self.last_term_width = area.width;
                 match self.view {
                     View::Library => self.library.render(frame),
                     View::Grid => {
-                        let (grid_area, detail_area) = split_grid_detail(area, self.detail_width);
+                        let [main, bar] =
+                            Layout::vertical([Constraint::Min(0), Constraint::Length(1)])
+                                .areas(area);
+                        let (grid_area, pane_area) = split_grid_pane(main, self.pane_pct);
 
                         // The grid groups by project NAME; derive the ordered
                         // name list from the ProjectInfo snapshot.
@@ -238,24 +242,11 @@ impl App {
                             self.spinner_frame,
                         );
 
-                        let selected_wt = self.worktrees.get(self.grid.selected);
-                        let summary = selected_wt.and_then(|wt| wt.last_summary.as_deref());
-                        let prompt_input = if self.grid_mode == GridMode::PromptInput {
-                            Some(self.prompt_input.as_str())
-                        } else {
-                            None
-                        };
-
-                        let status_text = self.build_status_text();
-
-                        self.detail.render(
-                            frame,
-                            detail_area,
-                            selected_wt,
-                            summary,
-                            prompt_input,
-                            Some(&status_text),
-                            self.spinner_frame,
+                        crate::ui::terminal::render_hint(frame, pane_area, "^a");
+                        frame.render_widget(
+                            Paragraph::new(self.build_status_text())
+                                .style(Style::default().fg(Color::DarkGray)),
+                            bar,
                         );
                     }
                 }
@@ -395,6 +386,12 @@ impl App {
         if self.grid_mode == GridMode::NameInput {
             return format!(
                 "[daemon]  rename worktree: {}█  Enter: save  Esc: cancel",
+                self.prompt_input
+            );
+        }
+        if self.grid_mode == GridMode::PromptInput {
+            return format!(
+                "[daemon]  prompt: {}█  Enter: run  Esc: cancel",
                 self.prompt_input
             );
         }
@@ -933,11 +930,11 @@ impl App {
             }
             CommandId::WidenDetail => {
                 self.view = View::Grid;
-                self.adjust_detail_width(5);
+                self.adjust_pane_pct(5);
             }
             CommandId::NarrowDetail => {
                 self.view = View::Grid;
-                self.adjust_detail_width(-5);
+                self.adjust_pane_pct(-5);
             }
             CommandId::CopyResumeCommand => {
                 self.view = View::Grid;
@@ -1100,14 +1097,12 @@ impl App {
             return;
         }
 
-        // Derive `cols` from the grid PANE width (not the full terminal width)
-        // so motion and render use the exact same column count.  The detail pane
-        // takes `effective_detail_width(...)` columns (the same value the renderer
-        // uses), so grid_width = terminal_width - detail_width, floored at CELL_W.
+        // Derive `cols` from the same split the renderer uses, so motion and
+        // render agree on the column count.
         let cols = {
-            let (term_w, _) = crossterm::terminal::size().unwrap_or((80, 24));
-            let detail_w = crate::ui::detail::effective_detail_width(term_w, self.detail_width);
-            let grid_w = term_w.saturating_sub(detail_w).max(crate::ui::grid::CELL_W);
+            let grid_w = split_grid_pane(Rect::new(0, 0, self.last_term_width, 1), self.pane_pct)
+                .0
+                .width;
             crate::ui::grid::GridView::cols_for_width(grid_w)
         };
 
@@ -1218,12 +1213,12 @@ impl App {
                 self.execute_command(CommandId::CopyResumeCommand).await;
             }
 
-            // Detail-pane resize.  `<` widens / `>` narrows by 5 cols; with Ctrl,
-            // by 1 col (fine).  `<` = wider (the divider moves left).
+            // Terminal-pane resize.  `<` widens / `>` narrows by 5%; with Ctrl,
+            // by 1% (fine).  `<` = wider (the divider moves left).
             KeyCode::Char('<') => {
                 self.grid.clear_pending_count();
                 if modifiers.contains(KeyModifiers::CONTROL) {
-                    self.adjust_detail_width(1);
+                    self.adjust_pane_pct(1);
                 } else {
                     self.execute_command(CommandId::WidenDetail).await;
                 }
@@ -1231,7 +1226,7 @@ impl App {
             KeyCode::Char('>') => {
                 self.grid.clear_pending_count();
                 if modifiers.contains(KeyModifiers::CONTROL) {
-                    self.adjust_detail_width(-1);
+                    self.adjust_pane_pct(-1);
                 } else {
                     self.execute_command(CommandId::NarrowDetail).await;
                 }
@@ -1301,13 +1296,10 @@ impl App {
         self.set_status("resuming session…");
     }
 
-    /// Nudge the detail-pane width by `delta` cols, clamped to
-    /// [30, 80% of the current terminal width].
-    fn adjust_detail_width(&mut self, delta: i32) {
-        let hi = crate::ui::detail::effective_detail_width(self.last_term_width, u16::MAX);
-        let new = (self.detail_width as i32 + delta).clamp(30, hi as i32) as u16;
-        self.detail_width = new;
-        self.set_status(format!("detail width: {new} cols"));
+    /// Nudge the terminal-pane width by `delta` percentage points, within 10..=80.
+    fn adjust_pane_pct(&mut self, delta: i16) {
+        self.pane_pct = (self.pane_pct as i16 + delta).clamp(10, 80) as u16;
+        self.set_status(format!("pane width: {}%", self.pane_pct));
     }
 
     async fn send_set_worktree_name(&mut self, name: String) {

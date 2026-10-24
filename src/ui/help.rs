@@ -127,7 +127,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ),
         kv(
             "< / >   ",
-            "widen / narrow the detail pane by 5 cols (Ctrl: 1 col)",
+            "widen / narrow the terminal pane by 5% (Ctrl: 1%)",
             key,
             desc,
         ),
