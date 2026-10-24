@@ -1508,12 +1508,10 @@ impl App {
     }
 
     /// A paste goes to the focused terminal (bracketed if the inner app asked
-    /// for it) or to the active text input; anywhere else it is dropped.
+    /// for it) or to the active text input; anywhere else it is dropped, so
+    /// pasted text never runs grid or library commands.
     async fn handle_paste(&mut self, text: String) {
-        if self.view != View::Grid {
-            return;
-        }
-        if self.focus == Focus::Term {
+        if self.view == View::Grid && self.focus == Focus::Term {
             let text = text.replace("\r\n", "\n").replace('\n', "\r");
             let bracketed = self
                 .term
@@ -1525,9 +1523,37 @@ impl App {
                 text
             };
             self.send_input(bytes.into_bytes()).await;
-        } else if matches!(self.grid_mode, GridMode::PromptInput | GridMode::NameInput) {
+        } else if self.key_text_input() {
+            // These inputs edit on keys: replay the paste as typed keys, and
+            // stop if one (e.g. Enter) closes the input.
+            for ch in text.replace("\r\n", "\n").chars() {
+                if !self.key_text_input() {
+                    break;
+                }
+                let code = match ch {
+                    '\n' | '\r' => KeyCode::Enter,
+                    ch => KeyCode::Char(ch),
+                };
+                let key = KeyEvent::new(code, KeyModifiers::NONE);
+                Box::pin(self.handle_crossterm_event(Event::Key(key))).await;
+            }
+        } else if self.view == View::Grid
+            && matches!(self.grid_mode, GridMode::PromptInput | GridMode::NameInput)
+        {
             self.prompt_input.push_str(&text);
         }
+    }
+
+    /// A text input that edits through key events is open.
+    fn key_text_input(&self) -> bool {
+        self.add_project_input.is_some()
+            || self.palette.is_some()
+            || self.new_worktree.is_some()
+            || (self.view == View::Library
+                && matches!(
+                    self.library.mode,
+                    LibraryMode::Filter | LibraryMode::NewPrompt
+                ))
     }
 
     /// Focus the terminal pane, but only onto a live session, so a dead pane
@@ -1738,15 +1764,34 @@ impl App {
                 cols,
                 bytes,
             } => {
-                // Accept the attached slot, or any slot as a pending create's reply.
+                // A pending create takes the first screen for its path as the
+                // reply; otherwise a mismatch is a desync (see `desynced`).
                 let Some((path, want)) = &self.attached else {
                     return;
                 };
-                if *path != worktree_path || want.is_some_and(|w| w != slot) {
+                if *path != worktree_path {
+                    if want.is_some() {
+                        self.desynced();
+                    }
                     return;
                 }
-                if want.is_none() {
-                    self.focus = Focus::Term;
+                match want {
+                    Some(w) if *w != slot => return self.desynced(),
+                    Some(_) => {}
+                    // Focus the new session unless an overlay or input owns keys.
+                    None => {
+                        let busy = self.view != View::Grid
+                            || self.grid_mode != GridMode::Normal
+                            || self.show_help
+                            || self.palette.is_some()
+                            || self.new_worktree.is_some()
+                            || self.add_project_input.is_some()
+                            || self.pending_delete.is_some()
+                            || self.confirm_new_worktree.is_some();
+                        if !busy {
+                            self.focus = Focus::Term;
+                        }
+                    }
                 }
                 let mut parser = vt100::Parser::new(rows, cols, 0);
                 parser.process(&bytes);
@@ -1759,10 +1804,15 @@ impl App {
                 slot,
                 bytes,
             } => {
-                if self.attached == Some((worktree_path, Some(slot))) {
-                    if let Some(term) = self.term.as_mut() {
-                        term.process(&bytes);
+                // During a pending create a diff is a stale frame: drop it.
+                match &self.attached {
+                    Some((path, Some(s))) if *path == worktree_path && *s == slot => {
+                        if let Some(term) = self.term.as_mut() {
+                            term.process(&bytes);
+                        }
                     }
+                    Some((_, Some(_))) => self.desynced(),
+                    _ => {}
                 }
             }
             AppEvent::TermSessions {
@@ -1804,6 +1854,15 @@ impl App {
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
+
+    /// A frame for another session arrived while attached: the daemon's view
+    /// and ours disagree (e.g. a stale screen was taken as a create reply).
+    /// Drop the attachment so `sync_attachment` re-sends `Attach`; frames for
+    /// that attach match, so this settles once in-flight frames drain.
+    fn desynced(&mut self) {
+        self.attached = None;
+        self.term = None;
+    }
 
     fn enter_grid_view(&mut self) {
         self.view = View::Grid;
@@ -2089,6 +2148,144 @@ mod tests {
         assert!(app.term.is_none());
         assert_eq!(app.focus, Focus::Nav);
         assert!(rx.try_recv().is_err(), "nothing is sent to a dead daemon");
+    }
+
+    fn diff(path: &Path, slot: u8) -> AppEvent {
+        AppEvent::TermDiff {
+            worktree_path: path.to_path_buf(),
+            slot,
+            bytes: b"x".to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn mismatched_frame_resyncs_without_looping() {
+        let (mut app, mut rx, path) = app_with_worktree();
+        attach(&mut app, &mut rx, &path, &[1, 2]).await;
+        app.handle_app_event(diff(&path, 2));
+        assert_eq!(app.attached, None, "a frame for slot 2 while on slot 1");
+        app.sync_attachment().await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::Term(TermCmd::Attach { slot: Some(1), .. }))
+        ));
+        app.handle_app_event(screen(&path, 1));
+        app.handle_app_event(diff(&path, 1));
+        app.sync_attachment().await;
+        assert!(rx.try_recv().is_err(), "the re-attach reply matches");
+        assert_eq!(app.attached, Some((path, Some(1))));
+        assert_eq!(app.focus, Focus::Term);
+    }
+
+    #[tokio::test]
+    async fn stale_screen_taken_as_create_reply_is_corrected() {
+        let (mut app, mut rx, path) = app_with_worktree();
+        attach(&mut app, &mut rx, &path, &[1]).await;
+        app.handle_key_action(KeyAction::Create).await;
+        rx.try_recv().unwrap();
+        app.handle_app_event(diff(&path, 1));
+        assert_eq!(
+            app.attached,
+            Some((path.clone(), None)),
+            "stale diff dropped"
+        );
+        // A stale slot-1 screen is taken as the reply, then slot 2's frame
+        // exposes it; the pane re-attaches and agrees with the daemon again.
+        app.handle_app_event(screen(&path, 1));
+        app.handle_app_event(diff(&path, 2));
+        app.handle_app_event(sessions(&path, &[1, 2]));
+        app.sync_attachment().await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::Term(TermCmd::Attach { slot: Some(_), .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_whose_shell_exited_settles_back_to_nav() {
+        let (mut app, mut rx, path) = app_with_worktree();
+        app.handle_key_action(KeyAction::Create).await;
+        rx.try_recv().unwrap();
+        // The shell exited before its first frame: the slot is already gone
+        // when the daemon's final screen arrives.
+        app.handle_app_event(sessions(&path, &[1]));
+        app.handle_app_event(sessions(&path, &[]));
+        app.handle_app_event(screen(&path, 1));
+        app.sync_attachment().await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::Term(TermCmd::Detach))
+        ));
+        assert_eq!(app.attached, None);
+        assert_eq!(app.focus, Focus::Nav);
+    }
+
+    #[tokio::test]
+    async fn create_reply_does_not_steal_focus_from_an_overlay() {
+        let (mut app, mut rx, path) = app_with_worktree();
+        app.handle_key_action(KeyAction::Create).await;
+        rx.try_recv().unwrap();
+        app.show_help = true;
+        app.handle_app_event(screen(&path, 1));
+        assert_eq!(app.attached, Some((path, Some(1))));
+        assert_eq!(app.focus, Focus::Nav);
+    }
+
+    #[tokio::test]
+    async fn paste_replays_into_key_inputs_and_stops_when_they_close() {
+        let (mut app, mut rx) = grid_app();
+        app.add_project_input = Some(String::new());
+        app.handle_crossterm_event(Event::Paste("/a b\nQ".into()))
+            .await;
+        match rx.try_recv() {
+            Ok(ClientMsg::AddProject { path }) => assert_eq!(path, PathBuf::from("/a b")),
+            other => panic!("expected AddProject, got {other:?}"),
+        }
+        assert!(app.add_project_input.is_none());
+        assert!(
+            app.running,
+            "the Q after Enter is not replayed into the grid"
+        );
+        assert!(rx.try_recv().is_err());
+
+        // Grid navigation never runs pasted text as commands.
+        app.handle_crossterm_event(Event::Paste("Q".into())).await;
+        assert!(app.running);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn pane_resize_keys_step_and_clamp() {
+        let (mut app, _rx) = grid_app();
+        let press = |ch, mods| Event::Key(KeyEvent::new(KeyCode::Char(ch), mods));
+        let none = KeyModifiers::NONE;
+        let ctrl = KeyModifiers::CONTROL;
+        assert_eq!(app.pane_pct, 60);
+        app.handle_crossterm_event(press('<', none)).await;
+        assert_eq!(app.pane_pct, 65);
+        app.handle_crossterm_event(press('>', none)).await;
+        assert_eq!(app.pane_pct, 60);
+        app.handle_crossterm_event(press('<', ctrl)).await;
+        assert_eq!(app.pane_pct, 61);
+        app.handle_crossterm_event(press('>', ctrl)).await;
+        assert_eq!(app.pane_pct, 60);
+        app.pane_pct = 78;
+        app.handle_crossterm_event(press('<', none)).await;
+        assert_eq!(app.pane_pct, 80);
+        app.pane_pct = 12;
+        app.handle_crossterm_event(press('>', none)).await;
+        assert_eq!(app.pane_pct, 10);
+        assert_eq!(app.status_message.as_deref(), Some("pane width: 10%"));
+    }
+
+    #[tokio::test]
+    async fn enter_with_live_session_focuses_term() {
+        let (mut app, mut rx, path) = app_with_worktree();
+        attach(&mut app, &mut rx, &path, &[1]).await;
+        app.focus = Focus::Nav;
+        app.handle_crossterm_event(Event::Key(key(KeyCode::Enter)))
+            .await;
+        assert_eq!(app.focus, Focus::Term);
     }
 
     #[tokio::test]
