@@ -8,6 +8,7 @@ pub mod ipc;
 mod pr_status_store;
 mod project_config;
 mod projects;
+mod pty;
 mod watcher;
 mod watcher_proc;
 
