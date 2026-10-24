@@ -6,6 +6,9 @@ use ratatui::{
     Frame,
 };
 
+use std::collections::HashSet;
+use std::path::PathBuf;
+
 use crate::ipc::WorktreeView;
 use crate::ui::spinner_glyph;
 use crate::worktree::{PrStatus, WorktreeStatus};
@@ -102,7 +105,8 @@ impl GridView {
     /// stack vertically in `projects` order.  Selection uses a FLAT index over
     /// the worktrees concatenated IN `projects` ORDER, so the highlight lands on
     /// the correct square within its group.  A zero-worktree project shows its
-    /// header plus a dim "(no worktrees)" line.
+    /// header plus a dim "(no worktrees)" line.  Worktrees in `attention`
+    /// (a bell in an unwatched terminal session) get a `◆` marker.
     pub fn render(
         &self,
         frame: &mut Frame,
@@ -110,6 +114,7 @@ impl GridView {
         projects: &[String],
         worktrees: &[WorktreeView],
         spinner_frame: usize,
+        attention: &HashSet<PathBuf>,
     ) {
         if projects.is_empty() {
             let msg = Paragraph::new(" No worktrees found.  Add a project with `A`.")
@@ -163,7 +168,14 @@ impl GridView {
 
                 let cell_area = Rect::new(x, cell_y, CELL_W, CELL_H);
                 let is_selected = flat == self.selected;
-                self.render_cell(frame, cell_area, wt, is_selected, spinner_frame);
+                self.render_cell(
+                    frame,
+                    cell_area,
+                    wt,
+                    is_selected,
+                    spinner_frame,
+                    attention.contains(&wt.path),
+                );
                 flat += 1;
             }
 
@@ -179,6 +191,7 @@ impl GridView {
         wt: &WorktreeView,
         selected: bool,
         spinner_frame: usize,
+        marked: bool,
     ) {
         let running = wt.status == WorktreeStatus::Running;
         let deleting = wt.status == WorktreeStatus::Deleting;
@@ -218,14 +231,16 @@ impl GridView {
         };
         // While active (Running/Deleting), prefix the name with an animated
         // spinner (reserving 2 cols for the glyph + space) so the user sees work.
+        // The attention marker reserves 2 more.
+        let name_w = inner_w.saturating_sub(2 * marked as usize);
         let name_label = if active {
             format!(
                 "{} {}",
                 spinner_glyph(spinner_frame),
-                truncate(&name_core, inner_w.saturating_sub(2))
+                truncate(&name_core, name_w.saturating_sub(2))
             )
         } else {
-            truncate(&name_core, inner_w)
+            truncate(&name_core, name_w)
         };
 
         // Line 2: prompt slug + PR number, with an optional unresolved-comment
@@ -296,6 +311,21 @@ impl GridView {
                 .fg(Color::LightRed)
                 .add_modifier(Modifier::BOLD)
         };
+        let marker_style = if selected {
+            Style::default()
+                .fg(Color::LightMagenta)
+                .bg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD)
+        };
+        let mut name_spans: Vec<Span> = Vec::new();
+        if marked {
+            name_spans.push(Span::styled("◆ ", marker_style));
+        }
+        name_spans.push(Span::styled(name_label, label_style));
         let mut meta_spans: Vec<Span> = vec![Span::styled(meta_base, label_style)];
         if let Some(badge) = unresolved_badge {
             meta_spans.push(Span::styled(badge, badge_style));
@@ -327,7 +357,7 @@ impl GridView {
 
         // Render the text lines inside the border.
         let lines: Vec<Line> = vec![
-            Line::from(Span::styled(name_label, label_style)),
+            Line::from(name_spans),
             Line::from(meta_spans),
             Line::from(line3),
         ];
@@ -668,6 +698,32 @@ pub(crate) mod tests {
 
     fn names(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn card_shows_attention_marker() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let wts = vec![wv("p", "rung"), wv("p", "quiet")];
+        let attention = HashSet::from([wts[0].path.clone()]);
+        let mut terminal = Terminal::new(TestBackend::new(CELL_W * 2, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                GridView::new().render(frame, frame.area(), &names(&["p"]), &wts, 0, &attention)
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let marked: Vec<(u16, u16)> = buf
+            .content()
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.symbol() == "◆")
+            .map(|(i, c)| {
+                assert_eq!(c.fg, Color::LightMagenta);
+                buf.pos_of(i)
+            })
+            .collect();
+        assert_eq!(marked.len(), 1, "only the rung card is marked");
+        assert!(marked[0].0 < CELL_W, "the marker is on the first card");
     }
 
     #[test]

@@ -377,6 +377,7 @@ impl App {
                             &project_names,
                             &self.worktrees,
                             self.spinner_frame,
+                            &self.attention,
                         );
 
                         let inner = Block::bordered().inner(pane_area);
