@@ -1115,8 +1115,11 @@ async fn handle_conn(
     .await;
     shared.pty.detach(&mut conn);
     reader.abort();
+    if let Err(e) = result {
+        tracing::debug!(client = req.client_pid, "daemon: write failed: {e}");
+    }
     tracing::info!(client = req.client_pid, "daemon: client disconnected");
-    result
+    Ok(())
 }
 
 /// The single writer of a connection.  Biased so control-plane broadcasts
@@ -1139,6 +1142,8 @@ async fn conn_loop(
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     // Dropped deltas: resync with a fresh full state.
                     tracing::warn!("daemon: client lagged {n} messages; resending snapshot");
+                    // Skip the stale backlog; the snapshot supersedes it.
+                    *sub = sub.resubscribe();
                     let projects = shared.project_infos().await;
                     let worktrees = shared.registry.lock().await.snapshot();
                     let snapshot = SupervisorMsg::Snapshot { projects, worktrees };
@@ -2995,6 +3000,46 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             }
         }
+        // The stale backlog is skipped, not replayed after the snapshot.
+        let stale = tokio::time::timeout(
+            Duration::from_millis(300),
+            ipc::read_frame_async::<_, SupervisorMsg>(&mut client),
+        )
+        .await;
+        assert!(stale.is_err(), "replayed after snapshot: {stale:?}");
+    }
+
+    #[tokio::test]
+    async fn write_failure_on_disconnect_is_not_an_error() {
+        let (_dir, root) = make_temp_repo();
+        let shared = make_shared(root, Arc::new(MockGh::new(vec![]))).await;
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+        let conn = tokio::spawn(handle_conn(Arc::clone(&shared), server, shutdown_tx));
+        ipc::write_frame_async(
+            &mut client,
+            &HandshakeReq {
+                protocol: ipc::PROTOCOL_VERSION,
+                client_pid: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let _: HandshakeResp = ipc::read_frame_async(&mut client).await.unwrap();
+        while shared.events.receiver_count() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        drop(client);
+        // Biased: the broadcast write (to a closed peer) goes before the EOF.
+        shared.broadcast(SupervisorMsg::Error {
+            worktree_path: None,
+            message: "x".into(),
+        });
+        let result = tokio::time::timeout(Duration::from_secs(10), conn)
+            .await
+            .expect("conn ends")
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
     }
 
     // -- Watcher PrStatusChanged → pr_status update + merge-edge auto-continue --

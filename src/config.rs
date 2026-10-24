@@ -171,6 +171,8 @@ impl Default for Config {
 /// letter of its Ctrl+letter chord.  Anything else logs a warning and falls
 /// back to `a`.  `h`, `i` and `m` are rejected: in legacy terminal mode Ctrl-h,
 /// Ctrl-i and Ctrl-m arrive as Backspace, Tab and Enter, so they never match.
+/// `c` and `p` are rejected too: Ctrl-C (quit) and Ctrl-P (palette) are
+/// handled before prefix routing.
 pub fn parse_prefix(s: &str) -> char {
     let lower = s.trim().to_ascii_lowercase();
     let rest = lower
@@ -179,7 +181,7 @@ pub fn parse_prefix(s: &str) -> char {
         .unwrap_or("");
     let mut chars = rest.chars();
     match (chars.next(), chars.next()) {
-        (Some(c), None) if c.is_ascii_lowercase() && !"him".contains(c) => c,
+        (Some(c), None) if c.is_ascii_lowercase() && !"himcp".contains(c) => c,
         _ => {
             warn!("config: invalid terminal_prefix {s:?}, using C-a");
             'a'
@@ -283,7 +285,9 @@ mod tests {
 
     #[test]
     fn bad_prefix_falls_back() {
-        for bad in ["", "a", "C-", "C-ab", "M-a", "C-1", "C-h", "ctrl-i", "C-m"] {
+        for bad in [
+            "", "a", "C-", "C-ab", "M-a", "C-1", "C-h", "ctrl-i", "C-m", "C-c", "ctrl-p",
+        ] {
             assert_eq!(parse_prefix(bad), 'a', "{bad:?}");
         }
     }

@@ -8,9 +8,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use nix::sys::signal::{killpg, Signal};
@@ -108,8 +109,14 @@ impl Conn {
             };
             tokio::time::sleep_until(view.next_at).await;
             let alive = view.frames.changed().await.is_ok() && !*view.frames.borrow();
-            if alive {
-                return view.frame();
+            // A session that ended before its first frame still sends one
+            // screen, so a pending create gets its reply.
+            if alive || view.last_sent.is_none() {
+                let frame = view.frame();
+                if !alive {
+                    self.view = None;
+                }
+                return frame;
             }
             self.view = None;
         }
@@ -119,7 +126,7 @@ impl Conn {
 impl View {
     /// A full screen on the first frame or after a resize, else a diff.
     fn frame(&mut self) -> SupervisorMsg {
-        let cur = self.session.state.lock().unwrap().parser.screen().clone();
+        let cur = lock(&self.session.state).parser.screen().clone();
         let worktree_path = self.session.path.clone();
         let slot = self.session.slot;
         let msg = match &self.last_sent {
@@ -150,6 +157,27 @@ fn term_error(worktree_path: PathBuf, message: impl Into<String>) -> SupervisorM
         worktree_path,
         message: message.into(),
     }
+}
+
+/// Lock ignoring poison: a panic elsewhere must not take every session down.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Run `f` on the parser, still under the session lock.  If vt100 panics,
+/// replace the parser with a blank `size` one so the screen stays usable.
+/// Returns whether `f` completed.
+fn guard_parser(
+    st: &mut State,
+    size: (u16, u16),
+    f: impl FnOnce(&mut vt100::Parser<BellCount>),
+) -> bool {
+    if catch_unwind(AssertUnwindSafe(|| f(&mut st.parser))).is_ok() {
+        return true;
+    }
+    tracing::warn!("pty: vt100 panicked; resetting the session screen");
+    st.parser = vt100::Parser::new_with_callbacks(size.0, size.1, 0, BellCount::default());
+    false
 }
 
 /// Clamp a client-supplied size so a bogus value cannot allocate a huge grid.
@@ -184,7 +212,7 @@ fn apply_size(st: &mut State, id: u64) -> bool {
         // before the session task closes it); TIOCSWINSZ reads a winsize.
         unsafe { nix::libc::ioctl(fd, nix::libc::TIOCSWINSZ as _, &ws) };
     }
-    st.parser.screen_mut().set_size(rows, cols);
+    guard_parser(st, (rows, cols), |p| p.screen_mut().set_size(rows, cols));
     true
 }
 
@@ -215,7 +243,7 @@ impl PtyHost {
             TermCmd::Input(bytes) => {
                 let session = &conn.view.as_ref()?.session;
                 let resized = {
-                    let mut st = session.state.lock().unwrap();
+                    let mut st = lock(&session.state);
                     st.owner = Some(conn.id);
                     apply_size(&mut st, conn.id)
                 };
@@ -232,7 +260,7 @@ impl PtyHost {
             TermCmd::Resize { rows, cols } => {
                 let session = &conn.view.as_ref()?.session;
                 let resized = {
-                    let mut st = session.state.lock().unwrap();
+                    let mut st = lock(&session.state);
                     st.viewers.insert(conn.id, clamp_size(rows, cols));
                     apply_size(&mut st, conn.id)
                 };
@@ -245,11 +273,7 @@ impl PtyHost {
                 worktree_path,
                 slot,
             } => {
-                let removed = self
-                    .sessions
-                    .lock()
-                    .unwrap()
-                    .remove(&(worktree_path.clone(), slot));
+                let removed = lock(&self.sessions).remove(&(worktree_path.clone(), slot));
                 let Some(session) = removed else {
                     return Some(term_error(worktree_path, format!("no session {slot}")));
                 };
@@ -271,12 +295,7 @@ impl PtyHost {
         let (rows, cols) = clamp_size(rows, cols);
         let session = match slot {
             Some(n) => {
-                let found = self
-                    .sessions
-                    .lock()
-                    .unwrap()
-                    .get(&(path.clone(), n))
-                    .cloned();
+                let found = lock(&self.sessions).get(&(path.clone(), n)).cloned();
                 match found {
                     Some(s) => s,
                     None => return Some(term_error(path, format!("no session {n}"))),
@@ -289,7 +308,7 @@ impl PtyHost {
         };
         self.detach(conn);
         let (resized, cleared) = {
-            let mut st = session.state.lock().unwrap();
+            let mut st = lock(&session.state);
             st.viewers.insert(conn.id, (rows, cols));
             st.owner.get_or_insert(conn.id);
             (
@@ -317,7 +336,7 @@ impl PtyHost {
     /// Stop viewing; call on every connection exit.
     pub fn detach(&self, conn: &mut Conn) {
         if let Some(view) = conn.view.take() {
-            view.session.state.lock().unwrap().viewers.remove(&conn.id);
+            lock(&view.session.state).viewers.remove(&conn.id);
         }
     }
 
@@ -325,7 +344,7 @@ impl PtyHost {
     /// and each session task reaps its shell in the background.
     pub fn kill_worktree(&self, path: &Path) {
         let mut killed = Vec::new();
-        self.sessions.lock().unwrap().retain(|(p, _), s| {
+        lock(&self.sessions).retain(|(p, _), s| {
             if p == path {
                 killed.push(Arc::clone(s));
             }
@@ -342,10 +361,7 @@ impl PtyHost {
 
     /// One `TermSessions` per worktree with live sessions (connect / lag resync).
     pub fn sessions_msgs(&self) -> Vec<SupervisorMsg> {
-        let mut paths: Vec<PathBuf> = self
-            .sessions
-            .lock()
-            .unwrap()
+        let mut paths: Vec<PathBuf> = lock(&self.sessions)
             .keys()
             .map(|(p, _)| p.clone())
             .collect();
@@ -354,12 +370,12 @@ impl PtyHost {
     }
 
     fn sessions_msg(&self, path: &Path) -> SupervisorMsg {
-        let map = self.sessions.lock().unwrap();
+        let map = lock(&self.sessions);
         let mut slots = Vec::new();
         let mut attention = false;
         for ((_, slot), s) in map.range(key_range(path)) {
             slots.push(*slot);
-            attention |= s.state.lock().unwrap().attention;
+            attention |= lock(&s.state).attention;
         }
         SupervisorMsg::TermSessions {
             worktree_path: path.to_path_buf(),
@@ -374,7 +390,7 @@ impl PtyHost {
 
     /// Spawn `$SHELL` in `path` in the lowest free slot.
     fn spawn(&self, path: &Path, rows: u16, cols: u16) -> Result<Arc<Session>, String> {
-        let mut map = self.sessions.lock().unwrap();
+        let mut map = lock(&self.sessions);
         let used: Vec<u8> = map.range(key_range(path)).map(|((_, s), _)| *s).collect();
         let slot = lowest_free_slot(&used).ok_or("max 9 sessions")?;
         let session = self
@@ -461,7 +477,7 @@ impl PtyHost {
     fn remove_if_same(&self, session: &Arc<Session>) {
         let key = (session.path.clone(), session.slot);
         let removed = {
-            let mut map = self.sessions.lock().unwrap();
+            let mut map = lock(&self.sessions);
             let same = map.get(&key).is_some_and(|s| Arc::ptr_eq(s, session));
             same && map.remove(&key).is_some()
         };
@@ -475,10 +491,11 @@ impl Session {
     /// Feed PTY output to the parser; broadcasts on the unwatched-bell edge.
     fn process(&self, host: &PtyHost, bytes: &[u8]) {
         let edge = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = lock(&self.state);
             let before = st.parser.callbacks().0;
-            st.parser.process(bytes);
-            let rang = st.parser.callbacks().0 != before;
+            let size = st.parser.screen().size();
+            let ok = guard_parser(&mut st, size, |p| p.process(bytes));
+            let rang = ok && st.parser.callbacks().0 != before;
             let edge = rang && st.viewers.is_empty() && !st.attention;
             st.attention |= edge;
             edge
@@ -538,15 +555,17 @@ async fn run_session(
         }
     };
 
+    // The foreground job, read while the master is still open.
+    let fg = tcgetpgrp(master.get_ref()).ok();
     if killed {
         // SIGHUP the foreground job and the shell's own group (the shell is a
         // session leader, so its pgid is its pid).
-        if let Ok(fg) = tcgetpgrp(master.get_ref()) {
+        if let Some(fg) = fg {
             let _ = killpg(fg, Signal::SIGHUP);
         }
         let _ = killpg(Pid::from_raw(session.pid as i32), Signal::SIGHUP);
     }
-    session.state.lock().unwrap().master = None;
+    lock(&session.state).master = None;
     // Closing the master hangs up the terminal.
     drop(master);
     if killed
@@ -554,6 +573,9 @@ async fn run_session(
             .await
             .is_err()
     {
+        if let Some(fg) = fg {
+            let _ = killpg(fg, Signal::SIGKILL);
+        }
         let _ = child.start_kill();
         let _ = child.wait().await;
     }
@@ -748,6 +770,58 @@ mod tests {
 
     fn is_alive(pid: Pid) -> bool {
         nix::sys::signal::kill(pid, None).is_ok()
+    }
+
+    #[test]
+    fn vt100_panic_resets_parser_without_poisoning() {
+        // A 1x1 grid (below the clamp floor) makes vt100 underflow on a wide char.
+        let st = Mutex::new(State {
+            parser: vt100::Parser::new_with_callbacks(1, 1, 0, BellCount::default()),
+            viewers: HashMap::new(),
+            owner: None,
+            attention: false,
+            master: None,
+        });
+        {
+            let mut g = lock(&st);
+            assert!(!guard_parser(&mut g, (3, 4), |p| p.process("漢漢".as_bytes())));
+            assert_eq!(g.parser.screen().size(), (3, 4));
+        }
+        assert!(!st.is_poisoned());
+        // A lock poisoned elsewhere is still usable.
+        let m = Mutex::new(1);
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _g = m.lock().unwrap();
+            panic!("poison");
+        }));
+        assert_eq!(*lock(&m), 1);
+    }
+
+    #[tokio::test]
+    async fn session_ending_before_first_frame_still_sends_a_screen() {
+        let (mut host, mut rx) = host();
+        host.shell = "/usr/bin/true".into();
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = Client::new();
+        let reply = c.send(
+            &host,
+            TermCmd::Attach {
+                worktree_path: dir.path().to_path_buf(),
+                slot: None,
+                rows: 10,
+                cols: 40,
+            },
+        );
+        assert!(reply.is_none());
+        let session = c.session();
+        // Let the shell exit before any frame is taken.
+        wait_until("session end", || ended(&session)).await;
+        while next_sessions(&mut rx).await.0 != Vec::<u8>::new() {}
+        assert!(matches!(
+            c.frame(WAIT).await,
+            Some(SupervisorMsg::TermScreen { slot: 1, .. })
+        ));
+        assert!(c.conn.view.is_none(), "the view ends after that screen");
     }
 
     #[test]
