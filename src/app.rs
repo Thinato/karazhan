@@ -1,6 +1,9 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+    KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -9,8 +12,9 @@ use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Paragraph};
 use ratatui::Terminal;
+use std::collections::{HashMap, HashSet};
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
@@ -18,11 +22,11 @@ use tokio::sync::mpsc;
 use crate::client::SupervisorClient;
 use crate::commands::{self, CommandId, NewWorktreeModal, Palette, WorktreeChoice};
 use crate::config::Config;
-use crate::ipc::{BuiltinKind, ClientMsg, ProjectInfo, WorktreeView};
+use crate::ipc::{BuiltinKind, ClientMsg, ProjectInfo, TermCmd, WorktreeView};
 use crate::ui::grid::GridView;
 use crate::ui::keymap::{clamp_selection, Motion};
 use crate::ui::library::{LibraryMode, LibraryView, SelectedPrompt};
-use crate::ui::terminal::split_grid_pane;
+use crate::ui::terminal::{key_to_bytes, split_grid_pane};
 use crate::worktree::WorktreeStatus;
 
 #[derive(Debug)]
@@ -74,7 +78,6 @@ pub enum AppEvent {
         unresolved_comments: Option<u64>,
     },
     /// Full screen of the attached terminal session (see `SupervisorMsg::TermScreen`).
-    #[allow(dead_code)] // rendered by the terminal pane
     TermScreen {
         worktree_path: PathBuf,
         slot: u8,
@@ -83,21 +86,18 @@ pub enum AppEvent {
         bytes: Vec<u8>,
     },
     /// Screen diff for the attached terminal session.
-    #[allow(dead_code)] // rendered by the terminal pane
     TermDiff {
         worktree_path: PathBuf,
         slot: u8,
         bytes: Vec<u8>,
     },
     /// Live terminal slots + bell attention for one worktree.
-    #[allow(dead_code)] // rendered by the terminal pane
     TermSessions {
         worktree_path: PathBuf,
         slots: Vec<u8>,
         attention: bool,
     },
     /// Per-connection terminal error.
-    #[allow(dead_code)] // rendered by the terminal pane
     TermError {
         worktree_path: PathBuf,
         message: String,
@@ -135,7 +135,6 @@ pub enum Focus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyAction {
     /// Forward the key to the PTY.
-    #[allow(dead_code)] // read once input reaches the PTY (phase d)
     Pty(KeyEvent),
     /// Forward a literal prefix key to the PTY (`prefix prefix`).
     PtyPrefix,
@@ -277,6 +276,20 @@ pub struct App {
     prefix_pending: bool,
     /// Letter of the Ctrl+letter terminal prefix (`a` → `^a`).
     prefix: char,
+    /// Live terminal slots per worktree (from `TermSessions`).
+    term_slots: HashMap<PathBuf, Vec<u8>>,
+    /// Worktrees whose unwatched session rang the bell.
+    attention: HashSet<PathBuf>,
+    /// Slot last viewed per worktree; reattached on reselect.
+    last_slot: HashMap<PathBuf, u8>,
+    /// Session this connection views; slot `None` = awaiting a create reply.
+    attached: Option<(PathBuf, Option<u8>)>,
+    /// Local emulator fed only with daemon-synthesised frames.
+    term: Option<vt100::Parser>,
+    /// Inner (rows, cols) of the terminal pane, captured each draw.
+    pane_inner: (u16, u16),
+    /// Size last sent to the daemon for the attached session.
+    sent_size: Option<(u16, u16)>,
 }
 
 impl App {
@@ -316,6 +329,13 @@ impl App {
             focus: Focus::Nav,
             prefix_pending: false,
             prefix,
+            term_slots: HashMap::new(),
+            attention: HashSet::new(),
+            last_slot: HashMap::new(),
+            attached: None,
+            term: None,
+            pane_inner: (24, 80),
+            sent_size: None,
         }
     }
 
@@ -333,6 +353,7 @@ impl App {
         let mut crossterm_events = EventStream::new();
 
         while self.running {
+            self.sync_attachment().await;
             terminal.draw(|frame| {
                 let area = frame.area();
                 // Remember terminal width so key handlers (no frame) compute the
@@ -358,7 +379,25 @@ impl App {
                             self.spinner_frame,
                         );
 
-                        crate::ui::terminal::render_hint(frame, pane_area, &self.prefix_label());
+                        let inner = Block::bordered().inner(pane_area);
+                        self.pane_inner = (inner.height, inner.width);
+                        match &self.attached {
+                            Some((path, slot)) => crate::ui::terminal::render_term(
+                                frame,
+                                pane_area,
+                                self.term.as_ref().map(|t| t.screen()),
+                                &crate::ui::terminal::pane_title(
+                                    self.term_slots.get(path).map_or(&[], Vec::as_slice),
+                                    *slot,
+                                ),
+                                self.focus == Focus::Term,
+                            ),
+                            None => crate::ui::terminal::render_hint(
+                                frame,
+                                pane_area,
+                                &self.prefix_label(),
+                            ),
+                        }
                         frame.render_widget(
                             Paragraph::new(self.build_status_text())
                                 .style(Style::default().fg(Color::DarkGray)),
@@ -424,6 +463,10 @@ impl App {
                     }
                 }
             }
+            // Coalesce queued daemon events (e.g. a burst of frames) into one draw.
+            while let Ok(event) = self.event_rx.try_recv() {
+                self.handle_app_event(event);
+            }
 
             // Open the external editor outside the select! so the EventStream's
             // stdin reader does not compete with the editor for terminal input.
@@ -460,7 +503,11 @@ impl App {
 
         // Leave the alternate screen + raw mode so the editor owns the terminal.
         let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
 
         let status = tokio::process::Command::new(program)
             .args(&extra_args)
@@ -473,7 +520,11 @@ impl App {
         // stale cells.  Rebuild the Terminal from a fresh backend so its buffers
         // are empty and sized to the current screen, then force a full repaint.
         let _ = enable_raw_mode();
-        let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+        let _ = execute!(
+            std::io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste
+        );
         if let Ok(new_terminal) = Terminal::new(CrosstermBackend::new(std::io::stdout())) {
             *terminal = new_terminal;
         }
@@ -522,6 +573,10 @@ impl App {
     // -----------------------------------------------------------------------
 
     async fn handle_crossterm_event(&mut self, event: Event) {
+        if let Event::Paste(text) = event {
+            self.handle_paste(text).await;
+            return;
+        }
         if let Event::Key(key) = event {
             // A focused terminal routes every key itself, ahead of Ctrl-C, so
             // Ctrl-C reaches the shell instead of quitting.
@@ -1396,20 +1451,122 @@ impl App {
             KeyAction::FocusTerm => self.focus_term(),
             // No sessions exist yet, so no slot is live.
             KeyAction::Select(n) => self.set_status(format!("no session {n}")),
-            // wired in phase (d)
-            KeyAction::Create | KeyAction::Kill | KeyAction::Pty(_) | KeyAction::PtyPrefix => {
-                self.set_status("terminal sessions not wired yet")
+            KeyAction::Create => {
+                let Some(path) = self.selected_worktree_path() else {
+                    self.set_status("no worktree selected");
+                    return;
+                };
+                let (rows, cols) = self.pane_inner;
+                self.client
+                    .send(ClientMsg::Term(TermCmd::Attach {
+                        worktree_path: path.clone(),
+                        slot: None,
+                        rows,
+                        cols,
+                    }))
+                    .await;
+                self.attached = Some((path, None));
+                self.term = None;
+                self.sent_size = Some(self.pane_inner);
+            }
+            KeyAction::Kill => self.set_status("terminal sessions not wired yet"),
+            KeyAction::Pty(key) => {
+                let app_cursor = self
+                    .term
+                    .as_ref()
+                    .is_some_and(|t| t.screen().application_cursor());
+                self.send_input(key_to_bytes(key, app_cursor)).await;
+            }
+            KeyAction::PtyPrefix => {
+                let prefix = KeyEvent::new(KeyCode::Char(self.prefix), KeyModifiers::CONTROL);
+                self.send_input(key_to_bytes(prefix, false)).await;
             }
             KeyAction::Nav(_) | KeyAction::Swallow => {}
         }
     }
 
+    async fn send_input(&mut self, bytes: Vec<u8>) {
+        if !bytes.is_empty() {
+            self.client
+                .send(ClientMsg::Term(TermCmd::Input(bytes)))
+                .await;
+        }
+    }
+
+    /// A paste goes to the focused terminal (bracketed if the inner app asked
+    /// for it) or to the active text input; anywhere else it is dropped.
+    async fn handle_paste(&mut self, text: String) {
+        if self.view != View::Grid {
+            return;
+        }
+        if self.focus == Focus::Term {
+            let text = text.replace("\r\n", "\n").replace('\n', "\r");
+            let bracketed = self
+                .term
+                .as_ref()
+                .is_some_and(|t| t.screen().bracketed_paste());
+            let bytes = if bracketed {
+                format!("\x1b[200~{text}\x1b[201~")
+            } else {
+                text
+            };
+            self.send_input(bytes.into_bytes()).await;
+        } else if matches!(self.grid_mode, GridMode::PromptInput | GridMode::NameInput) {
+            self.prompt_input.push_str(&text);
+        }
+    }
+
     /// Focus the terminal pane, but only onto a live session, so a dead pane
-    /// can never swallow Ctrl-C.  Sessions arrive in phase (d); until then the
-    /// guard always refuses.
+    /// can never swallow Ctrl-C.
     fn focus_term(&mut self) {
-        let msg = format!("no session — press {} c to create one", self.prefix_label());
-        self.set_status(msg);
+        if matches!(self.attached, Some((_, Some(_)))) {
+            self.focus = Focus::Term;
+        } else {
+            let msg = format!("no session — press {} c to create one", self.prefix_label());
+            self.set_status(msg);
+        }
+    }
+
+    /// Point this connection at the selected worktree's session (its last
+    /// viewed slot, else its lowest live one), and keep the daemon told of the
+    /// pane size.  Runs before every draw; never overrides a pending create.
+    async fn sync_attachment(&mut self) {
+        if matches!(self.attached, Some((_, None))) {
+            return;
+        }
+        let desired = self
+            .selected_worktree_path()
+            .filter(|_| self.view == View::Grid)
+            .and_then(|path| {
+                let slots = self.term_slots.get(&path)?;
+                let slot = self
+                    .last_slot
+                    .get(&path)
+                    .filter(|s| slots.contains(s))
+                    .or(slots.first())?;
+                Some((path, Some(*slot)))
+            });
+        let (rows, cols) = self.pane_inner;
+        if desired != self.attached {
+            let cmd = match &desired {
+                Some((path, slot)) => TermCmd::Attach {
+                    worktree_path: path.clone(),
+                    slot: *slot,
+                    rows,
+                    cols,
+                },
+                None => TermCmd::Detach,
+            };
+            self.client.send(ClientMsg::Term(cmd)).await;
+            self.sent_size = desired.as_ref().map(|_| self.pane_inner);
+            self.attached = desired;
+            self.term = None;
+        } else if self.attached.is_some() && self.sent_size != Some(self.pane_inner) {
+            self.client
+                .send(ClientMsg::Term(TermCmd::Resize { rows, cols }))
+                .await;
+            self.sent_size = Some(self.pane_inner);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1550,10 +1707,65 @@ impl App {
             }
             // Watcher-only variant the client never receives.
             AppEvent::PrStatusChanged { .. } => {}
-            AppEvent::TermScreen { .. }
-            | AppEvent::TermDiff { .. }
-            | AppEvent::TermSessions { .. }
-            | AppEvent::TermError { .. } => {}
+            AppEvent::TermScreen {
+                worktree_path,
+                slot,
+                rows,
+                cols,
+                bytes,
+            } => {
+                // Accept the attached slot, or any slot as a pending create's reply.
+                let Some((path, want)) = &self.attached else {
+                    return;
+                };
+                if *path != worktree_path || want.is_some_and(|w| w != slot) {
+                    return;
+                }
+                if want.is_none() {
+                    self.focus = Focus::Term;
+                }
+                let mut parser = vt100::Parser::new(rows, cols, 0);
+                parser.process(&bytes);
+                self.term = Some(parser);
+                self.last_slot.insert(worktree_path.clone(), slot);
+                self.attached = Some((worktree_path, Some(slot)));
+            }
+            AppEvent::TermDiff {
+                worktree_path,
+                slot,
+                bytes,
+            } => {
+                if self.attached == Some((worktree_path, Some(slot))) {
+                    if let Some(term) = self.term.as_mut() {
+                        term.process(&bytes);
+                    }
+                }
+            }
+            AppEvent::TermSessions {
+                worktree_path,
+                slots,
+                attention,
+            } => {
+                if attention {
+                    self.attention.insert(worktree_path.clone());
+                } else {
+                    self.attention.remove(&worktree_path);
+                }
+                if slots.is_empty() {
+                    self.term_slots.remove(&worktree_path);
+                } else {
+                    self.term_slots.insert(worktree_path, slots);
+                }
+            }
+            AppEvent::TermError {
+                worktree_path,
+                message,
+            } => {
+                if self.attached == Some((worktree_path, None)) {
+                    self.attached = None;
+                }
+                self.set_status(message);
+            }
         }
     }
 
@@ -1695,6 +1907,85 @@ mod tests {
             Some("no session — press ^a c to create one")
         );
         assert!(rx.try_recv().is_err(), "nothing is sent to the daemon");
+    }
+
+    /// A Grid app with one selected worktree at `/wt/p/a`.
+    fn app_with_worktree() -> (App, mpsc::Receiver<ClientMsg>, PathBuf) {
+        let (mut app, rx) = grid_app();
+        let wt = crate::ui::grid::tests::wv("p", "a");
+        let path = wt.path.clone();
+        app.worktrees = vec![wt];
+        (app, rx, path)
+    }
+
+    fn sessions(path: &Path, slots: &[u8]) -> AppEvent {
+        AppEvent::TermSessions {
+            worktree_path: path.to_path_buf(),
+            slots: slots.to_vec(),
+            attention: false,
+        }
+    }
+
+    fn screen(path: &Path, slot: u8) -> AppEvent {
+        AppEvent::TermScreen {
+            worktree_path: path.to_path_buf(),
+            slot,
+            rows: 24,
+            cols: 80,
+            bytes: b"hi".to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prefix_c_sends_create_then_focuses_on_reply() {
+        let (mut app, mut rx, path) = app_with_worktree();
+        app.handle_crossterm_event(Event::Key(ctrl('a'))).await;
+        app.handle_crossterm_event(Event::Key(key(KeyCode::Char('c'))))
+            .await;
+        match rx.try_recv() {
+            Ok(ClientMsg::Term(TermCmd::Attach {
+                worktree_path,
+                slot: None,
+                ..
+            })) => assert_eq!(worktree_path, path),
+            other => panic!("expected a create Attach, got {other:?}"),
+        }
+        assert_eq!(app.focus, Focus::Nav, "focus waits for the reply");
+
+        app.handle_app_event(screen(&path, 1));
+        assert_eq!(app.focus, Focus::Term);
+        assert_eq!(app.attached, Some((path.clone(), Some(1))));
+        assert_eq!(app.last_slot.get(&path), Some(&1));
+        assert!(app
+            .term
+            .as_ref()
+            .unwrap()
+            .screen()
+            .contents()
+            .starts_with("hi"));
+    }
+
+    #[tokio::test]
+    async fn pending_create_not_detached_by_sync() {
+        let (mut app, mut rx, path) = app_with_worktree();
+        app.handle_key_action(KeyAction::Create).await;
+        rx.try_recv().unwrap();
+        // The daemon broadcasts the new slot before the first frame.
+        app.handle_app_event(sessions(&path, &[1]));
+        app.sync_attachment().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "sync must not touch a pending create"
+        );
+        assert_eq!(app.attached, Some((path.clone(), None)));
+
+        app.handle_app_event(screen(&path, 1));
+        app.sync_attachment().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "already attached to the desired slot"
+        );
+        assert_eq!(app.attached, Some((path, Some(1))));
     }
 
     #[tokio::test]

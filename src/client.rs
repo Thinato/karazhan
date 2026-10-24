@@ -557,4 +557,89 @@ mod tests {
             other => panic!("expected DaemonError, got {other:?}"),
         }
     }
+
+    #[test]
+    fn term_screen_maps_to_app_term_screen() {
+        let event = supervisor_msg_to_app_event(SupervisorMsg::TermScreen {
+            worktree_path: PathBuf::from("/wt"),
+            slot: 2,
+            rows: 24,
+            cols: 80,
+            bytes: b"\x1b[H".to_vec(),
+        });
+        match event {
+            AppEvent::TermScreen {
+                worktree_path,
+                slot,
+                rows,
+                cols,
+                bytes,
+            } => {
+                assert_eq!(worktree_path, PathBuf::from("/wt"));
+                assert_eq!((slot, rows, cols), (2, 24, 80));
+                assert_eq!(bytes, b"\x1b[H");
+            }
+            other => panic!("expected TermScreen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn term_diff_maps_to_app_term_diff() {
+        let event = supervisor_msg_to_app_event(SupervisorMsg::TermDiff {
+            worktree_path: PathBuf::from("/wt"),
+            slot: 3,
+            bytes: b"x".to_vec(),
+        });
+        match event {
+            AppEvent::TermDiff {
+                worktree_path,
+                slot,
+                bytes,
+            } => {
+                assert_eq!(worktree_path, PathBuf::from("/wt"));
+                assert_eq!(slot, 3);
+                assert_eq!(bytes, b"x");
+            }
+            other => panic!("expected TermDiff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn term_sessions_maps_to_app_term_sessions() {
+        let event = supervisor_msg_to_app_event(SupervisorMsg::TermSessions {
+            worktree_path: PathBuf::from("/wt"),
+            slots: vec![1, 3],
+            attention: true,
+        });
+        match event {
+            AppEvent::TermSessions {
+                worktree_path,
+                slots,
+                attention,
+            } => {
+                assert_eq!(worktree_path, PathBuf::from("/wt"));
+                assert_eq!(slots, vec![1, 3]);
+                assert!(attention);
+            }
+            other => panic!("expected TermSessions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn term_error_maps_to_app_term_error() {
+        let event = supervisor_msg_to_app_event(SupervisorMsg::TermError {
+            worktree_path: PathBuf::from("/wt"),
+            message: "max 9 sessions".into(),
+        });
+        match event {
+            AppEvent::TermError {
+                worktree_path,
+                message,
+            } => {
+                assert_eq!(worktree_path, PathBuf::from("/wt"));
+                assert_eq!(message, "max 9 sessions");
+            }
+            other => panic!("expected TermError, got {other:?}"),
+        }
+    }
 }

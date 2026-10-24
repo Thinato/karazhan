@@ -26,6 +26,7 @@ mod ui;
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
+    event::{DisableBracketedPaste, EnableBracketedPaste},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -59,7 +60,7 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
         Ok(Self)
     }
 }
@@ -68,7 +69,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         // Best-effort restore — ignore errors during teardown.
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
     }
 }
 
@@ -78,7 +79,7 @@ fn install_panic_hook() {
         // Restore terminal before printing the panic message so the user's
         // shell is not left in raw / alternate-screen mode.
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
         default_hook(info);
     }));
 }

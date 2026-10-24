@@ -3,10 +3,12 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Alignment, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
     Frame,
 };
+
+use tui_term::widget::PseudoTerminal;
 
 use crate::ui::grid::CELL_W;
 
@@ -58,10 +60,52 @@ pub fn render_hint(frame: &mut Frame, area: Rect, prefix: &str) {
     frame.render_widget(hint, area);
 }
 
+/// Pane title listing the live slots, the active one bracketed: `[1] 2 3`.
+pub fn pane_title(slots: &[u8], active: Option<u8>) -> String {
+    let names: Vec<String> = slots
+        .iter()
+        .map(|&s| {
+            if Some(s) == active {
+                format!("[{s}]")
+            } else {
+                s.to_string()
+            }
+        })
+        .collect();
+    names.join(" ")
+}
+
+/// Render the attached session's screen (`None` until its first frame).  The
+/// border is highlighted while the pane has focus.
+pub fn render_term(
+    frame: &mut Frame,
+    area: Rect,
+    screen: Option<&vt100::Screen>,
+    title: &str,
+    focused: bool,
+) {
+    let border = if focused {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let block = Block::default()
+        .title(format!(" {title} "))
+        .title_alignment(Alignment::Center)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border);
+    match screen {
+        Some(screen) => frame.render_widget(PseudoTerminal::new(screen).block(block), area),
+        None => frame.render_widget(block, area),
+    }
+}
+
 /// Encode a key as the bytes an xterm sends for it.  `app_cursor` is the
 /// inner app's application-cursor mode (DECCKM), which switches unmodified
 /// arrows and Home/End from `ESC [` to `ESC O`.
-#[allow(dead_code)] // used by the Pty route in phase (d)
 pub fn key_to_bytes(key: KeyEvent, app_cursor: bool) -> Vec<u8> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -154,6 +198,13 @@ mod tests {
         for (key, app_cursor, want) in cases {
             assert_eq!(key_to_bytes(*key, *app_cursor), *want, "{key:?}");
         }
+    }
+
+    #[test]
+    fn pane_title_marks_active() {
+        assert_eq!(pane_title(&[1, 2, 3], Some(1)), "[1] 2 3");
+        assert_eq!(pane_title(&[1, 2, 3], Some(3)), "1 2 [3]");
+        assert_eq!(pane_title(&[2, 5], None), "2 5");
     }
 
     #[test]

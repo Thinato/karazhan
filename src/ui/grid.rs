@@ -636,11 +636,11 @@ fn truncate(s: &str, max: usize) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn wv(project: &str, name: &str) -> WorktreeView {
+    pub(crate) fn wv(project: &str, name: &str) -> WorktreeView {
         let now = chrono::Utc::now();
         WorktreeView {
             path: PathBuf::from(format!("/wt/{project}/{name}")),
