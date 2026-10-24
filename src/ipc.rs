@@ -52,7 +52,7 @@ use crate::worktree::model::{PrStatus, Worktree, WorktreeStatus};
 /// the handshake request and a `ProtocolMismatch` reply even when every other
 /// wire-format item has changed. Do NOT reorder these two; only append new
 /// variants after `ProtocolMismatch`.
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Maximum frame body size accepted by `read_frame_async` (64 MiB).
 const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
@@ -239,6 +239,34 @@ pub enum ClientMsg {
     },
     /// Ask the daemon to stop.
     Shutdown,
+    /// Embedded terminal pane command (see [`TermCmd`]).
+    Term(TermCmd),
+}
+
+/// Terminal-session commands.  Sessions are keyed by worktree + slot (1–9);
+/// each connection views at most one session at a time.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum TermCmd {
+    /// View a session, replacing any prior attachment on this connection.
+    /// `slot: None` creates a new session in the lowest free slot.
+    Attach {
+        worktree_path: PathBuf,
+        slot: Option<u8>,
+        rows: u16,
+        cols: u16,
+    },
+    Detach,
+    /// Bytes for the attached session's PTY.
+    Input(Vec<u8>),
+    /// This connection's pane size for the attached session.
+    Resize {
+        rows: u16,
+        cols: u16,
+    },
+    Kill {
+        worktree_path: PathBuf,
+        slot: u8,
+    },
 }
 
 // ── SupervisorMsg ─────────────────────────────────────────────────────────────
@@ -269,6 +297,33 @@ pub enum SupervisorMsg {
     /// Non-fatal error (gh failures, etc.) surfaced to the client status line.
     Error {
         worktree_path: Option<PathBuf>,
+        message: String,
+    },
+    /// Full screen of the attached session (vt100 `state_formatted`); the
+    /// client resets its parser to `rows`×`cols` before feeding `bytes`.
+    TermScreen {
+        worktree_path: PathBuf,
+        slot: u8,
+        rows: u16,
+        cols: u16,
+        bytes: Vec<u8>,
+    },
+    /// Changes since the previous frame (vt100 `state_diff`).
+    TermDiff {
+        worktree_path: PathBuf,
+        slot: u8,
+        bytes: Vec<u8>,
+    },
+    /// Broadcast: the live slots of a worktree and whether an unwatched
+    /// session rang the bell.
+    TermSessions {
+        worktree_path: PathBuf,
+        slots: Vec<u8>,
+        attention: bool,
+    },
+    /// Per-connection terminal error ("max 9 sessions", "no session N", ...).
+    TermError {
+        worktree_path: PathBuf,
         message: String,
     },
 }
@@ -598,8 +653,8 @@ mod tests {
     // ── Protocol version + frozen wire format ─────────────────────────────────
 
     #[test]
-    fn protocol_version_is_seventeen() {
-        assert_eq!(PROTOCOL_VERSION, 17);
+    fn protocol_version_is_eighteen() {
+        assert_eq!(PROTOCOL_VERSION, 18);
     }
 
     #[test]
@@ -815,6 +870,81 @@ mod tests {
         rt(&SupervisorMsg::Error {
             worktree_path: None,
             message: "daemon internal error".into(),
+        });
+    }
+
+    // ── Terminal pane variants ────────────────────────────────────────────────
+
+    #[test]
+    fn client_msg_term_variants() {
+        let wt = PathBuf::from("/repo/wt");
+        for cmd in [
+            TermCmd::Attach {
+                worktree_path: wt.clone(),
+                slot: None,
+                rows: 24,
+                cols: 80,
+            },
+            TermCmd::Attach {
+                worktree_path: wt.clone(),
+                slot: Some(3),
+                rows: 50,
+                cols: 150,
+            },
+            TermCmd::Detach,
+            TermCmd::Input(b"ls\r\x01\xe2\x82\xac".to_vec()),
+            TermCmd::Resize {
+                rows: 37,
+                cols: 101,
+            },
+            TermCmd::Kill {
+                worktree_path: wt.clone(),
+                slot: 9,
+            },
+        ] {
+            rt(&ClientMsg::Term(cmd));
+        }
+    }
+
+    #[test]
+    fn supervisor_msg_term_screen() {
+        rt(&SupervisorMsg::TermScreen {
+            worktree_path: PathBuf::from("/repo/wt"),
+            slot: 1,
+            rows: 24,
+            cols: 80,
+            bytes: b"\x1b[H\x1b[Jhello".to_vec(),
+        });
+    }
+
+    #[test]
+    fn supervisor_msg_term_diff() {
+        rt(&SupervisorMsg::TermDiff {
+            worktree_path: PathBuf::from("/repo/wt"),
+            slot: 2,
+            bytes: b"\x1b[3;4Hx".to_vec(),
+        });
+    }
+
+    #[test]
+    fn supervisor_msg_term_sessions() {
+        rt(&SupervisorMsg::TermSessions {
+            worktree_path: PathBuf::from("/repo/wt"),
+            slots: vec![1, 3, 9],
+            attention: true,
+        });
+        rt(&SupervisorMsg::TermSessions {
+            worktree_path: PathBuf::from("/repo/wt"),
+            slots: vec![],
+            attention: false,
+        });
+    }
+
+    #[test]
+    fn supervisor_msg_term_error() {
+        rt(&SupervisorMsg::TermError {
+            worktree_path: PathBuf::from("/repo/wt"),
+            message: "max 9 sessions".into(),
         });
     }
 
