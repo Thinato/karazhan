@@ -48,6 +48,7 @@ use crate::ipc::{self, BuiltinKind, ClientMsg, HandshakeReq, HandshakeResp, Supe
 use crate::pr_status_store;
 use crate::project_config::{ProjectConfig, WorktreeSettings};
 use crate::projects;
+use crate::pty::{self, PtyHost};
 use crate::worktree::model::PrStatus;
 use crate::worktree::{state, WorktreeManager, WorktreeStatus};
 
@@ -161,6 +162,8 @@ pub struct Shared {
     pub events: broadcast::Sender<SupervisorMsg>,
     /// Validated global `[[hooks]]`, concatenated with each project's own.
     pub hooks: Vec<Hook>,
+    /// Embedded terminal sessions.
+    pub pty: PtyHost,
 }
 
 impl Shared {
@@ -177,6 +180,7 @@ impl Shared {
             registry: Mutex::new(Registry::empty()),
             gh,
             config,
+            pty: PtyHost::new(events.clone()),
             events,
             hooks,
         }
@@ -1084,46 +1088,89 @@ async fn handle_conn(
     // Subscribe to the broadcast AFTER the handshake snapshot so the client's
     // baseline is the snapshot and every later delta is delivered exactly once.
     let mut sub = shared.events.subscribe();
+    for msg in shared.pty.sessions_msgs() {
+        ipc::write_frame_async(&mut write_half, &msg).await?;
+    }
 
+    // The only reader of the socket, so `read_frame_async` is never cancelled
+    // mid-frame.  EOF / read error closes `cmd_rx`.
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientMsg>(64);
+    let reader = tokio::spawn(async move {
+        while let Ok(msg) = ipc::read_frame_async::<_, ClientMsg>(&mut read_half).await {
+            if cmd_tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut conn = pty::Conn::default();
+    let result = conn_loop(
+        &shared,
+        &mut write_half,
+        &mut sub,
+        &mut cmd_rx,
+        &mut conn,
+        &shutdown_tx,
+    )
+    .await;
+    shared.pty.detach(&mut conn);
+    reader.abort();
+    tracing::info!(client = req.client_pid, "daemon: client disconnected");
+    result
+}
+
+/// The single writer of a connection.  Biased so control-plane broadcasts
+/// always go before terminal frames.
+async fn conn_loop(
+    shared: &Arc<Shared>,
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    sub: &mut broadcast::Receiver<SupervisorMsg>,
+    cmd_rx: &mut mpsc::Receiver<ClientMsg>,
+    conn: &mut pty::Conn,
+    shutdown_tx: &mpsc::Sender<()>,
+) -> Result<()> {
     loop {
         tokio::select! {
-            // Client → daemon command.
-            incoming = ipc::read_frame_async::<_, ClientMsg>(&mut read_half) => {
-                match incoming {
-                    Ok(msg) => {
-                        let is_shutdown = matches!(msg, ClientMsg::Shutdown);
-                        handle_client_msg(&shared, msg).await;
-                        if is_shutdown {
-                            // Signal the serve() loop to exit the process.
-                            let _ = shutdown_tx.send(()).await;
-                            return Ok(());
-                        }
-                    }
-                    Err(e) => {
-                        // EOF / read error → client disconnected; daemon lives on.
-                        tracing::info!(client = req.client_pid, "daemon: client disconnected: {e}");
-                        return Ok(());
-                    }
-                }
-            }
+            biased;
 
             // Daemon → client delta.
-            broadcasted = sub.recv() => {
-                match broadcasted {
-                    Ok(msg) => {
-                        if ipc::write_frame_async(&mut write_half, &msg).await.is_err() {
-                            tracing::info!(client = req.client_pid, "daemon: write failed; dropping client");
-                            return Ok(());
-                        }
+            broadcasted = sub.recv() => match broadcasted {
+                Ok(msg) => ipc::write_frame_async(write_half, &msg).await?,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    // Dropped deltas: resync with a fresh full state.
+                    tracing::warn!("daemon: client lagged {n} messages; resending snapshot");
+                    let projects = shared.project_infos().await;
+                    let worktrees = shared.registry.lock().await.snapshot();
+                    let snapshot = SupervisorMsg::Snapshot { projects, worktrees };
+                    ipc::write_frame_async(write_half, &snapshot).await?;
+                    for msg in shared.pty.sessions_msgs() {
+                        ipc::write_frame_async(write_half, &msg).await?;
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(client = req.client_pid, "daemon: client lagged {n} messages");
+                }
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            },
+
+            // Client → daemon command.
+            cmd = cmd_rx.recv() => match cmd {
+                None => return Ok(()),
+                Some(ClientMsg::Term(cmd)) => {
+                    if let Some(reply) = shared.pty.handle(conn, cmd) {
+                        ipc::write_frame_async(write_half, &reply).await?;
                     }
-                    Err(broadcast::error::RecvError::Closed) => {
+                }
+                Some(msg) => {
+                    let is_shutdown = matches!(msg, ClientMsg::Shutdown);
+                    handle_client_msg(shared, msg).await;
+                    if is_shutdown {
+                        // Signal the serve() loop to exit the process.
+                        let _ = shutdown_tx.send(()).await;
                         return Ok(());
                     }
                 }
-            }
+            },
+
+            // Attached terminal session → frame (gated, coalesced).
+            frame = conn.next_frame() => ipc::write_frame_async(write_half, &frame).await?,
         }
     }
 }
@@ -1198,6 +1245,8 @@ async fn handle_client_msg(shared: &Arc<Shared>, msg: ClientMsg) {
         ClientMsg::Shutdown => {
             // Handled by the caller (signals serve() to exit); nothing here.
         }
+        // Per-connection: handled by handle_conn via `shared.pty`.
+        ClientMsg::Term(_) => {}
     }
 }
 
@@ -1863,6 +1912,11 @@ async fn remove_worktree(shared: &Arc<Shared>, path: &Path, _force: bool) {
             None,
         )
         .await;
+    // Fire-and-forget: frees the slots now, shells are reaped in the background.
+    shared.pty.kill_worktree(path);
+    if let Ok(canonical) = path.canonicalize() {
+        shared.pty.kill_worktree(&canonical);
+    }
 
     // The manager handles git + fs removal (always force per the spec).  This is
     // blocking I/O (git subprocess + recursive directory delete), so run it on
@@ -2323,16 +2377,18 @@ mod tests {
     /// Build a `Shared` over one or more temp-repo projects with a MockGh.
     /// The registry is built across all supplied projects.
     async fn make_shared_with(projects: Vec<ProjectRuntime>, gh: Arc<dyn GhRunner>) -> Arc<Shared> {
-        make_shared_with_config(projects, gh, Config::default()).await
+        make_shared_with_config(projects, gh, Config::default(), BROADCAST_CAP).await
     }
 
-    /// `make_shared_with`, with an explicit global [`Config`] (for hook tests).
+    /// `make_shared_with`, with an explicit global [`Config`] (for hook tests)
+    /// and broadcast capacity (for lag tests).
     async fn make_shared_with_config(
         projects: Vec<ProjectRuntime>,
         gh: Arc<dyn GhRunner>,
         config: Config,
+        cap: usize,
     ) -> Arc<Shared> {
-        let (events, _rx) = broadcast::channel::<SupervisorMsg>(BROADCAST_CAP);
+        let (events, _rx) = broadcast::channel::<SupervisorMsg>(cap);
         let shared = Arc::new(Shared::new(projects, gh, config, events));
         shared.rebuild_registry().await;
         shared
@@ -2800,7 +2856,7 @@ mod tests {
     // -- RemoveWorktree -------------------------------------------------------
 
     #[tokio::test]
-    async fn remove_worktree_disappears_from_registry_and_git() {
+    async fn remove_worktree_kills_sessions() {
         let (_dir, root) = make_temp_repo();
         let wt_dir = tempfile::tempdir().expect("wt tempdir");
         let gh: Arc<dyn GhRunner> = Arc::new(MockGh::new(vec![]));
@@ -2827,7 +2883,28 @@ mod tests {
         // just spawns this as a detached task so the connection loop stays
         // responsive; awaiting it here keeps the assertion deterministic while
         // still exercising the full git + fs + registry teardown path.)
+        let mut conn = pty::Conn::default();
+        for _ in 0..2 {
+            let attach = ipc::TermCmd::Attach {
+                worktree_path: canonical.clone(),
+                slot: None,
+                rows: 24,
+                cols: 80,
+            };
+            assert!(shared.pty.handle(&mut conn, attach).is_none());
+        }
+        assert_eq!(shared.pty.sessions_msgs().len(), 1);
+        let start = std::time::Instant::now();
         remove_worktree(&shared, &canonical, true).await;
+        // Sessions are gone at once; the kill's 2 s reap grace is not awaited.
+        assert!(
+            shared.pty.sessions_msgs().is_empty(),
+            "sessions survived removal"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "removal waited on the kill"
+        );
 
         // Registry must no longer contain the worktree.
         {
@@ -2856,6 +2933,68 @@ mod tests {
             !stdout.contains(canonical.to_string_lossy().as_ref()),
             "removed worktree must not appear in git worktree list"
         );
+    }
+
+    // -- Connection loop: lag resync -----------------------------------------
+
+    #[tokio::test]
+    async fn lagged_client_receives_fresh_snapshot() {
+        let (_dir, root) = make_temp_repo();
+        let shared = make_shared_with_config(
+            vec![make_runtime("proj", root)],
+            Arc::new(MockGh::new(vec![])),
+            Config::default(),
+            2,
+        )
+        .await;
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+        tokio::spawn(handle_conn(Arc::clone(&shared), server, shutdown_tx));
+
+        ipc::write_frame_async(
+            &mut client,
+            &HandshakeReq {
+                protocol: ipc::PROTOCOL_VERSION,
+                client_pid: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let resp: HandshakeResp = ipc::read_frame_async(&mut client).await.unwrap();
+        assert!(matches!(resp, HandshakeResp::Ok { .. }));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while shared.events.receiver_count() == 0 {
+            assert!(std::time::Instant::now() < deadline, "never subscribed");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Without reading: far more than `cap` deltas, big enough to fill the
+        // socket buffer so the writer blocks and the subscriber lags.
+        for i in 0..50 {
+            shared.broadcast(SupervisorMsg::StatusChanged {
+                worktree_path: PathBuf::from(format!("/wt/{i}")),
+                status: WorktreeStatus::Idle,
+                summary: Some("x".repeat(4096)),
+                activity: None,
+                turns: 0,
+                tokens: 0,
+                run_started_at: None,
+            });
+        }
+
+        // Any deltas written before the lag was noticed, then the resync.
+        loop {
+            let msg: SupervisorMsg =
+                tokio::time::timeout(Duration::from_secs(10), ipc::read_frame_async(&mut client))
+                    .await
+                    .expect("snapshot after lag")
+                    .unwrap();
+            match msg {
+                SupervisorMsg::StatusChanged { .. } => {}
+                SupervisorMsg::Snapshot { .. } => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
     }
 
     // -- Watcher PrStatusChanged → pr_status update + merge-edge auto-continue --
@@ -3557,6 +3696,7 @@ mod tests {
             vec![make_runtime("proj", root.clone())],
             Arc::new(MockGh::new(vec![])),
             cfg,
+            BROADCAST_CAP,
         )
         .await;
 
@@ -3600,6 +3740,7 @@ mod tests {
             vec![make_runtime("proj", root.clone())],
             Arc::new(MockGh::new(vec![])),
             cfg,
+            BROADCAST_CAP,
         )
         .await;
 
@@ -3643,6 +3784,7 @@ mod tests {
             vec![make_runtime("proj", root.clone())],
             Arc::new(MockGh::new(vec![])),
             cfg,
+            BROADCAST_CAP,
         )
         .await;
 
@@ -3688,6 +3830,7 @@ mod tests {
             vec![make_runtime("proj", root.clone())],
             Arc::new(MockGh::new(vec![])),
             cfg,
+            BROADCAST_CAP,
         )
         .await;
 

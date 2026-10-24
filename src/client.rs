@@ -101,6 +101,44 @@ pub fn supervisor_msg_to_app_event(msg: SupervisorMsg) -> AppEvent {
             worktree_path,
             message,
         },
+        SupervisorMsg::TermScreen {
+            worktree_path,
+            slot,
+            rows,
+            cols,
+            bytes,
+        } => AppEvent::TermScreen {
+            worktree_path,
+            slot,
+            rows,
+            cols,
+            bytes,
+        },
+        SupervisorMsg::TermDiff {
+            worktree_path,
+            slot,
+            bytes,
+        } => AppEvent::TermDiff {
+            worktree_path,
+            slot,
+            bytes,
+        },
+        SupervisorMsg::TermSessions {
+            worktree_path,
+            slots,
+            attention,
+        } => AppEvent::TermSessions {
+            worktree_path,
+            slots,
+            attention,
+        },
+        SupervisorMsg::TermError {
+            worktree_path,
+            message,
+        } => AppEvent::TermError {
+            worktree_path,
+            message,
+        },
     }
 }
 

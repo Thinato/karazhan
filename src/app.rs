@@ -73,6 +73,35 @@ pub enum AppEvent {
         /// open PR or the count could not be fetched this tick.
         unresolved_comments: Option<u64>,
     },
+    /// Full screen of the attached terminal session (see `SupervisorMsg::TermScreen`).
+    #[allow(dead_code)] // rendered by the terminal pane
+    TermScreen {
+        worktree_path: PathBuf,
+        slot: u8,
+        rows: u16,
+        cols: u16,
+        bytes: Vec<u8>,
+    },
+    /// Screen diff for the attached terminal session.
+    #[allow(dead_code)] // rendered by the terminal pane
+    TermDiff {
+        worktree_path: PathBuf,
+        slot: u8,
+        bytes: Vec<u8>,
+    },
+    /// Live terminal slots + bell attention for one worktree.
+    #[allow(dead_code)] // rendered by the terminal pane
+    TermSessions {
+        worktree_path: PathBuf,
+        slots: Vec<u8>,
+        attention: bool,
+    },
+    /// Per-connection terminal error.
+    #[allow(dead_code)] // rendered by the terminal pane
+    TermError {
+        worktree_path: PathBuf,
+        message: String,
+    },
 }
 
 /// Top-level view the application is currently showing.
@@ -1521,6 +1550,10 @@ impl App {
             }
             // Watcher-only variant the client never receives.
             AppEvent::PrStatusChanged { .. } => {}
+            AppEvent::TermScreen { .. }
+            | AppEvent::TermDiff { .. }
+            | AppEvent::TermSessions { .. }
+            | AppEvent::TermError { .. } => {}
         }
     }
 
