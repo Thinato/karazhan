@@ -1449,8 +1449,12 @@ impl App {
         match action {
             KeyAction::FocusNav => self.focus = Focus::Nav,
             KeyAction::FocusTerm => self.focus_term(),
-            // No sessions exist yet, so no slot is live.
-            KeyAction::Select(n) => self.set_status(format!("no session {n}")),
+            KeyAction::Select(n) => match self.selected_worktree_path() {
+                Some(path) if self.term_slots.get(&path).is_some_and(|s| s.contains(&n)) => {
+                    self.last_slot.insert(path, n);
+                }
+                _ => self.set_status(format!("no session {n}")),
+            },
             KeyAction::Create => {
                 let Some(path) = self.selected_worktree_path() else {
                     self.set_status("no worktree selected");
@@ -1469,7 +1473,16 @@ impl App {
                 self.term = None;
                 self.sent_size = Some(self.pane_inner);
             }
-            KeyAction::Kill => self.set_status("terminal sessions not wired yet"),
+            KeyAction::Kill => {
+                if let Some((worktree_path, Some(slot))) = self.attached.clone() {
+                    self.client
+                        .send(ClientMsg::Term(TermCmd::Kill {
+                            worktree_path,
+                            slot,
+                        }))
+                        .await;
+                }
+            }
             KeyAction::Pty(key) => {
                 let app_cursor = self
                     .term
@@ -1566,6 +1579,9 @@ impl App {
                 .send(ClientMsg::Term(TermCmd::Resize { rows, cols }))
                 .await;
             self.sent_size = Some(self.pane_inner);
+        }
+        if self.attached.is_none() {
+            self.focus = Focus::Nav;
         }
     }
 
@@ -1704,6 +1720,13 @@ impl App {
             AppEvent::DaemonDisconnected => {
                 tracing::warn!("daemon disconnected");
                 self.set_status("daemon disconnected — restart karazhan to reconnect");
+                self.term_slots.clear();
+                self.attention.clear();
+                self.last_slot.clear();
+                self.attached = None;
+                self.term = None;
+                self.sent_size = None;
+                self.focus = Focus::Nav;
             }
             // Watcher-only variant the client never receives.
             AppEvent::PrStatusChanged { .. } => {}
@@ -1750,6 +1773,14 @@ impl App {
                     self.attention.insert(worktree_path.clone());
                 } else {
                     self.attention.remove(&worktree_path);
+                }
+                // The attached session exited or was killed: drop it, and let
+                // sync_attachment pick the next slot.
+                if let Some((path, Some(slot))) = &self.attached {
+                    if *path == worktree_path && !slots.contains(slot) {
+                        self.attached = None;
+                        self.term = None;
+                    }
                 }
                 if slots.is_empty() {
                     self.term_slots.remove(&worktree_path);
@@ -1986,6 +2017,77 @@ mod tests {
             "already attached to the desired slot"
         );
         assert_eq!(app.attached, Some((path, Some(1))));
+    }
+
+    /// Attach `app` to `slot` of `path` the way the daemon flow does.
+    async fn attach(app: &mut App, rx: &mut mpsc::Receiver<ClientMsg>, path: &Path, slots: &[u8]) {
+        app.handle_app_event(sessions(path, slots));
+        app.sync_attachment().await;
+        while rx.try_recv().is_ok() {}
+        let slot = app.attached.as_ref().unwrap().1.unwrap();
+        app.handle_app_event(screen(path, slot));
+        app.focus = Focus::Term;
+    }
+
+    #[tokio::test]
+    async fn next_attachment_after_exit_picks_lowest() {
+        let (mut app, mut rx, path) = app_with_worktree();
+        attach(&mut app, &mut rx, &path, &[1, 2, 3]).await;
+        app.handle_key_action(KeyAction::Select(2)).await;
+        app.sync_attachment().await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::Term(TermCmd::Attach { slot: Some(2), .. }))
+        ));
+        app.handle_app_event(screen(&path, 2));
+
+        // Slot 2 exits: the pane falls back to the lowest remaining slot.
+        app.handle_app_event(sessions(&path, &[1, 3]));
+        assert_eq!(app.attached, None);
+        app.sync_attachment().await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::Term(TermCmd::Attach { slot: Some(1), .. }))
+        ));
+        assert_eq!(app.focus, Focus::Term);
+
+        app.handle_key_action(KeyAction::Select(7)).await;
+        assert_eq!(app.status_message.as_deref(), Some("no session 7"));
+    }
+
+    #[tokio::test]
+    async fn exit_of_last_session_returns_focus_to_nav() {
+        let (mut app, mut rx, path) = app_with_worktree();
+        attach(&mut app, &mut rx, &path, &[1]).await;
+        app.handle_key_action(KeyAction::Kill).await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::Term(TermCmd::Kill { slot: 1, .. }))
+        ));
+        app.handle_app_event(sessions(&path, &[]));
+        app.sync_attachment().await;
+        assert_eq!(app.attached, None);
+        assert!(app.term.is_none());
+        assert_eq!(app.focus, Focus::Nav);
+        assert!(
+            rx.try_recv().is_err(),
+            "the daemon already dropped the view"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_disconnect_clears_term_state() {
+        let (mut app, mut rx, path) = app_with_worktree();
+        attach(&mut app, &mut rx, &path, &[1]).await;
+        app.attention.insert(path.clone());
+        app.handle_app_event(AppEvent::DaemonDisconnected);
+        app.sync_attachment().await;
+        assert!(app.term_slots.is_empty());
+        assert!(app.attention.is_empty());
+        assert_eq!(app.attached, None);
+        assert!(app.term.is_none());
+        assert_eq!(app.focus, Focus::Nav);
+        assert!(rx.try_recv().is_err(), "nothing is sent to a dead daemon");
     }
 
     #[tokio::test]
