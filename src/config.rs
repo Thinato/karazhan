@@ -141,6 +141,10 @@ pub struct Config {
     /// project's own hooks rather than overridden — hooks are additive rules,
     /// not a single slot like `setup_command`.
     pub hooks: Vec<HookRule>,
+
+    /// Grid terminal-pane prefix chord, tmux style (`"C-a"`, `"ctrl-b"`).
+    /// Parsed by [`parse_prefix`]; an invalid value falls back to `C-a`.
+    pub terminal_prefix: String,
 }
 
 impl Default for Config {
@@ -158,6 +162,27 @@ impl Default for Config {
             colors: ColorsConfig::default(),
             worktree: WorktreeSettings::default(),
             hooks: Vec::new(),
+            terminal_prefix: "C-a".to_string(),
+        }
+    }
+}
+
+/// Parse a tmux-style prefix (`"C-a"`, `"ctrl-b"`, case-insensitive) into the
+/// letter of its Ctrl+letter chord.  Anything else logs a warning and falls
+/// back to `a`.  `h`, `i` and `m` are rejected: in legacy terminal mode Ctrl-h,
+/// Ctrl-i and Ctrl-m arrive as Backspace, Tab and Enter, so they never match.
+pub fn parse_prefix(s: &str) -> char {
+    let lower = s.trim().to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("c-")
+        .or_else(|| lower.strip_prefix("ctrl-"))
+        .unwrap_or("");
+    let mut chars = rest.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if c.is_ascii_lowercase() && !"him".contains(c) => c,
+        _ => {
+            warn!("config: invalid terminal_prefix {s:?}, using C-a");
+            'a'
         }
     }
 }
@@ -243,6 +268,24 @@ mod tests {
         assert_eq!(cfg.gh_bin, "gh");
         assert!(!cfg.auto_continue_prompt.is_empty());
         assert!(cfg.prompt_dir.is_none());
+        assert_eq!(cfg.terminal_prefix, "C-a");
+        assert_eq!(parse_prefix(&cfg.terminal_prefix), 'a');
+    }
+
+    #[test]
+    fn parse_prefix_variants() {
+        assert_eq!(parse_prefix("C-a"), 'a');
+        assert_eq!(parse_prefix("c-b"), 'b');
+        assert_eq!(parse_prefix("ctrl-b"), 'b');
+        assert_eq!(parse_prefix("CTRL-X"), 'x');
+        assert_eq!(parse_prefix(" C-Q "), 'q');
+    }
+
+    #[test]
+    fn bad_prefix_falls_back() {
+        for bad in ["", "a", "C-", "C-ab", "M-a", "C-1", "C-h", "ctrl-i", "C-m"] {
+            assert_eq!(parse_prefix(bad), 'a', "{bad:?}");
+        }
     }
 
     // -----------------------------------------------------------------------

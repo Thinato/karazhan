@@ -259,6 +259,7 @@ impl App {
         // The library starts empty and fills per-project on the first Snapshot
         // (same as the grid) — prompts now live at <project>/.karazhan/prompts/.
         let library = LibraryView::new();
+        let prefix = crate::config::parse_prefix(&config.terminal_prefix);
 
         Self {
             running: true,
@@ -285,7 +286,7 @@ impl App {
             last_term_width: 120,
             focus: Focus::Nav,
             prefix_pending: false,
-            prefix: 'a',
+            prefix,
         }
     }
 
@@ -339,7 +340,7 @@ impl App {
 
                 // Render help overlay on top of whatever view is active.
                 if self.show_help {
-                    crate::ui::help::render_help(frame, area);
+                    crate::ui::help::render_help(frame, area, &self.prefix_label());
                 }
 
                 // Render the command palette on top of everything else.

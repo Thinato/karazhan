@@ -160,6 +160,9 @@ gh_bin     = "gh"
 # Prompt sent to the agent when auto-continue fires after a PR merge.
 auto_continue_prompt = "The PR for this worktree was merged. Continue with the next step of the task."
 
+# Prefix chord for the Grid view's terminal pane (tmux style: "C-a", "ctrl-b").
+terminal_prefix = "C-a"
+
 # Per-status color overrides. Supported names: black, red, green, yellow,
 # blue, magenta, cyan, gray, dark_gray, white, light_red, light_green,
 # light_yellow, light_blue, light_magenta, light_cyan.

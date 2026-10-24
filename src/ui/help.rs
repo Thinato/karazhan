@@ -11,8 +11,9 @@ use ratatui::{
     Frame,
 };
 
-/// Render the help overlay centered in `area`.
-pub fn render_help(frame: &mut Frame, area: Rect) {
+/// Render the help overlay centered in `area`.  `prefix` is the terminal
+/// prefix's display form (`^a`).
+pub fn render_help(frame: &mut Frame, area: Rect, prefix: &str) {
     let popup = centered_rect(60, 80, area);
 
     // Clear the background so the popup is readable.
@@ -27,12 +28,12 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let lines = help_lines();
+    let lines = help_lines(prefix);
     let para = Paragraph::new(lines);
     frame.render_widget(para, inner);
 }
 
-fn help_lines() -> Vec<Line<'static>> {
+fn help_lines(prefix: &str) -> Vec<Line<'static>> {
     let header = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
@@ -41,6 +42,13 @@ fn help_lines() -> Vec<Line<'static>> {
         .add_modifier(Modifier::BOLD);
     let desc = Style::default().fg(Color::White);
     let dim = Style::default().fg(Color::DarkGray);
+    let pk = |k: &str, v: &'static str| {
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(format!("{:<8}", format!("{prefix} {k}")), key),
+            Span::styled(v, desc),
+        ])
+    };
 
     vec![
         // ── Global ──────────────────────────────────────────────────────────
@@ -56,7 +64,12 @@ fn help_lines() -> Vec<Line<'static>> {
         kv("C-p     ", "open command palette", key, desc),
         kv("A       ", "add project (register a git repo)", key, desc),
         kv("q       ", "quit karazhan", key, desc),
-        kv("Ctrl-C  ", "quit (always works)", key, desc),
+        kv(
+            "Ctrl-C  ",
+            "quit (goes to the shell while the terminal is focused)",
+            key,
+            desc,
+        ),
         Line::from(""),
         // ── Library view ────────────────────────────────────────────────────
         Line::from(Span::styled("Library view", header)),
@@ -149,6 +162,20 @@ fn help_lines() -> Vec<Line<'static>> {
         )),
         Line::from(Span::styled(
             "  (prompt input)  Enter: send  Esc: cancel  Backspace: delete",
+            dim,
+        )),
+        Line::from(""),
+        // ── Terminal pane ───────────────────────────────────────────────────
+        Line::from(Span::styled("Terminal pane", header)),
+        Line::from(""),
+        pk("c", "create a terminal session for the selected worktree"),
+        pk("1-9", "switch to session 1-9"),
+        pk("x", "kill the current session"),
+        pk("h", "focus the grid"),
+        pk("l", "focus the terminal (Enter also works from the grid)"),
+        pk(prefix, "send a literal prefix to the shell"),
+        Line::from(Span::styled(
+            "  while the terminal is focused every other key (Ctrl-C too) goes to the shell.",
             dim,
         )),
     ]
