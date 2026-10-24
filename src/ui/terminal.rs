@@ -1,5 +1,6 @@
 //! Grid-view terminal pane: layout math and rendering.
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Style},
@@ -57,10 +58,103 @@ pub fn render_hint(frame: &mut Frame, area: Rect, prefix: &str) {
     frame.render_widget(hint, area);
 }
 
+/// Encode a key as the bytes an xterm sends for it.  `app_cursor` is the
+/// inner app's application-cursor mode (DECCKM), which switches unmodified
+/// arrows and Home/End from `ESC [` to `ESC O`.
+#[allow(dead_code)] // used by the Pty route in phase (d)
+pub fn key_to_bytes(key: KeyEvent, app_cursor: bool) -> Vec<u8> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // xterm modifier parameter: 1 + shift + 2·alt + 4·ctrl.
+    let m = 1 + shift as u8 + 2 * alt as u8 + 4 * ctrl as u8;
+    let letter = |c: char, ss3: bool| match (m, ss3) {
+        (1, true) => format!("\x1bO{c}"),
+        (1, false) => format!("\x1b[{c}"),
+        _ => format!("\x1b[1;{m}{c}"),
+    };
+    let tilde = |n: u8| match m {
+        1 => format!("\x1b[{n}~"),
+        _ => format!("\x1b[{n};{m}~"),
+    };
+    let seq = match key.code {
+        KeyCode::Up => letter('A', app_cursor),
+        KeyCode::Down => letter('B', app_cursor),
+        KeyCode::Right => letter('C', app_cursor),
+        KeyCode::Left => letter('D', app_cursor),
+        KeyCode::Home => letter('H', app_cursor),
+        KeyCode::End => letter('F', app_cursor),
+        KeyCode::F(n @ 1..=4) => letter((b'P' + n - 1) as char, true),
+        KeyCode::F(n @ 5..=12) => tilde([15, 17, 18, 19, 20, 21, 23, 24][n as usize - 5]),
+        KeyCode::Insert => tilde(2),
+        KeyCode::Delete => tilde(3),
+        KeyCode::PageUp => tilde(5),
+        KeyCode::PageDown => tilde(6),
+        KeyCode::BackTab => "\x1b[Z".to_string(),
+        _ => {
+            // Plain keys: Alt is an ESC prefix rather than a parameter.
+            let mut out = match key.code {
+                KeyCode::Char(c) if ctrl => match c {
+                    'a'..='z' | 'A'..='Z' => vec![c.to_ascii_lowercase() as u8 - b'a' + 1],
+                    ' ' | '@' => vec![0],
+                    '[' | '\\' | ']' | '^' | '_' => vec![c as u8 - b'@'],
+                    // Legacy crossterm reports 0x1c..=0x1f as Ctrl-4..=7.
+                    '4'..='7' => vec![c as u8 - b'4' + 0x1c],
+                    _ => c.to_string().into_bytes(),
+                },
+                KeyCode::Char(c) => c.to_string().into_bytes(),
+                KeyCode::Enter => vec![b'\r'],
+                KeyCode::Tab => vec![b'\t'],
+                KeyCode::Backspace => vec![0x7f],
+                KeyCode::Esc => vec![0x1b],
+                _ => return Vec::new(),
+            };
+            if alt {
+                out.insert(0, 0x1b);
+            }
+            return out;
+        }
+    };
+    seq.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn key_to_bytes_table() {
+        let k = |code, mods| KeyEvent::new(code, mods);
+        let none = KeyModifiers::NONE;
+        let ctrl = KeyModifiers::CONTROL;
+        let cases: &[(KeyEvent, bool, &[u8])] = &[
+            (k(KeyCode::Char('c'), ctrl), false, b"\x03"),
+            (k(KeyCode::Char('a'), ctrl), false, b"\x01"),
+            (k(KeyCode::Char(' '), ctrl), false, b"\x00"),
+            (k(KeyCode::Char(']'), ctrl), false, b"\x1d"),
+            (k(KeyCode::Char('b'), KeyModifiers::ALT), false, b"\x1bb"),
+            (k(KeyCode::Char('é'), none), false, "é".as_bytes()),
+            (k(KeyCode::Enter, none), false, b"\r"),
+            (k(KeyCode::Tab, none), false, b"\t"),
+            (k(KeyCode::BackTab, KeyModifiers::SHIFT), false, b"\x1b[Z"),
+            (k(KeyCode::Backspace, none), false, b"\x7f"),
+            (k(KeyCode::Esc, none), false, b"\x1b"),
+            (k(KeyCode::Up, none), false, b"\x1b[A"),
+            (k(KeyCode::Up, none), true, b"\x1bOA"),
+            (k(KeyCode::Right, ctrl), false, b"\x1b[1;5C"),
+            (k(KeyCode::Right, ctrl), true, b"\x1b[1;5C"),
+            (k(KeyCode::Home, none), false, b"\x1b[H"),
+            (k(KeyCode::PageUp, none), false, b"\x1b[5~"),
+            (k(KeyCode::Delete, none), false, b"\x1b[3~"),
+            (k(KeyCode::F(1), none), false, b"\x1bOP"),
+            (k(KeyCode::F(5), none), false, b"\x1b[15~"),
+            (k(KeyCode::F(12), none), false, b"\x1b[24~"),
+        ];
+        for (key, app_cursor, want) in cases {
+            assert_eq!(key_to_bytes(*key, *app_cursor), *want, "{key:?}");
+        }
+    }
 
     #[test]
     fn effective_pane_width_default_60pct() {
