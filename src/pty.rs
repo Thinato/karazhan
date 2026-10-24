@@ -153,8 +153,10 @@ fn term_error(worktree_path: PathBuf, message: impl Into<String>) -> SupervisorM
 }
 
 /// Clamp a client-supplied size so a bogus value cannot allocate a huge grid.
+/// The floor is 2×2: vt100 underflows on a 1-row or 1-column grid (and the
+/// panic would poison the session lock).
 fn clamp_size(rows: u16, cols: u16) -> (u16, u16) {
-    (rows.clamp(1, 500), cols.clamp(1, 1000))
+    (rows.clamp(2, 500), cols.clamp(2, 1000))
 }
 
 fn key_range(path: &Path) -> std::ops::RangeInclusive<Key> {
@@ -746,6 +748,13 @@ mod tests {
 
     fn is_alive(pid: Pid) -> bool {
         nix::sys::signal::kill(pid, None).is_ok()
+    }
+
+    #[test]
+    fn tiny_size_is_clamped_to_a_safe_grid() {
+        let (rows, cols) = clamp_size(0, 0);
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process("漢字 wraps\r\n漢字\r\n".as_bytes());
     }
 
     #[test]
