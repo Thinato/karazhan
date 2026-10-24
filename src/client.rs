@@ -50,6 +50,20 @@ impl SupervisorClient {
             tracing::warn!("client: failed to enqueue ClientMsg (writer gone): {e}");
         }
     }
+
+    /// A client backed by a bare channel instead of a socket, so tests can
+    /// drive the real `App` handlers and inspect what they send.
+    #[cfg(test)]
+    pub fn test_pair() -> (Self, mpsc::Receiver<ClientMsg>) {
+        let (tx, rx) = mpsc::channel(CLIENT_TX_CAP);
+        (
+            Self {
+                tx,
+                supervisor_pid: 0,
+            },
+            rx,
+        )
+    }
 }
 
 /// Translate a daemon-pushed [`SupervisorMsg`] into the [`AppEvent`] the UI loop

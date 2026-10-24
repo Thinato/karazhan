@@ -93,6 +93,78 @@ pub enum GridMode {
     NameInput,
 }
 
+/// Which side of the Grid view receives keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    /// The worktree grid (vim motions, commands).
+    Nav,
+    /// The terminal pane: every key except the prefix goes to the PTY.
+    Term,
+}
+
+/// What a key resolves to after prefix handling (see [`route_key`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyAction {
+    /// Forward the key to the PTY.
+    #[allow(dead_code)] // read once input reaches the PTY (phase d)
+    Pty(KeyEvent),
+    /// Forward a literal prefix key to the PTY (`prefix prefix`).
+    PtyPrefix,
+    FocusNav,
+    FocusTerm,
+    /// Create a session in the lowest free slot.
+    Create,
+    /// Kill the attached session.
+    Kill,
+    /// Switch to session slot `n` (1–9).
+    Select(u8),
+    /// Handle the key as a normal grid key.
+    Nav(KeyEvent),
+    /// Consume the key and do nothing.
+    Swallow,
+}
+
+/// Route a key through the tmux-style prefix state machine.  `prefix` is the
+/// letter of the Ctrl+letter prefix chord.  A pending prefix is cleared by
+/// whatever key follows it.
+pub fn route_key(focus: Focus, pending: &mut bool, key: KeyEvent, prefix: char) -> KeyAction {
+    let is_prefix = key.code == KeyCode::Char(prefix) && key.modifiers == KeyModifiers::CONTROL;
+    let term = focus == Focus::Term;
+    if !std::mem::take(pending) {
+        return if is_prefix {
+            *pending = true;
+            KeyAction::Swallow
+        } else if term {
+            KeyAction::Pty(key)
+        } else if key.code == KeyCode::Enter {
+            KeyAction::FocusTerm
+        } else {
+            KeyAction::Nav(key)
+        };
+    }
+    if is_prefix {
+        return if term {
+            KeyAction::PtyPrefix
+        } else {
+            KeyAction::Swallow
+        };
+    }
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return KeyAction::Swallow;
+    }
+    match key.code {
+        KeyCode::Char('h') if term => KeyAction::FocusNav,
+        KeyCode::Char('l') => KeyAction::FocusTerm,
+        KeyCode::Char('c') => KeyAction::Create,
+        KeyCode::Char('x') if term => KeyAction::Kill,
+        KeyCode::Char(ch @ '1'..='9') => KeyAction::Select(ch as u8 - b'0'),
+        _ => KeyAction::Swallow,
+    }
+}
+
 /// The worktree pending deletion, held while the (y/N) confirmation modal is open.
 pub struct DeleteTarget {
     /// Canonical filesystem path of the worktree to delete.
@@ -170,6 +242,12 @@ pub struct App {
     /// Last rendered terminal width, captured each draw so the grid column math
     /// in key handlers (which have no frame) matches the rendered split.
     last_term_width: u16,
+    /// Which Grid-view side receives keys.
+    focus: Focus,
+    /// The prefix key was pressed and the next key is a pane command.
+    prefix_pending: bool,
+    /// Letter of the Ctrl+letter terminal prefix (`a` → `^a`).
+    prefix: char,
 }
 
 impl App {
@@ -205,7 +283,15 @@ impl App {
             spinner_frame: 0,
             pane_pct: crate::ui::terminal::DEFAULT_PANE_PCT,
             last_term_width: 120,
+            focus: Focus::Nav,
+            prefix_pending: false,
+            prefix: 'a',
         }
+    }
+
+    /// Display form of the terminal prefix, e.g. `^a`.
+    fn prefix_label(&self) -> String {
+        format!("^{}", self.prefix)
     }
 
     /// Set the transient status message (replaces any previous message).
@@ -242,7 +328,7 @@ impl App {
                             self.spinner_frame,
                         );
 
-                        crate::ui::terminal::render_hint(frame, pane_area, "^a");
+                        crate::ui::terminal::render_hint(frame, pane_area, &self.prefix_label());
                         frame.render_widget(
                             Paragraph::new(self.build_status_text())
                                 .style(Style::default().fg(Color::DarkGray)),
@@ -406,10 +492,18 @@ impl App {
     // -----------------------------------------------------------------------
 
     async fn handle_crossterm_event(&mut self, event: Event) {
-        if let Event::Key(KeyEvent {
-            code, modifiers, ..
-        }) = event
-        {
+        if let Event::Key(key) = event {
+            // A focused terminal routes every key itself, ahead of Ctrl-C, so
+            // Ctrl-C reaches the shell instead of quitting.
+            if self.view == View::Grid && self.focus == Focus::Term {
+                let action = route_key(self.focus, &mut self.prefix_pending, key, self.prefix);
+                self.handle_key_action(action).await;
+                return;
+            }
+            let KeyEvent {
+                code, modifiers, ..
+            } = key;
+
             // Ctrl-C always quits regardless of mode/view.  Daemon survives.
             if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
                 tracing::info!("quit requested via Ctrl-C");
@@ -497,6 +591,7 @@ impl App {
 
             // Global `?` opens help from any view/mode.
             if code == KeyCode::Char('?') {
+                self.prefix_pending = false;
                 self.show_help = true;
                 return;
             }
@@ -507,6 +602,7 @@ impl App {
                 let in_input =
                     self.library.mode != LibraryMode::Normal || self.grid_mode != GridMode::Normal;
                 if !in_input {
+                    self.prefix_pending = false;
                     self.palette = Some(commands::Palette::open(self.view == View::Grid));
                     return;
                 }
@@ -1092,6 +1188,15 @@ impl App {
         // Clear transient status on any grid key.
         self.status_message = None;
 
+        // Prefix routing runs before every grid binding (Ctrl-a would
+        // otherwise hit the modifier-blind `a`).
+        let key = KeyEvent::new(code, modifiers);
+        let (code, modifiers) =
+            match route_key(self.focus, &mut self.prefix_pending, key, self.prefix) {
+                KeyAction::Nav(key) => (key.code, key.modifiers),
+                action => return self.handle_key_action(action).await,
+            };
+
         if code == KeyCode::Tab {
             self.execute_command(CommandId::SwitchView).await;
             return;
@@ -1254,6 +1359,29 @@ impl App {
         }
     }
 
+    /// Act on a routed terminal-pane key.
+    async fn handle_key_action(&mut self, action: KeyAction) {
+        match action {
+            KeyAction::FocusNav => self.focus = Focus::Nav,
+            KeyAction::FocusTerm => self.focus_term(),
+            // No sessions exist yet, so no slot is live.
+            KeyAction::Select(n) => self.set_status(format!("no session {n}")),
+            // wired in phase (d)
+            KeyAction::Create | KeyAction::Kill | KeyAction::Pty(_) | KeyAction::PtyPrefix => {
+                self.set_status("terminal sessions not wired yet")
+            }
+            KeyAction::Nav(_) | KeyAction::Swallow => {}
+        }
+    }
+
+    /// Focus the terminal pane, but only onto a live session, so a dead pane
+    /// can never swallow Ctrl-C.  Sessions arrive in phase (d); until then the
+    /// guard always refuses.
+    fn focus_term(&mut self) {
+        let msg = format!("no session — press {} c to create one", self.prefix_label());
+        self.set_status(msg);
+    }
+
     // -----------------------------------------------------------------------
     // Command senders (client → daemon)
     // -----------------------------------------------------------------------
@@ -1402,5 +1530,147 @@ impl App {
     fn enter_grid_view(&mut self) {
         self.view = View::Grid;
         tracing::info!("entered grid view ({} worktrees)", self.worktrees.len());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
+
+    /// Route `k` with the prefix already pending.
+    fn after_prefix(focus: Focus, k: KeyEvent) -> KeyAction {
+        route_key(focus, &mut true, k, 'a')
+    }
+
+    fn grid_app() -> (App, mpsc::Receiver<ClientMsg>) {
+        let (client, rx) = SupervisorClient::test_pair();
+        let (_tx, event_rx) = mpsc::channel(1);
+        let mut app = App::new(event_rx, Config::default(), client);
+        app.view = View::Grid;
+        (app, rx)
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_forwarded_when_term_focused() {
+        let mut pending = false;
+        assert_eq!(
+            route_key(Focus::Term, &mut pending, ctrl('c'), 'a'),
+            KeyAction::Pty(ctrl('c'))
+        );
+
+        let (mut app, _rx) = grid_app();
+        app.focus = Focus::Term;
+        app.handle_crossterm_event(Event::Key(ctrl('c'))).await;
+        assert!(
+            app.running,
+            "Ctrl-C must not quit while the terminal is focused"
+        );
+    }
+
+    #[test]
+    fn prefix_prefix_literal_only_in_term() {
+        assert_eq!(after_prefix(Focus::Term, ctrl('a')), KeyAction::PtyPrefix);
+        assert_eq!(after_prefix(Focus::Nav, ctrl('a')), KeyAction::Swallow);
+    }
+
+    #[test]
+    fn prefix_h_focuses_nav() {
+        let h = key(KeyCode::Char('h'));
+        assert_eq!(after_prefix(Focus::Term, h), KeyAction::FocusNav);
+        assert_eq!(after_prefix(Focus::Nav, h), KeyAction::Swallow);
+        let l = key(KeyCode::Char('l'));
+        assert_eq!(after_prefix(Focus::Term, l), KeyAction::FocusTerm);
+        assert_eq!(after_prefix(Focus::Nav, l), KeyAction::FocusTerm);
+        let c = key(KeyCode::Char('c'));
+        assert_eq!(after_prefix(Focus::Term, c), KeyAction::Create);
+        assert_eq!(after_prefix(Focus::Nav, c), KeyAction::Create);
+        let three = key(KeyCode::Char('3'));
+        assert_eq!(after_prefix(Focus::Term, three), KeyAction::Select(3));
+        assert_eq!(after_prefix(Focus::Nav, three), KeyAction::Select(3));
+    }
+
+    #[test]
+    fn prefix_x_ignored_in_nav() {
+        let x = key(KeyCode::Char('x'));
+        assert_eq!(after_prefix(Focus::Nav, x), KeyAction::Swallow);
+        assert_eq!(after_prefix(Focus::Term, x), KeyAction::Kill);
+    }
+
+    #[test]
+    fn unknown_prefix_key_swallowed() {
+        for focus in [Focus::Nav, Focus::Term] {
+            for k in [key(KeyCode::Char('z')), key(KeyCode::Char('0')), ctrl('c')] {
+                assert_eq!(
+                    after_prefix(focus, k),
+                    KeyAction::Swallow,
+                    "{focus:?} {k:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pending_cleared_after_any_key() {
+        for focus in [Focus::Nav, Focus::Term] {
+            let mut pending = false;
+            assert_eq!(
+                route_key(focus, &mut pending, ctrl('a'), 'a'),
+                KeyAction::Swallow
+            );
+            assert!(pending);
+            for k in [
+                key(KeyCode::Char('z')),
+                key(KeyCode::Char('c')),
+                ctrl('a'),
+                key(KeyCode::Enter),
+            ] {
+                pending = true;
+                route_key(focus, &mut pending, k, 'a');
+                assert!(!pending, "{focus:?} {k:?}");
+            }
+        }
+        // Without a pending prefix, plain keys pass straight through.
+        let mut pending = false;
+        let j = key(KeyCode::Char('j'));
+        assert_eq!(
+            route_key(Focus::Nav, &mut pending, j, 'a'),
+            KeyAction::Nav(j)
+        );
+        assert_eq!(
+            route_key(Focus::Term, &mut pending, j, 'a'),
+            KeyAction::Pty(j)
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_without_session_stays_nav_with_hint() {
+        let (mut app, mut rx) = grid_app();
+        app.handle_crossterm_event(Event::Key(key(KeyCode::Enter)))
+            .await;
+        assert_eq!(app.focus, Focus::Nav);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("no session — press ^a c to create one")
+        );
+        assert!(rx.try_recv().is_err(), "nothing is sent to the daemon");
+    }
+
+    #[tokio::test]
+    async fn help_key_clears_prefix_pending() {
+        let (mut app, _rx) = grid_app();
+        app.handle_crossterm_event(Event::Key(ctrl('a'))).await;
+        assert!(app.prefix_pending);
+        app.handle_crossterm_event(Event::Key(key(KeyCode::Char('?'))))
+            .await;
+        assert!(app.show_help);
+        assert!(!app.prefix_pending);
     }
 }
