@@ -44,9 +44,11 @@ use crate::github::commands::{build_address_pr_comments_prompt, build_check_ci_p
 use crate::github::pr::pr_for_current_branch;
 use crate::github::{GhRunner, RealGh};
 use crate::hooks::{self, Hook};
-use crate::ipc::{self, BuiltinKind, ClientMsg, HandshakeReq, HandshakeResp, SupervisorMsg};
+use crate::ipc::{
+    self, AgentEvent, BuiltinKind, ClientMsg, HandshakeReq, HandshakeResp, SupervisorMsg,
+};
 use crate::pr_status_store;
-use crate::project_config::{ProjectConfig, WorktreeSettings};
+use crate::project_config::{AgentConfig, ProjectConfig, WorktreeSettings};
 use crate::projects;
 use crate::pty::{self, PtyHost};
 use crate::worktree::model::PrStatus;
@@ -125,6 +127,24 @@ pub struct Registry {
     pub summaries: HashMap<PathBuf, String>,
     pub project_of: HashMap<PathBuf, String>,
     pub order: Vec<PathBuf>,
+    /// The interactive claude karazhan launched per worktree, while its hooks
+    /// report it running.
+    pub interactive: HashMap<PathBuf, Claude>,
+    /// Session id chosen for a launched claude, persisted once it starts (so
+    /// `R` never resumes a session that never ran).
+    pub pending_session: HashMap<PathBuf, String>,
+}
+
+/// An interactive claude in a terminal session.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Claude {
+    pub slot: u8,
+    /// claude's process group, read from the terminal when a hook fired.  A
+    /// paste goes in only while it still holds the foreground, never into the
+    /// shell or another program (Ctrl-Z, crash, slot reused).
+    pub pgrp: u32,
+    /// Showing a permission dialog, where a paste + Enter would answer it.
+    pub waiting: bool,
 }
 
 impl Registry {
@@ -135,6 +155,8 @@ impl Registry {
             summaries: HashMap::new(),
             project_of: HashMap::new(),
             order: Vec::new(),
+            interactive: HashMap::new(),
+            pending_session: HashMap::new(),
         }
     }
 
@@ -1252,12 +1274,22 @@ async fn handle_client_msg(shared: &Arc<Shared>, msg: ClientMsg) {
         }
         // Per-connection: handled by handle_conn via `shared.pty`.
         ClientMsg::Term(_) => {}
+        ClientMsg::AgentEvent {
+            worktree_path,
+            slot,
+            event,
+        } => {
+            agent_event(shared, worktree_path, slot, event).await;
+        }
     }
 }
 
 /// `RunPrompt` — set Running, then spawn a task that drives the agent session,
 /// mirroring `App::run_agent` but writing to the registry + broadcast.
 async fn run_prompt(shared: Arc<Shared>, worktree_path: PathBuf, prompt: String) {
+    if paste_into_claude(&shared, &worktree_path, &prompt).await {
+        return;
+    }
     // Clear any stale summary and mark Running.
     {
         let mut reg = shared.registry.lock().await;
@@ -1315,6 +1347,9 @@ fn run_continue_session(shared: Arc<Shared>, worktree_path: PathBuf, prompt: Str
     let path = worktree_path.clone();
 
     tokio::spawn(async move {
+        if paste_into_claude(&shared, &path, &prompt).await {
+            return;
+        }
         let Some(backend) = shared.backend_for(&path).await else {
             tracing::warn!(
                 worktree = %path.display(),
@@ -1735,17 +1770,19 @@ async fn new_worktree(
 ) {
     // Resolve the target project's base dir + worktree settings up-front (clone
     // what we need so we don't hold the projects lock across git/state I/O).
-    let resolved: Option<(PathBuf, PathBuf, WorktreeSettings)> = {
+    let resolved: Option<(PathBuf, PathBuf, WorktreeSettings, Option<AgentConfig>)> = {
         let projects = shared.projects.lock().await;
         projects.iter().find(|p| p.name == project).map(|p| {
+            let agent = &p.project_config.agent;
             (
                 p.root.clone(),
                 p.project_config.worktrees_base(&p.root),
                 p.project_config.worktree.clone(),
+                runs_interactive(agent, p.backend_name).then(|| agent.clone()),
             )
         })
     };
-    let Some((root, base, project_worktree)) = resolved else {
+    let Some((root, base, project_worktree, interactive_agent)) = resolved else {
         shared.error(None, format!("unknown project: {project}"));
         return;
     };
@@ -1797,6 +1834,15 @@ async fn new_worktree(
     let snapshot = shared.rebuild_registry().await;
     shared.broadcast_snapshot(snapshot).await;
 
+    let prompt_body = prompt_body.filter(|b| !b.trim().is_empty());
+    if let Some(agent) = interactive_agent {
+        launch_in_terminal(shared, &canonical, setup_command, prompt_body, &agent).await;
+        return;
+    }
+    if let Err(e) = shared.pty.create(&canonical, Vec::new()) {
+        shared.error(Some(canonical.clone()), format!("terminal: {e}"));
+    }
+
     // Setup-then-prompt sequence, in a spawned task so the daemon isn't blocked.
     //
     // 1. If a setup command is configured, run it non-interactively to
@@ -1804,7 +1850,6 @@ async fn new_worktree(
     //    On failure/timeout: surface an error but STILL proceed.
     // 2. Then, if a prompt was supplied, drive the agent on it; otherwise set
     //    the worktree back to Idle.
-    let prompt_body = prompt_body.filter(|b| !b.trim().is_empty());
     let task_shared = Arc::clone(shared);
     tokio::spawn(async move {
         if let Some(command) = setup_command {
@@ -1918,6 +1963,7 @@ async fn remove_worktree(shared: &Arc<Shared>, path: &Path, _force: bool) {
         )
         .await;
     // Fire-and-forget: frees the slots now, shells are reaped in the background.
+    shared.registry.lock().await.interactive.remove(path);
     shared.pty.kill_worktree(path);
     if let Ok(canonical) = path.canonicalize() {
         shared.pty.kill_worktree(&canonical);
@@ -1983,6 +2029,306 @@ async fn remove_worktree(shared: &Arc<Shared>, path: &Path, _force: bool) {
 
     let snapshot = shared.rebuild_registry().await;
     shared.broadcast_snapshot(snapshot).await;
+}
+
+// ---------------------------------------------------------------------------
+// Interactive claude in the terminal pane
+// ---------------------------------------------------------------------------
+
+/// Whether new worktrees run `agent` interactively in their first terminal.
+/// Only a real claude (not the Mock fallback) takes the session-id/settings
+/// flags and hooks that keep karazhan's status in sync.
+fn runs_interactive(agent: &AgentConfig, backend_name: &str) -> bool {
+    backend_name == "Configured"
+        && Path::new(&agent.command)
+            .file_name()
+            .is_some_and(|n| n == "claude")
+}
+
+/// `agent.args` without the headless-only (`-p`) flags.
+fn interactive_args(agent: &AgentConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut args = agent.args.iter();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--output-format" | "--input-format" | "--max-turns" => {
+                args.next();
+            }
+            "-p"
+            | "--print"
+            | "--verbose"
+            | "--include-partial-messages"
+            | "--replay-user-messages" => {}
+            _ if a.starts_with("--output-format=") || a.starts_with("--input-format=") => {}
+            _ => out.push(a.clone()),
+        }
+    }
+    out
+}
+
+/// Quote `s` as one POSIX shell word (left bare when that is safe).
+fn sh_word(s: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "_-./=:,+@%".contains(c);
+    if !s.is_empty() && s.chars().all(safe) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// The line typed into a new worktree's first terminal: setup (via `sh -c`,
+/// as the background runner did), then claude, which only starts if setup
+/// succeeded, then `end`, which reports the end however claude exited (or
+/// never started).  Empty when there is nothing to run.
+fn launch_line(setup: Option<&str>, claude: Option<&str>, end: &str) -> String {
+    let setup = setup.map(|c| format!("sh -c {}", sh_word(c)));
+    let run = [setup.as_deref(), claude]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" && ");
+    if run.is_empty() {
+        run
+    } else {
+        format!("{run}; {end}")
+    }
+}
+
+/// `<karazhan> --agent-event <event>`, as run by claude's hooks.
+fn agent_event_command(exe: &Path, event: AgentEvent) -> String {
+    format!(
+        "{} --agent-event {}",
+        sh_word(&exe.to_string_lossy()),
+        event.as_arg()
+    )
+}
+
+/// `claude ... --session-id <id> --settings <hooks> "$(cat <prompt file>)"`.
+/// The prompt goes through a file: typed input before the shell starts is
+/// subject to the tty's line limit (1024 bytes on macOS).
+fn claude_command(agent: &AgentConfig, session_id: &str, settings: &Path, prompt: &Path) -> String {
+    let mut words = vec![sh_word(&agent.command)];
+    words.extend(interactive_args(agent).iter().map(|a| sh_word(a)));
+    words.push(format!("--session-id {session_id}"));
+    words.push(format!(
+        "--settings {}",
+        sh_word(&settings.to_string_lossy())
+    ));
+    words.push(format!("\"$(cat {})\"", sh_word(&prompt.to_string_lossy())));
+    words.join(" ")
+}
+
+/// Claude Code settings whose hooks report to the daemon via
+/// `karazhan --agent-event` (the worktree + slot come from the env the
+/// terminal sets).
+fn hooks_settings(exe: &Path) -> serde_json::Value {
+    let hook = |matcher: &str, event: AgentEvent| {
+        serde_json::json!({ "matcher": matcher, "hooks": [{
+            "type": "command",
+            "command": agent_event_command(exe, event),
+            "timeout": 10,
+        }]})
+    };
+    serde_json::json!({ "hooks": {
+        "SessionStart": [hook("", AgentEvent::Start)],
+        "UserPromptSubmit": [hook("", AgentEvent::Running)],
+        "Stop": [hook("", AgentEvent::Done)],
+        "Notification": [
+            hook("permission_prompt", AgentEvent::Waiting),
+            hook("idle_prompt", AgentEvent::Idle),
+        ],
+        "SessionEnd": [hook("", AgentEvent::End)],
+    }})
+}
+
+/// Write the hooks settings + `prompt` to the socket dir, pick the session id
+/// (persisted on `SessionStart`), and return the claude command.
+async fn prepare_claude(
+    shared: &Arc<Shared>,
+    path: &Path,
+    agent: &AgentConfig,
+    prompt: &str,
+    exe: &Path,
+) -> Result<String> {
+    let dir = ipc::ensure_sock_dir()?;
+    let settings = dir.join("claude-hooks.json");
+    let content = hooks_settings(exe).to_string();
+    // Only on change: a claude starting elsewhere may be reading it.
+    if std::fs::read(&settings).ok().as_deref() != Some(content.as_bytes()) {
+        std::fs::write(&settings, content)?;
+    }
+    let session_id = uuid::Uuid::new_v4().to_string();
+    // ponytail: prompt files are never deleted (a few KB per worktree); clean
+    // them up on SessionStart if the dir ever grows.
+    let prompt_file = dir.join("prompts").join(format!("{session_id}.md"));
+    std::fs::create_dir_all(dir.join("prompts"))?;
+    std::fs::write(&prompt_file, prompt)?;
+    shared
+        .registry
+        .lock()
+        .await
+        .pending_session
+        .insert(path.to_path_buf(), session_id.clone());
+    Ok(claude_command(agent, &session_id, &settings, &prompt_file))
+}
+
+/// New worktree, interactive agent: open terminal 1 and type setup + claude.
+async fn launch_in_terminal(
+    shared: &Arc<Shared>,
+    path: &Path,
+    setup: Option<String>,
+    prompt: Option<String>,
+    agent: &AgentConfig,
+) {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            shared.error(
+                Some(path.to_path_buf()),
+                format!("cannot locate karazhan: {e}"),
+            );
+            return;
+        }
+    };
+    let claude = match prompt {
+        Some(body) => match prepare_claude(shared, path, agent, &body, &exe).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                shared.error(
+                    Some(path.to_path_buf()),
+                    format!("cannot start claude: {e}"),
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let end = agent_event_command(&exe, AgentEvent::End);
+    let line = launch_line(setup.as_deref(), claude.as_deref(), &end);
+    let input = if line.is_empty() {
+        Vec::new()
+    } else {
+        // Running until `end` (or claude's hooks) say otherwise.
+        let summary = setup.map(|c| format!("running setup: {}", truncate_command(&c)));
+        shared
+            .set_status(path, WorktreeStatus::Running, summary, None)
+            .await;
+        format!("{line}\r").into_bytes()
+    };
+    tracing::info!(worktree = %path.display(), "daemon: launching in terminal: {line}");
+    if let Err(e) = shared.pty.create(path, input) {
+        shared.error(Some(path.to_path_buf()), format!("terminal: {e}"));
+        shared
+            .set_status(path, WorktreeStatus::Idle, None, None)
+            .await;
+    }
+}
+
+/// Type `prompt` into the worktree's live interactive claude.  False when
+/// there is none (run headless instead); true when it was pasted or refused.
+async fn paste_into_claude(shared: &Arc<Shared>, path: &Path, prompt: &str) -> bool {
+    let Some(claude) = shared.registry.lock().await.interactive.get(path).copied() else {
+        return false;
+    };
+    let slot = claude.slot;
+    if shared.pty.foreground(path, slot) != Some(claude.pgrp) {
+        shared.registry.lock().await.interactive.remove(path);
+        return false;
+    }
+    let refused = if claude.waiting {
+        Some("is waiting for you")
+    } else if !shared.pty.bracketed_paste(path, slot) {
+        Some("is not ready for input")
+    } else {
+        None
+    };
+    if let Some(why) = refused {
+        shared.error(
+            Some(path.to_path_buf()),
+            format!("claude in terminal {slot} {why}; prompt not sent"),
+        );
+        return true;
+    }
+    // No ESC, so the prompt cannot end the paste early.
+    let text = format!("\x1b[200~{}\x1b[201~", prompt.replace('\x1b', ""));
+    if !shared.pty.send(path, slot, text.into_bytes()) {
+        shared.registry.lock().await.interactive.remove(path);
+        return false;
+    }
+    tracing::info!(worktree = %path.display(), slot, "daemon: pasted prompt into claude");
+    // ponytail: fixed delay so claude has taken the paste before Enter
+    // submits it; watch the screen if it ever proves flaky.
+    let pty = shared.pty.clone();
+    let path = path.to_path_buf();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        pty.send(&path, slot, b"\r".to_vec());
+    });
+    true
+}
+
+/// A hook of the interactive claude in terminal `slot` of `path` fired.
+async fn agent_event(shared: &Arc<Shared>, path: PathBuf, slot: u8, event: AgentEvent) {
+    // A hook runs in claude's process group, so this is claude's.
+    let pgrp = shared.pty.foreground(&path, slot);
+    let (status, session_id) = {
+        let mut reg = shared.registry.lock().await;
+        let Some(view) = reg.worktrees.get_mut(&path) else {
+            return;
+        };
+        if matches!(view.status, WorktreeStatus::Deleting) {
+            return;
+        }
+        let running = matches!(view.status, WorktreeStatus::Running);
+        if event == AgentEvent::Running {
+            view.last_summary = None;
+            reg.summaries.remove(&path);
+        }
+        match (event, pgrp) {
+            (AgentEvent::End, _) => {
+                if reg.interactive.get(&path).is_some_and(|c| c.slot == slot) {
+                    reg.interactive.remove(&path);
+                }
+            }
+            (_, Some(pgrp)) => {
+                // Only a new turn or its end clears a waiting dialog.
+                let waiting = match event {
+                    AgentEvent::Waiting => true,
+                    AgentEvent::Running | AgentEvent::Done => false,
+                    _ => reg.interactive.get(&path).is_some_and(|c| c.waiting),
+                };
+                reg.interactive.insert(
+                    path.clone(),
+                    Claude {
+                        slot,
+                        pgrp,
+                        waiting,
+                    },
+                );
+            }
+            (_, None) => {}
+        }
+        let session_id = if event == AgentEvent::Start {
+            reg.pending_session.remove(&path)
+        } else {
+            None
+        };
+        let status = match event {
+            AgentEvent::Start => None,
+            AgentEvent::Running => Some(WorktreeStatus::Running),
+            AgentEvent::Done | AgentEvent::Waiting | AgentEvent::Idle => {
+                Some(WorktreeStatus::NeedsReview)
+            }
+            AgentEvent::End => running.then_some(WorktreeStatus::Idle),
+        };
+        (status, session_id)
+    };
+    if let Some(id) = session_id {
+        shared.persist_session_id(&path, &id).await;
+    }
+    if let Some(status) = status {
+        shared.set_status(&path, status, None, None).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3664,6 +4010,203 @@ mod tests {
 
         // The project count is unchanged (still just alpha).
         assert_eq!(shared.projects.lock().await.len(), 1);
+    }
+
+    // -- Interactive claude in the terminal ----------------------------------
+
+    #[test]
+    fn interactive_args_drop_streaming_flags() {
+        assert!(interactive_args(&AgentConfig::default()).is_empty());
+        let agent = AgentConfig {
+            args: ["--model", "opus", "--output-format=json", "-p", "--verbose"]
+                .map(String::from)
+                .to_vec(),
+            ..AgentConfig::default()
+        };
+        assert_eq!(interactive_args(&agent), ["--model", "opus"]);
+    }
+
+    #[test]
+    fn runs_interactive_only_for_real_claude() {
+        let claude = AgentConfig::default();
+        assert!(runs_interactive(&claude, "Configured"));
+        assert!(!runs_interactive(&claude, "Mock"));
+        let abs = AgentConfig {
+            command: "/opt/bin/claude".into(),
+            ..AgentConfig::default()
+        };
+        assert!(runs_interactive(&abs, "Configured"));
+        let other = AgentConfig {
+            command: "codex".into(),
+            ..AgentConfig::default()
+        };
+        assert!(!runs_interactive(&other, "Configured"));
+    }
+
+    #[test]
+    fn launch_line_chains_setup_then_claude() {
+        let claude = claude_command(
+            &AgentConfig::default(),
+            "ID",
+            Path::new("/k/hooks.json"),
+            Path::new("/k/it's.md"),
+        );
+        assert_eq!(
+            claude,
+            r#"claude --session-id ID --settings /k/hooks.json "$(cat '/k/it'\''s.md')""#
+        );
+        assert_eq!(
+            launch_line(Some("npm i; make"), Some("claude x"), "end"),
+            "sh -c 'npm i; make' && claude x; end"
+        );
+        assert_eq!(launch_line(Some("make"), None, "end"), "sh -c make; end");
+        assert_eq!(launch_line(None, Some("claude x"), "end"), "claude x; end");
+        assert_eq!(launch_line(None, None, "end"), "");
+        assert_eq!(
+            agent_event_command(Path::new("/my bin/karazhan"), AgentEvent::End),
+            "'/my bin/karazhan' --agent-event end"
+        );
+    }
+
+    #[test]
+    fn hooks_settings_report_each_event() {
+        let v = hooks_settings(Path::new("/bin/karazhan"));
+        let cmd = |e: &str, i: usize| v["hooks"][e][i]["hooks"][0]["command"].clone();
+        assert_eq!(cmd("SessionStart", 0), "/bin/karazhan --agent-event start");
+        assert_eq!(
+            cmd("UserPromptSubmit", 0),
+            "/bin/karazhan --agent-event running"
+        );
+        assert_eq!(cmd("Stop", 0), "/bin/karazhan --agent-event done");
+        assert_eq!(cmd("SessionEnd", 0), "/bin/karazhan --agent-event end");
+        assert_eq!(
+            v["hooks"]["Notification"][0]["matcher"],
+            "permission_prompt"
+        );
+        assert_eq!(
+            cmd("Notification", 0),
+            "/bin/karazhan --agent-event waiting"
+        );
+        assert_eq!(v["hooks"]["Notification"][1]["matcher"], "idle_prompt");
+        assert_eq!(cmd("Notification", 1), "/bin/karazhan --agent-event idle");
+    }
+
+    async fn status_of(shared: &Arc<Shared>, path: &Path) -> WorktreeStatus {
+        shared.registry.lock().await.worktrees[path].status.clone()
+    }
+
+    async fn claude_of(shared: &Arc<Shared>, path: &Path) -> Option<Claude> {
+        shared.registry.lock().await.interactive.get(path).copied()
+    }
+
+    /// A seeded worktree whose terminal 1 runs `cat` in the foreground with
+    /// bracketed paste on: a stand-in for claude, so pastes never reach a shell.
+    async fn worktree_with_job(shared: &Arc<Shared>, dir: &tempfile::TempDir) -> (PathBuf, u8) {
+        let path = dir.path().canonicalize().unwrap();
+        seed_worktree(shared, &path, false, None).await;
+        let input = b"printf '\\033[?2004h'; cat\r".to_vec();
+        let slot = shared.pty.create(&path, input).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while shared.pty.foreground(&path, slot).is_none()
+            || !shared.pty.bracketed_paste(&path, slot)
+        {
+            assert!(std::time::Instant::now() < deadline, "cat never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        (path, slot)
+    }
+
+    #[tokio::test]
+    async fn agent_events_drive_status_and_liveness() {
+        let (_dir, root) = make_temp_repo();
+        let shared = make_shared(root, Arc::new(MockGh::new(vec![]))).await;
+        let wt = tempfile::tempdir().unwrap();
+        let (path, slot) = worktree_with_job(&shared, &wt).await;
+        shared
+            .registry
+            .lock()
+            .await
+            .pending_session
+            .insert(path.clone(), "sid-1".into());
+
+        agent_event(&shared, path.clone(), slot, AgentEvent::Start).await;
+        let claude = claude_of(&shared, &path).await.expect("recorded");
+        assert_eq!((claude.slot, claude.waiting), (slot, false));
+        assert_eq!(status_of(&shared, &path).await, WorktreeStatus::Idle);
+        assert_eq!(
+            shared.registry.lock().await.worktrees[&path]
+                .session_id
+                .as_deref(),
+            Some("sid-1"),
+            "session id persisted once claude started"
+        );
+        agent_event(&shared, path.clone(), slot, AgentEvent::Running).await;
+        assert_eq!(status_of(&shared, &path).await, WorktreeStatus::Running);
+        agent_event(&shared, path.clone(), slot, AgentEvent::Waiting).await;
+        assert!(claude_of(&shared, &path).await.unwrap().waiting);
+        agent_event(&shared, path.clone(), slot, AgentEvent::Idle).await;
+        assert!(
+            claude_of(&shared, &path).await.unwrap().waiting,
+            "idle keeps a dialog waiting"
+        );
+        assert_eq!(status_of(&shared, &path).await, WorktreeStatus::NeedsReview);
+        agent_event(&shared, path.clone(), slot, AgentEvent::Done).await;
+        assert!(!claude_of(&shared, &path).await.unwrap().waiting);
+        // Quitting mid-turn leaves it Idle, not stuck Running.
+        agent_event(&shared, path.clone(), slot, AgentEvent::Running).await;
+        agent_event(&shared, path.clone(), slot, AgentEvent::End).await;
+        assert_eq!(claude_of(&shared, &path).await, None);
+        assert_eq!(status_of(&shared, &path).await, WorktreeStatus::Idle);
+
+        // Events for unknown or deleting worktrees are ignored.
+        let gone = PathBuf::from("/tmp/no-such-wt");
+        agent_event(&shared, gone.clone(), 1, AgentEvent::Running).await;
+        assert!(shared.registry.lock().await.interactive.is_empty());
+        shared
+            .set_status(&path, WorktreeStatus::Deleting, None, None)
+            .await;
+        agent_event(&shared, path.clone(), slot, AgentEvent::Done).await;
+        assert_eq!(status_of(&shared, &path).await, WorktreeStatus::Deleting);
+    }
+
+    #[tokio::test]
+    async fn prompts_paste_into_live_claude_else_run_headless() {
+        let (_dir, root) = make_temp_repo();
+        let shared = make_shared(root, Arc::new(MockGh::new(vec![]))).await;
+        let wt = tempfile::tempdir().unwrap();
+        let (path, slot) = worktree_with_job(&shared, &wt).await;
+        agent_event(&shared, path.clone(), slot, AgentEvent::Start).await;
+        let claude = claude_of(&shared, &path).await.expect("recorded");
+
+        // Pasted into the live claude: no headless run.
+        run_prompt(Arc::clone(&shared), path.clone(), "hello".into()).await;
+        assert_eq!(status_of(&shared, &path).await, WorktreeStatus::Idle);
+        assert_eq!(claude_of(&shared, &path).await, Some(claude));
+
+        // A waiting dialog: refused, and no headless run either.
+        shared.registry.lock().await.interactive.insert(
+            path.clone(),
+            Claude {
+                waiting: true,
+                ..claude
+            },
+        );
+        assert!(paste_into_claude(&shared, &path, "hello").await);
+        assert!(claude_of(&shared, &path).await.is_some());
+
+        // A recorded claude whose shell is back in the foreground (Ctrl-Z,
+        // crash) or whose slot holds another shell: dropped, run headless.
+        shared.registry.lock().await.interactive.insert(
+            path.clone(),
+            Claude {
+                pgrp: claude.pgrp + 1,
+                waiting: false,
+                ..claude
+            },
+        );
+        run_prompt(Arc::clone(&shared), path.clone(), "hello".into()).await;
+        assert_eq!(status_of(&shared, &path).await, WorktreeStatus::Running);
+        assert_eq!(claude_of(&shared, &path).await, None);
     }
 
     // -- Worktree setup: precedence resolver ----------------------------------

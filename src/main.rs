@@ -116,6 +116,13 @@ fn main() -> Result<()> {
         return watcher_proc::run_watcher();
     }
 
+    // Agent-event branch: a claude hook inside a karazhan terminal reporting
+    // to the daemon (see `client::send_agent_event`).
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(i) = argv.iter().position(|a| a == "--agent-event") {
+        return client::send_agent_event(argv.get(i + 1).map(String::as_str));
+    }
+
     // Stop-daemon branch: cleanly stop any running supervisor and exit without
     // starting the TUI.  Handled before the main runtime/TUI setup.
     if std::env::args().any(|a| a == "--stop-daemon") {

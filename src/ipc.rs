@@ -52,7 +52,7 @@ use crate::worktree::model::{PrStatus, Worktree, WorktreeStatus};
 /// the handshake request and a `ProtocolMismatch` reply even when every other
 /// wire-format item has changed. Do NOT reorder these two; only append new
 /// variants after `ProtocolMismatch`.
-pub const PROTOCOL_VERSION: u32 = 18;
+pub const PROTOCOL_VERSION: u32 = 19;
 
 /// Maximum frame body size accepted by `read_frame_async` (64 MiB).
 const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
@@ -241,6 +241,58 @@ pub enum ClientMsg {
     Shutdown,
     /// Embedded terminal pane command (see [`TermCmd`]).
     Term(TermCmd),
+    /// A Claude Code hook fired in the interactive claude karazhan launched in
+    /// terminal `slot` of `worktree_path` (sent by `karazhan --agent-event`).
+    AgentEvent {
+        worktree_path: PathBuf,
+        slot: u8,
+        event: AgentEvent,
+    },
+}
+
+/// Claude Code hook events karazhan listens to.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub enum AgentEvent {
+    /// `SessionStart`: claude is up and accepts pasted prompts.
+    Start,
+    /// `UserPromptSubmit`: a turn started.
+    Running,
+    /// `Stop`: the turn finished.
+    Done,
+    /// `Notification` (`permission_prompt`): claude waits on a dialog.
+    Waiting,
+    /// `Notification` (`idle_prompt`): claude has been idle a while (also after
+    /// an Esc interrupt, where `Stop` does not fire).
+    Idle,
+    /// `SessionEnd`: claude exited.
+    End,
+}
+
+impl AgentEvent {
+    /// The `--agent-event` argument naming this event.
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Waiting => "waiting",
+            Self::Idle => "idle",
+            Self::End => "end",
+        }
+    }
+
+    pub fn from_arg(arg: &str) -> Option<Self> {
+        [
+            Self::Start,
+            Self::Running,
+            Self::Done,
+            Self::Waiting,
+            Self::Idle,
+            Self::End,
+        ]
+        .into_iter()
+        .find(|e| e.as_arg() == arg)
+    }
 }
 
 /// Terminal-session commands.  Sessions are keyed by worktree + slot (1–9);
@@ -653,8 +705,8 @@ mod tests {
     // ── Protocol version + frozen wire format ─────────────────────────────────
 
     #[test]
-    fn protocol_version_is_eighteen() {
-        assert_eq!(PROTOCOL_VERSION, 18);
+    fn protocol_version_is_nineteen() {
+        assert_eq!(PROTOCOL_VERSION, 19);
     }
 
     #[test]

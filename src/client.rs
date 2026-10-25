@@ -362,6 +362,57 @@ async fn finish_connect(
     Ok(SupervisorClient { tx, supervisor_pid })
 }
 
+/// `karazhan --agent-event <event>`: run by the hooks of an interactive claude
+/// inside a karazhan terminal, which sets `KARAZHAN_WORKTREE`/`KARAZHAN_SLOT`.
+/// Reports the event to the daemon.  Never spawns a daemon and never fails,
+/// so a missing daemon cannot break the hook.
+pub fn send_agent_event(arg: Option<&str>) -> Result<()> {
+    let event = arg.and_then(ipc::AgentEvent::from_arg);
+    let path = std::env::var_os("KARAZHAN_WORKTREE");
+    let slot = std::env::var("KARAZHAN_SLOT")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let (Some(event), Some(path), Some(slot)) = (event, path, slot) else {
+        return Ok(());
+    };
+    let msg = ClientMsg::AgentEvent {
+        worktree_path: path.into(),
+        slot,
+        event,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let timeout = std::time::Duration::from_secs(3);
+    let _ = runtime.block_on(async { tokio::time::timeout(timeout, send_once(msg)).await });
+    Ok(())
+}
+
+/// Handshake, send `msg`, and wait for the daemon to close the connection
+/// (it does once it has handled `msg` and seen our EOF).
+async fn send_once(msg: ClientMsg) -> Result<()> {
+    let sock = std::env::var_os("KARAZHAN_SOCKET")
+        .map_or_else(ipc::resolve_socket_path, std::path::PathBuf::from);
+    let stream = UnixStream::connect(sock).await?;
+    let (mut read_half, mut write_half) = stream.into_split();
+    ipc::write_frame_async(
+        &mut write_half,
+        &HandshakeReq {
+            protocol: PROTOCOL_VERSION,
+            client_pid: std::process::id(),
+        },
+    )
+    .await?;
+    let HandshakeResp::Ok { .. } = ipc::read_frame_async(&mut read_half).await? else {
+        bail!("daemon protocol mismatch");
+    };
+    ipc::write_frame_async(&mut write_half, &msg).await?;
+    // Dropping the write half shuts it down: the daemon sees EOF.
+    drop(write_half);
+    tokio::io::copy(&mut read_half, &mut tokio::io::sink()).await?;
+    Ok(())
+}
+
 /// Cleanly stop a running supervisor daemon, if any.
 ///
 /// Reads the pidfile next to the resolved socket; if it names a live PID, sends

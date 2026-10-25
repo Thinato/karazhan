@@ -388,6 +388,43 @@ impl PtyHost {
         let _ = self.events.send(self.sessions_msg(path));
     }
 
+    /// Start a session in the lowest free slot (no viewer yet) and type
+    /// `input` into it.  Returns the slot.
+    pub fn create(&self, path: &Path, input: Vec<u8>) -> Result<u8, String> {
+        let session = self.spawn(path, 24, 80)?;
+        self.broadcast_sessions(path);
+        let _ = session.input_tx.try_send(input);
+        Ok(session.slot)
+    }
+
+    /// Type `bytes` into session `slot` of `path`; false if it is gone.
+    pub fn send(&self, path: &Path, slot: u8, bytes: Vec<u8>) -> bool {
+        let session = lock(&self.sessions)
+            .get(&(path.to_path_buf(), slot))
+            .cloned();
+        session.is_some_and(|s| s.input_tx.try_send(bytes).is_ok())
+    }
+
+    /// The process group of the job holding session `slot`'s foreground, or
+    /// `None` when that is the shell itself (or there is no such session).
+    pub fn foreground(&self, path: &Path, slot: u8) -> Option<u32> {
+        let session = lock(&self.sessions)
+            .get(&(path.to_path_buf(), slot))
+            .cloned()?;
+        let st = lock(&session.state);
+        // SAFETY: the fd is open while `master` is Some (we hold the lock).
+        let pgrp = unsafe { nix::libc::tcgetpgrp(st.master?) };
+        (pgrp > 0 && pgrp as u32 != session.pid).then_some(pgrp as u32)
+    }
+
+    /// Whether the session's app enabled bracketed paste.
+    pub fn bracketed_paste(&self, path: &Path, slot: u8) -> bool {
+        let session = lock(&self.sessions)
+            .get(&(path.to_path_buf(), slot))
+            .cloned();
+        session.is_some_and(|s| lock(&s.state).parser.screen().bracketed_paste())
+    }
+
     /// Spawn `$SHELL` in `path` in the lowest free slot.
     fn spawn(&self, path: &Path, rows: u16, cols: u16) -> Result<Arc<Session>, String> {
         let mut map = lock(&self.sessions);
@@ -424,6 +461,10 @@ impl PtyHost {
         let mut cmd = tokio::process::Command::new(&self.shell);
         cmd.current_dir(path)
             .env("TERM", "xterm-256color")
+            // Read by `karazhan --agent-event` from claude's hooks.
+            .env("KARAZHAN_WORKTREE", path)
+            .env("KARAZHAN_SLOT", slot.to_string())
+            .env("KARAZHAN_SOCKET", crate::ipc::resolve_socket_path())
             .stdin(pty.slave.try_clone()?)
             .stdout(pty.slave.try_clone()?)
             .stderr(pty.slave)
@@ -853,6 +894,31 @@ mod tests {
             .to_string_lossy()
             .to_string();
         c.until(&format!("{name}\n")).await;
+    }
+
+    #[tokio::test]
+    async fn create_types_input_and_send_reaches_shell() {
+        let (host, _rx) = host();
+        let dir = tempfile::tempdir().unwrap();
+        let slot = host
+            .create(dir.path(), b"echo typed-$KARAZHAN_SLOT\r".to_vec())
+            .unwrap();
+        assert_eq!(slot, 1);
+        assert!(host.send(dir.path(), 1, b"echo sent-ok\r".to_vec()));
+        assert!(!host.send(dir.path(), 2, b"x".to_vec()), "no session 2");
+        let mut c = Client::attach(&host, dir.path(), Some(1), (24, 80)).await;
+        c.until("typed-1\n").await;
+        c.until("sent-ok\n").await;
+        assert_eq!(
+            host.foreground(dir.path(), 1),
+            None,
+            "the shell is in front"
+        );
+        c.input(&host, "sleep 5\r");
+        wait_until("a foreground job", || {
+            host.foreground(dir.path(), 1).is_some()
+        })
+        .await;
     }
 
     #[tokio::test]
