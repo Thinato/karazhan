@@ -146,6 +146,10 @@ cd karazhan
 cargo install --path .
 ```
 
+On startup karazhan asks GitHub for the latest release, and the Grid view's
+status line shows `karazhan vX.Y.Z available` when it's newer. Nothing is
+downloaded; update the way you installed.
+
 Or run without installing:
 
 ```bash
