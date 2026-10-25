@@ -50,6 +50,20 @@ impl SupervisorClient {
             tracing::warn!("client: failed to enqueue ClientMsg (writer gone): {e}");
         }
     }
+
+    /// A client backed by a bare channel instead of a socket, so tests can
+    /// drive the real `App` handlers and inspect what they send.
+    #[cfg(test)]
+    pub fn test_pair() -> (Self, mpsc::Receiver<ClientMsg>) {
+        let (tx, rx) = mpsc::channel(CLIENT_TX_CAP);
+        (
+            Self {
+                tx,
+                supervisor_pid: 0,
+            },
+            rx,
+        )
+    }
 }
 
 /// Translate a daemon-pushed [`SupervisorMsg`] into the [`AppEvent`] the UI loop
@@ -84,6 +98,44 @@ pub fn supervisor_msg_to_app_event(msg: SupervisorMsg) -> AppEvent {
             worktree_path,
             message,
         } => AppEvent::DaemonError {
+            worktree_path,
+            message,
+        },
+        SupervisorMsg::TermScreen {
+            worktree_path,
+            slot,
+            rows,
+            cols,
+            bytes,
+        } => AppEvent::TermScreen {
+            worktree_path,
+            slot,
+            rows,
+            cols,
+            bytes,
+        },
+        SupervisorMsg::TermDiff {
+            worktree_path,
+            slot,
+            bytes,
+        } => AppEvent::TermDiff {
+            worktree_path,
+            slot,
+            bytes,
+        },
+        SupervisorMsg::TermSessions {
+            worktree_path,
+            slots,
+            attention,
+        } => AppEvent::TermSessions {
+            worktree_path,
+            slots,
+            attention,
+        },
+        SupervisorMsg::TermError {
+            worktree_path,
+            message,
+        } => AppEvent::TermError {
             worktree_path,
             message,
         },
@@ -310,6 +362,57 @@ async fn finish_connect(
     Ok(SupervisorClient { tx, supervisor_pid })
 }
 
+/// `karazhan --agent-event <event>`: run by the hooks of an interactive claude
+/// inside a karazhan terminal, which sets `KARAZHAN_WORKTREE`/`KARAZHAN_SLOT`.
+/// Reports the event to the daemon.  Never spawns a daemon and never fails,
+/// so a missing daemon cannot break the hook.
+pub fn send_agent_event(arg: Option<&str>) -> Result<()> {
+    let event = arg.and_then(ipc::AgentEvent::from_arg);
+    let path = std::env::var_os("KARAZHAN_WORKTREE");
+    let slot = std::env::var("KARAZHAN_SLOT")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let (Some(event), Some(path), Some(slot)) = (event, path, slot) else {
+        return Ok(());
+    };
+    let msg = ClientMsg::AgentEvent {
+        worktree_path: path.into(),
+        slot,
+        event,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let timeout = std::time::Duration::from_secs(3);
+    let _ = runtime.block_on(async { tokio::time::timeout(timeout, send_once(msg)).await });
+    Ok(())
+}
+
+/// Handshake, send `msg`, and wait for the daemon to close the connection
+/// (it does once it has handled `msg` and seen our EOF).
+async fn send_once(msg: ClientMsg) -> Result<()> {
+    let sock = std::env::var_os("KARAZHAN_SOCKET")
+        .map_or_else(ipc::resolve_socket_path, std::path::PathBuf::from);
+    let stream = UnixStream::connect(sock).await?;
+    let (mut read_half, mut write_half) = stream.into_split();
+    ipc::write_frame_async(
+        &mut write_half,
+        &HandshakeReq {
+            protocol: PROTOCOL_VERSION,
+            client_pid: std::process::id(),
+        },
+    )
+    .await?;
+    let HandshakeResp::Ok { .. } = ipc::read_frame_async(&mut read_half).await? else {
+        bail!("daemon protocol mismatch");
+    };
+    ipc::write_frame_async(&mut write_half, &msg).await?;
+    // Dropping the write half shuts it down: the daemon sees EOF.
+    drop(write_half);
+    tokio::io::copy(&mut read_half, &mut tokio::io::sink()).await?;
+    Ok(())
+}
+
 /// Cleanly stop a running supervisor daemon, if any.
 ///
 /// Reads the pidfile next to the resolved socket; if it names a live PID, sends
@@ -503,6 +606,91 @@ mod tests {
                 assert_eq!(message, "internal");
             }
             other => panic!("expected DaemonError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn term_screen_maps_to_app_term_screen() {
+        let event = supervisor_msg_to_app_event(SupervisorMsg::TermScreen {
+            worktree_path: PathBuf::from("/wt"),
+            slot: 2,
+            rows: 24,
+            cols: 80,
+            bytes: b"\x1b[H".to_vec(),
+        });
+        match event {
+            AppEvent::TermScreen {
+                worktree_path,
+                slot,
+                rows,
+                cols,
+                bytes,
+            } => {
+                assert_eq!(worktree_path, PathBuf::from("/wt"));
+                assert_eq!((slot, rows, cols), (2, 24, 80));
+                assert_eq!(bytes, b"\x1b[H");
+            }
+            other => panic!("expected TermScreen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn term_diff_maps_to_app_term_diff() {
+        let event = supervisor_msg_to_app_event(SupervisorMsg::TermDiff {
+            worktree_path: PathBuf::from("/wt"),
+            slot: 3,
+            bytes: b"x".to_vec(),
+        });
+        match event {
+            AppEvent::TermDiff {
+                worktree_path,
+                slot,
+                bytes,
+            } => {
+                assert_eq!(worktree_path, PathBuf::from("/wt"));
+                assert_eq!(slot, 3);
+                assert_eq!(bytes, b"x");
+            }
+            other => panic!("expected TermDiff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn term_sessions_maps_to_app_term_sessions() {
+        let event = supervisor_msg_to_app_event(SupervisorMsg::TermSessions {
+            worktree_path: PathBuf::from("/wt"),
+            slots: vec![1, 3],
+            attention: true,
+        });
+        match event {
+            AppEvent::TermSessions {
+                worktree_path,
+                slots,
+                attention,
+            } => {
+                assert_eq!(worktree_path, PathBuf::from("/wt"));
+                assert_eq!(slots, vec![1, 3]);
+                assert!(attention);
+            }
+            other => panic!("expected TermSessions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn term_error_maps_to_app_term_error() {
+        let event = supervisor_msg_to_app_event(SupervisorMsg::TermError {
+            worktree_path: PathBuf::from("/wt"),
+            message: "max 9 sessions".into(),
+        });
+        match event {
+            AppEvent::TermError {
+                worktree_path,
+                message,
+            } => {
+                assert_eq!(worktree_path, PathBuf::from("/wt"));
+                assert_eq!(message, "max 9 sessions");
+            }
+            other => panic!("expected TermError, got {other:?}"),
         }
     }
 }

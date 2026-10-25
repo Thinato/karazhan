@@ -23,8 +23,8 @@ raw transcript.
 Karazhan (`kah-rah-zhan`) is a Rust TUI for developers who run **many** coding
 agents in parallel. Instead of juggling terminal tabs, you keep a library of
 prompts and a grid of worktrees. Pick a prompt, spawn a worktree, and the agent
-runs headless in the background. You only ever see a coarse per-square status and
-a short summary in the detail pane — never the noisy transcript.
+starts in that worktree's embedded terminal. Each square shows a coarse status,
+and you can check in on or talk to any agent without leaving the grid.
 
 **How it works.** A background **daemon** (the supervisor) owns every agent
 session and a filesystem watcher; the **TUI client** talks to it over a local
@@ -93,7 +93,7 @@ Press `?` any time for the in-app keybinding overlay, or `Ctrl-p` for the comman
 | `o` / `y` / `Y` | Open PR in browser / copy PR URL / copy URL + title |
 | `R` | Resume session (recover an errored/interrupted run) |
 | `s` | Copy a `cd <worktree> && resume` shell command to debug it yourself |
-| `<` / `>` | Widen / narrow the detail pane by 5 cols (`Ctrl` for 1) |
+| `<` / `>` | Widen / narrow the terminal pane by 5% (`Ctrl` for 1%) |
 | `r` | Refresh the worktree list |
 
 ### Worktree status colors
@@ -108,6 +108,21 @@ Press `?` any time for the in-app keybinding overlay, or `Ctrl-p` for the comman
 | **error** (red) | Agent session or command failed |
 
 Colors are configurable — see [Configuration](#-configuration).
+
+### New worktrees run in the terminal
+
+Every new worktree opens terminal session 1. With the default `claude` agent,
+karazhan types the setup command and then claude on the prompt into it
+(`sh -c '<setup>' && claude --session-id <id> --settings <hooks> "<prompt>"`),
+so the agent is interactive from the start. Claude Code hooks report each turn
+back to the daemon, so the card still goes **running** → **needs review**.
+While that claude is open, `c`, `p`, `i`, `R` and auto-continue paste their
+prompt into it instead of starting a headless run. Custom agent commands keep
+the headless background flow (and get a plain shell in session 1).
+
+Claude asks to trust each new folder (default: *No, exit*). Trust is inherited
+from parent directories, so run `claude` once in your worktrees base dir and
+accept to skip the prompt for every worktree.
 
 ## 📦 Installation
 
@@ -159,6 +174,9 @@ gh_bin     = "gh"
 
 # Prompt sent to the agent when auto-continue fires after a PR merge.
 auto_continue_prompt = "The PR for this worktree was merged. Continue with the next step of the task."
+
+# Prefix chord for the Grid view's terminal pane (tmux style: "C-a", "ctrl-b").
+terminal_prefix = "C-a"
 
 # Per-status color overrides. Supported names: black, red, green, yellow,
 # blue, magenta, cyan, gray, dark_gray, white, light_red, light_green,

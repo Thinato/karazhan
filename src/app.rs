@@ -1,13 +1,20 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+    KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Style};
+use ratatui::widgets::{Block, Paragraph};
 use ratatui::Terminal;
+use std::collections::{HashMap, HashSet};
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
@@ -15,11 +22,11 @@ use tokio::sync::mpsc;
 use crate::client::SupervisorClient;
 use crate::commands::{self, CommandId, NewWorktreeModal, Palette, WorktreeChoice};
 use crate::config::Config;
-use crate::ipc::{BuiltinKind, ClientMsg, ProjectInfo, WorktreeView};
-use crate::ui::detail::{split_grid_detail, DetailView};
+use crate::ipc::{BuiltinKind, ClientMsg, ProjectInfo, TermCmd, WorktreeView};
 use crate::ui::grid::GridView;
 use crate::ui::keymap::{clamp_selection, Motion};
 use crate::ui::library::{LibraryMode, LibraryView, SelectedPrompt};
+use crate::ui::terminal::{key_to_bytes, split_grid_pane};
 use crate::worktree::WorktreeStatus;
 
 #[derive(Debug)]
@@ -70,6 +77,31 @@ pub enum AppEvent {
         /// open PR or the count could not be fetched this tick.
         unresolved_comments: Option<u64>,
     },
+    /// Full screen of the attached terminal session (see `SupervisorMsg::TermScreen`).
+    TermScreen {
+        worktree_path: PathBuf,
+        slot: u8,
+        rows: u16,
+        cols: u16,
+        bytes: Vec<u8>,
+    },
+    /// Screen diff for the attached terminal session.
+    TermDiff {
+        worktree_path: PathBuf,
+        slot: u8,
+        bytes: Vec<u8>,
+    },
+    /// Live terminal slots + bell attention for one worktree.
+    TermSessions {
+        worktree_path: PathBuf,
+        slots: Vec<u8>,
+        attention: bool,
+    },
+    /// Per-connection terminal error.
+    TermError {
+        worktree_path: PathBuf,
+        message: String,
+    },
 }
 
 /// Top-level view the application is currently showing.
@@ -88,6 +120,77 @@ pub enum GridMode {
     PromptInput,
     /// Typing a new name for the selected worktree.
     NameInput,
+}
+
+/// Which side of the Grid view receives keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    /// The worktree grid (vim motions, commands).
+    Nav,
+    /// The terminal pane: every key except the prefix goes to the PTY.
+    Term,
+}
+
+/// What a key resolves to after prefix handling (see [`route_key`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyAction {
+    /// Forward the key to the PTY.
+    Pty(KeyEvent),
+    /// Forward a literal prefix key to the PTY (`prefix prefix`).
+    PtyPrefix,
+    FocusNav,
+    FocusTerm,
+    /// Create a session in the lowest free slot.
+    Create,
+    /// Kill the attached session.
+    Kill,
+    /// Switch to session slot `n` (1–9).
+    Select(u8),
+    /// Handle the key as a normal grid key.
+    Nav(KeyEvent),
+    /// Consume the key and do nothing.
+    Swallow,
+}
+
+/// Route a key through the tmux-style prefix state machine.  `prefix` is the
+/// letter of the Ctrl+letter prefix chord.  A pending prefix is cleared by
+/// whatever key follows it.
+pub fn route_key(focus: Focus, pending: &mut bool, key: KeyEvent, prefix: char) -> KeyAction {
+    let is_prefix = key.code == KeyCode::Char(prefix) && key.modifiers == KeyModifiers::CONTROL;
+    let term = focus == Focus::Term;
+    if !std::mem::take(pending) {
+        return if is_prefix {
+            *pending = true;
+            KeyAction::Swallow
+        } else if term {
+            KeyAction::Pty(key)
+        } else if key.code == KeyCode::Enter {
+            KeyAction::FocusTerm
+        } else {
+            KeyAction::Nav(key)
+        };
+    }
+    if is_prefix {
+        return if term {
+            KeyAction::PtyPrefix
+        } else {
+            KeyAction::Swallow
+        };
+    }
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return KeyAction::Swallow;
+    }
+    match key.code {
+        KeyCode::Char('h') if term => KeyAction::FocusNav,
+        KeyCode::Char('l') => KeyAction::FocusTerm,
+        KeyCode::Char('c') => KeyAction::Create,
+        KeyCode::Char('x') if term => KeyAction::Kill,
+        KeyCode::Char(ch @ '1'..='9') => KeyAction::Select(ch as u8 - b'0'),
+        _ => KeyAction::Swallow,
+    }
 }
 
 /// The worktree pending deletion, held while the (y/N) confirmation modal is open.
@@ -125,7 +228,6 @@ pub struct App {
     grid: GridView,
     grid_mode: GridMode,
     prompt_input: String,
-    detail: DetailView,
     /// Local cache of worktree views pushed by the daemon.
     worktrees: Vec<WorktreeView>,
     /// Authoritative ordered project list pushed by the daemon.  Drives grid
@@ -162,12 +264,32 @@ pub struct App {
     /// Monotonic counter advanced on every tick; drives the Running spinner
     /// animation.  Wraps harmlessly.
     spinner_frame: usize,
-    /// User-requested width (cols) of the Grid-view detail pane.  Adjustable with
-    /// `<`/`>` (±5) and `Ctrl-<`/`Ctrl->` (±1); clamped at use to [30, 80% term].
-    detail_width: u16,
-    /// Last rendered terminal width, captured each draw so width clamping in key
-    /// handlers (which have no frame) uses the current terminal size.
+    /// Width of the Grid-view terminal pane in percent of the terminal width.
+    /// Adjustable with `<`/`>` (±5) and `Ctrl-<`/`Ctrl->` (±1), within 10..=80.
+    pane_pct: u16,
+    /// Last rendered terminal width, captured each draw so the grid column math
+    /// in key handlers (which have no frame) matches the rendered split.
     last_term_width: u16,
+    /// Which Grid-view side receives keys.
+    focus: Focus,
+    /// The prefix key was pressed and the next key is a pane command.
+    prefix_pending: bool,
+    /// Letter of the Ctrl+letter terminal prefix (`a` → `^a`).
+    prefix: char,
+    /// Live terminal slots per worktree (from `TermSessions`).
+    term_slots: HashMap<PathBuf, Vec<u8>>,
+    /// Worktrees whose unwatched session rang the bell.
+    attention: HashSet<PathBuf>,
+    /// Slot last viewed per worktree; reattached on reselect.
+    last_slot: HashMap<PathBuf, u8>,
+    /// Session this connection views; slot `None` = awaiting a create reply.
+    attached: Option<(PathBuf, Option<u8>)>,
+    /// Local emulator fed only with daemon-synthesised frames.
+    term: Option<vt100::Parser>,
+    /// Inner (rows, cols) of the terminal pane, captured each draw.
+    pane_inner: (u16, u16),
+    /// Size last sent to the daemon for the attached session.
+    sent_size: Option<(u16, u16)>,
 }
 
 impl App {
@@ -179,6 +301,7 @@ impl App {
         // The library starts empty and fills per-project on the first Snapshot
         // (same as the grid) — prompts now live at <project>/.karazhan/prompts/.
         let library = LibraryView::new();
+        let prefix = crate::config::parse_prefix(&config.terminal_prefix);
 
         Self {
             running: true,
@@ -188,7 +311,6 @@ impl App {
             grid: GridView::new(),
             grid_mode: GridMode::Normal,
             prompt_input: String::new(),
-            detail: DetailView::new(),
             worktrees: Vec::new(),
             projects: Vec::new(),
             status_message: None,
@@ -202,9 +324,24 @@ impl App {
             pending_delete: None,
             confirm_new_worktree: None,
             spinner_frame: 0,
-            detail_width: crate::ui::detail::DEFAULT_DETAIL_WIDTH,
+            pane_pct: crate::ui::terminal::DEFAULT_PANE_PCT,
             last_term_width: 120,
+            focus: Focus::Nav,
+            prefix_pending: false,
+            prefix,
+            term_slots: HashMap::new(),
+            attention: HashSet::new(),
+            last_slot: HashMap::new(),
+            attached: None,
+            term: None,
+            pane_inner: (24, 80),
+            sent_size: None,
         }
+    }
+
+    /// Display form of the terminal prefix, e.g. `^a`.
+    fn prefix_label(&self) -> String {
+        format!("^{}", self.prefix)
     }
 
     /// Set the transient status message (replaces any previous message).
@@ -216,15 +353,19 @@ impl App {
         let mut crossterm_events = EventStream::new();
 
         while self.running {
+            self.sync_attachment().await;
             terminal.draw(|frame| {
                 let area = frame.area();
-                // Remember terminal width so key handlers (no frame) can clamp
-                // the detail-pane width against the live size.
+                // Remember terminal width so key handlers (no frame) compute the
+                // same grid split as the renderer.
                 self.last_term_width = area.width;
                 match self.view {
                     View::Library => self.library.render(frame),
                     View::Grid => {
-                        let (grid_area, detail_area) = split_grid_detail(area, self.detail_width);
+                        let [main, bar] =
+                            Layout::vertical([Constraint::Min(0), Constraint::Length(1)])
+                                .areas(area);
+                        let (grid_area, pane_area) = split_grid_pane(main, self.pane_pct);
 
                         // The grid groups by project NAME; derive the ordered
                         // name list from the ProjectInfo snapshot.
@@ -236,33 +377,39 @@ impl App {
                             &project_names,
                             &self.worktrees,
                             self.spinner_frame,
+                            &self.attention,
                         );
 
-                        let selected_wt = self.worktrees.get(self.grid.selected);
-                        let summary = selected_wt.and_then(|wt| wt.last_summary.as_deref());
-                        let prompt_input = if self.grid_mode == GridMode::PromptInput {
-                            Some(self.prompt_input.as_str())
-                        } else {
-                            None
-                        };
-
-                        let status_text = self.build_status_text();
-
-                        self.detail.render(
-                            frame,
-                            detail_area,
-                            selected_wt,
-                            summary,
-                            prompt_input,
-                            Some(&status_text),
-                            self.spinner_frame,
+                        let inner = Block::bordered().inner(pane_area);
+                        self.pane_inner = (inner.height, inner.width);
+                        match &self.attached {
+                            Some((path, slot)) => crate::ui::terminal::render_term(
+                                frame,
+                                pane_area,
+                                self.term.as_ref().map(|t| t.screen()),
+                                &crate::ui::terminal::pane_title(
+                                    self.term_slots.get(path).map_or(&[], Vec::as_slice),
+                                    *slot,
+                                ),
+                                self.focus == Focus::Term,
+                            ),
+                            None => crate::ui::terminal::render_hint(
+                                frame,
+                                pane_area,
+                                &self.prefix_label(),
+                            ),
+                        }
+                        frame.render_widget(
+                            Paragraph::new(self.build_status_text())
+                                .style(Style::default().fg(Color::DarkGray)),
+                            bar,
                         );
                     }
                 }
 
                 // Render help overlay on top of whatever view is active.
                 if self.show_help {
-                    crate::ui::help::render_help(frame, area);
+                    crate::ui::help::render_help(frame, area, &self.prefix_label());
                 }
 
                 // Render the command palette on top of everything else.
@@ -317,6 +464,10 @@ impl App {
                     }
                 }
             }
+            // Coalesce queued daemon events (e.g. a burst of frames) into one draw.
+            while let Ok(event) = self.event_rx.try_recv() {
+                self.handle_app_event(event);
+            }
 
             // Open the external editor outside the select! so the EventStream's
             // stdin reader does not compete with the editor for terminal input.
@@ -353,7 +504,11 @@ impl App {
 
         // Leave the alternate screen + raw mode so the editor owns the terminal.
         let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
 
         let status = tokio::process::Command::new(program)
             .args(&extra_args)
@@ -366,7 +521,11 @@ impl App {
         // stale cells.  Rebuild the Terminal from a fresh backend so its buffers
         // are empty and sized to the current screen, then force a full repaint.
         let _ = enable_raw_mode();
-        let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+        let _ = execute!(
+            std::io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste
+        );
         if let Ok(new_terminal) = Terminal::new(CrosstermBackend::new(std::io::stdout())) {
             *terminal = new_terminal;
         }
@@ -398,6 +557,12 @@ impl App {
                 self.prompt_input
             );
         }
+        if self.grid_mode == GridMode::PromptInput {
+            return format!(
+                "[daemon]  prompt: {}█  Enter: run  Esc: cancel",
+                self.prompt_input
+            );
+        }
         if let Some(ref msg) = self.status_message {
             return format!("[daemon]  {msg}");
         }
@@ -409,10 +574,22 @@ impl App {
     // -----------------------------------------------------------------------
 
     async fn handle_crossterm_event(&mut self, event: Event) {
-        if let Event::Key(KeyEvent {
-            code, modifiers, ..
-        }) = event
-        {
+        if let Event::Paste(text) = event {
+            self.handle_paste(text).await;
+            return;
+        }
+        if let Event::Key(key) = event {
+            // A focused terminal routes every key itself, ahead of Ctrl-C, so
+            // Ctrl-C reaches the shell instead of quitting.
+            if self.view == View::Grid && self.focus == Focus::Term {
+                let action = route_key(self.focus, &mut self.prefix_pending, key, self.prefix);
+                self.handle_key_action(action).await;
+                return;
+            }
+            let KeyEvent {
+                code, modifiers, ..
+            } = key;
+
             // Ctrl-C always quits regardless of mode/view.  Daemon survives.
             if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
                 tracing::info!("quit requested via Ctrl-C");
@@ -500,6 +677,7 @@ impl App {
 
             // Global `?` opens help from any view/mode.
             if code == KeyCode::Char('?') {
+                self.prefix_pending = false;
                 self.show_help = true;
                 return;
             }
@@ -510,6 +688,7 @@ impl App {
                 let in_input =
                     self.library.mode != LibraryMode::Normal || self.grid_mode != GridMode::Normal;
                 if !in_input {
+                    self.prefix_pending = false;
                     self.palette = Some(commands::Palette::open(self.view == View::Grid));
                     return;
                 }
@@ -933,11 +1112,11 @@ impl App {
             }
             CommandId::WidenDetail => {
                 self.view = View::Grid;
-                self.adjust_detail_width(5);
+                self.adjust_pane_pct(5);
             }
             CommandId::NarrowDetail => {
                 self.view = View::Grid;
-                self.adjust_detail_width(-5);
+                self.adjust_pane_pct(-5);
             }
             CommandId::CopyResumeCommand => {
                 self.view = View::Grid;
@@ -1095,19 +1274,26 @@ impl App {
         // Clear transient status on any grid key.
         self.status_message = None;
 
+        // Prefix routing runs before every grid binding (Ctrl-a would
+        // otherwise hit the modifier-blind `a`).
+        let key = KeyEvent::new(code, modifiers);
+        let (code, modifiers) =
+            match route_key(self.focus, &mut self.prefix_pending, key, self.prefix) {
+                KeyAction::Nav(key) => (key.code, key.modifiers),
+                action => return self.handle_key_action(action).await,
+            };
+
         if code == KeyCode::Tab {
             self.execute_command(CommandId::SwitchView).await;
             return;
         }
 
-        // Derive `cols` from the grid PANE width (not the full terminal width)
-        // so motion and render use the exact same column count.  The detail pane
-        // takes `effective_detail_width(...)` columns (the same value the renderer
-        // uses), so grid_width = terminal_width - detail_width, floored at CELL_W.
+        // Derive `cols` from the same split the renderer uses, so motion and
+        // render agree on the column count.
         let cols = {
-            let (term_w, _) = crossterm::terminal::size().unwrap_or((80, 24));
-            let detail_w = crate::ui::detail::effective_detail_width(term_w, self.detail_width);
-            let grid_w = term_w.saturating_sub(detail_w).max(crate::ui::grid::CELL_W);
+            let grid_w = split_grid_pane(Rect::new(0, 0, self.last_term_width, 1), self.pane_pct)
+                .0
+                .width;
             crate::ui::grid::GridView::cols_for_width(grid_w)
         };
 
@@ -1218,12 +1404,12 @@ impl App {
                 self.execute_command(CommandId::CopyResumeCommand).await;
             }
 
-            // Detail-pane resize.  `<` widens / `>` narrows by 5 cols; with Ctrl,
-            // by 1 col (fine).  `<` = wider (the divider moves left).
+            // Terminal-pane resize.  `<` widens / `>` narrows by 5%; with Ctrl,
+            // by 1% (fine).  `<` = wider (the divider moves left).
             KeyCode::Char('<') => {
                 self.grid.clear_pending_count();
                 if modifiers.contains(KeyModifiers::CONTROL) {
-                    self.adjust_detail_width(1);
+                    self.adjust_pane_pct(1);
                 } else {
                     self.execute_command(CommandId::WidenDetail).await;
                 }
@@ -1231,7 +1417,7 @@ impl App {
             KeyCode::Char('>') => {
                 self.grid.clear_pending_count();
                 if modifiers.contains(KeyModifiers::CONTROL) {
-                    self.adjust_detail_width(-1);
+                    self.adjust_pane_pct(-1);
                 } else {
                     self.execute_command(CommandId::NarrowDetail).await;
                 }
@@ -1256,6 +1442,173 @@ impl App {
             _ => {
                 self.grid.clear_pending_count();
             }
+        }
+    }
+
+    /// Act on a routed terminal-pane key.
+    async fn handle_key_action(&mut self, action: KeyAction) {
+        match action {
+            KeyAction::FocusNav => self.focus = Focus::Nav,
+            KeyAction::FocusTerm => self.focus_term(),
+            KeyAction::Select(n) => match self.selected_worktree_path() {
+                Some(path) if self.term_slots.get(&path).is_some_and(|s| s.contains(&n)) => {
+                    self.last_slot.insert(path, n);
+                }
+                _ => self.set_status(format!("no session {n}")),
+            },
+            KeyAction::Create => {
+                let Some(path) = self.selected_worktree_path() else {
+                    self.set_status("no worktree selected");
+                    return;
+                };
+                let (rows, cols) = self.pane_inner;
+                self.client
+                    .send(ClientMsg::Term(TermCmd::Attach {
+                        worktree_path: path.clone(),
+                        slot: None,
+                        rows,
+                        cols,
+                    }))
+                    .await;
+                self.attached = Some((path, None));
+                self.term = None;
+                self.sent_size = Some(self.pane_inner);
+            }
+            KeyAction::Kill => {
+                if let Some((worktree_path, Some(slot))) = self.attached.clone() {
+                    self.client
+                        .send(ClientMsg::Term(TermCmd::Kill {
+                            worktree_path,
+                            slot,
+                        }))
+                        .await;
+                }
+            }
+            KeyAction::Pty(key) => {
+                let app_cursor = self
+                    .term
+                    .as_ref()
+                    .is_some_and(|t| t.screen().application_cursor());
+                self.send_input(key_to_bytes(key, app_cursor)).await;
+            }
+            KeyAction::PtyPrefix => {
+                let prefix = KeyEvent::new(KeyCode::Char(self.prefix), KeyModifiers::CONTROL);
+                self.send_input(key_to_bytes(prefix, false)).await;
+            }
+            KeyAction::Nav(_) | KeyAction::Swallow => {}
+        }
+    }
+
+    async fn send_input(&mut self, bytes: Vec<u8>) {
+        if !bytes.is_empty() {
+            self.client
+                .send(ClientMsg::Term(TermCmd::Input(bytes)))
+                .await;
+        }
+    }
+
+    /// A paste goes to the focused terminal (bracketed if the inner app asked
+    /// for it) or to the active text input; anywhere else it is dropped, so
+    /// pasted text never runs grid or library commands.
+    async fn handle_paste(&mut self, text: String) {
+        if self.view == View::Grid && self.focus == Focus::Term {
+            let text = text.replace("\r\n", "\n").replace('\n', "\r");
+            let bracketed = self
+                .term
+                .as_ref()
+                .is_some_and(|t| t.screen().bracketed_paste());
+            let bytes = if bracketed {
+                format!("\x1b[200~{text}\x1b[201~")
+            } else {
+                text
+            };
+            self.send_input(bytes.into_bytes()).await;
+        } else if self.key_text_input() {
+            // These inputs edit on keys: replay the paste as typed keys, and
+            // stop if one (e.g. Enter) closes the input.
+            for ch in text.replace("\r\n", "\n").chars() {
+                if !self.key_text_input() {
+                    break;
+                }
+                let code = match ch {
+                    '\n' | '\r' => KeyCode::Enter,
+                    ch => KeyCode::Char(ch),
+                };
+                let key = KeyEvent::new(code, KeyModifiers::NONE);
+                Box::pin(self.handle_crossterm_event(Event::Key(key))).await;
+            }
+        } else if self.view == View::Grid
+            && matches!(self.grid_mode, GridMode::PromptInput | GridMode::NameInput)
+        {
+            self.prompt_input.push_str(&text);
+        }
+    }
+
+    /// A text input that edits through key events is open.
+    fn key_text_input(&self) -> bool {
+        self.add_project_input.is_some()
+            || self.palette.is_some()
+            || self.new_worktree.is_some()
+            || (self.view == View::Library
+                && matches!(
+                    self.library.mode,
+                    LibraryMode::Filter | LibraryMode::NewPrompt
+                ))
+    }
+
+    /// Focus the terminal pane, but only onto a live session, so a dead pane
+    /// can never swallow Ctrl-C.
+    fn focus_term(&mut self) {
+        if matches!(self.attached, Some((_, Some(_)))) {
+            self.focus = Focus::Term;
+        } else {
+            let msg = format!("no session — press {} c to create one", self.prefix_label());
+            self.set_status(msg);
+        }
+    }
+
+    /// Point this connection at the selected worktree's session (its last
+    /// viewed slot, else its lowest live one), and keep the daemon told of the
+    /// pane size.  Runs before every draw; never overrides a pending create.
+    async fn sync_attachment(&mut self) {
+        if matches!(self.attached, Some((_, None))) {
+            return;
+        }
+        let desired = self
+            .selected_worktree_path()
+            .filter(|_| self.view == View::Grid)
+            .and_then(|path| {
+                let slots = self.term_slots.get(&path)?;
+                let slot = self
+                    .last_slot
+                    .get(&path)
+                    .filter(|s| slots.contains(s))
+                    .or(slots.first())?;
+                Some((path, Some(*slot)))
+            });
+        let (rows, cols) = self.pane_inner;
+        if desired != self.attached {
+            let cmd = match &desired {
+                Some((path, slot)) => TermCmd::Attach {
+                    worktree_path: path.clone(),
+                    slot: *slot,
+                    rows,
+                    cols,
+                },
+                None => TermCmd::Detach,
+            };
+            self.client.send(ClientMsg::Term(cmd)).await;
+            self.sent_size = desired.as_ref().map(|_| self.pane_inner);
+            self.attached = desired;
+            self.term = None;
+        } else if self.attached.is_some() && self.sent_size != Some(self.pane_inner) {
+            self.client
+                .send(ClientMsg::Term(TermCmd::Resize { rows, cols }))
+                .await;
+            self.sent_size = Some(self.pane_inner);
+        }
+        if self.attached.is_none() {
+            self.focus = Focus::Nav;
         }
     }
 
@@ -1301,13 +1654,10 @@ impl App {
         self.set_status("resuming session…");
     }
 
-    /// Nudge the detail-pane width by `delta` cols, clamped to
-    /// [30, 80% of the current terminal width].
-    fn adjust_detail_width(&mut self, delta: i32) {
-        let hi = crate::ui::detail::effective_detail_width(self.last_term_width, u16::MAX);
-        let new = (self.detail_width as i32 + delta).clamp(30, hi as i32) as u16;
-        self.detail_width = new;
-        self.set_status(format!("detail width: {new} cols"));
+    /// Nudge the terminal-pane width by `delta` percentage points, within 10..=80.
+    fn adjust_pane_pct(&mut self, delta: i16) {
+        self.pane_pct = (self.pane_pct as i16 + delta).clamp(10, 80) as u16;
+        self.set_status(format!("pane width: {}%", self.pane_pct));
     }
 
     async fn send_set_worktree_name(&mut self, name: String) {
@@ -1397,9 +1747,107 @@ impl App {
             AppEvent::DaemonDisconnected => {
                 tracing::warn!("daemon disconnected");
                 self.set_status("daemon disconnected — restart karazhan to reconnect");
+                self.term_slots.clear();
+                self.attention.clear();
+                self.last_slot.clear();
+                self.attached = None;
+                self.term = None;
+                self.sent_size = None;
+                self.focus = Focus::Nav;
             }
             // Watcher-only variant the client never receives.
             AppEvent::PrStatusChanged { .. } => {}
+            AppEvent::TermScreen {
+                worktree_path,
+                slot,
+                rows,
+                cols,
+                bytes,
+            } => {
+                // A pending create takes the first screen for its path as the
+                // reply; otherwise a mismatch is a desync (see `desynced`).
+                let Some((path, want)) = &self.attached else {
+                    return;
+                };
+                if *path != worktree_path {
+                    if want.is_some() {
+                        self.desynced();
+                    }
+                    return;
+                }
+                match want {
+                    Some(w) if *w != slot => return self.desynced(),
+                    Some(_) => {}
+                    // Focus the new session unless an overlay or input owns keys.
+                    None => {
+                        let busy = self.view != View::Grid
+                            || self.grid_mode != GridMode::Normal
+                            || self.show_help
+                            || self.palette.is_some()
+                            || self.new_worktree.is_some()
+                            || self.add_project_input.is_some()
+                            || self.pending_delete.is_some()
+                            || self.confirm_new_worktree.is_some();
+                        if !busy {
+                            self.focus = Focus::Term;
+                        }
+                    }
+                }
+                let mut parser = vt100::Parser::new(rows, cols, 0);
+                parser.process(&bytes);
+                self.term = Some(parser);
+                self.last_slot.insert(worktree_path.clone(), slot);
+                self.attached = Some((worktree_path, Some(slot)));
+            }
+            AppEvent::TermDiff {
+                worktree_path,
+                slot,
+                bytes,
+            } => {
+                // During a pending create a diff is a stale frame: drop it.
+                match &self.attached {
+                    Some((path, Some(s))) if *path == worktree_path && *s == slot => {
+                        if let Some(term) = self.term.as_mut() {
+                            term.process(&bytes);
+                        }
+                    }
+                    Some((_, Some(_))) => self.desynced(),
+                    _ => {}
+                }
+            }
+            AppEvent::TermSessions {
+                worktree_path,
+                slots,
+                attention,
+            } => {
+                if attention {
+                    self.attention.insert(worktree_path.clone());
+                } else {
+                    self.attention.remove(&worktree_path);
+                }
+                // The attached session exited or was killed: drop it, and let
+                // sync_attachment pick the next slot.
+                if let Some((path, Some(slot))) = &self.attached {
+                    if *path == worktree_path && !slots.contains(slot) {
+                        self.attached = None;
+                        self.term = None;
+                    }
+                }
+                if slots.is_empty() {
+                    self.term_slots.remove(&worktree_path);
+                } else {
+                    self.term_slots.insert(worktree_path, slots);
+                }
+            }
+            AppEvent::TermError {
+                worktree_path,
+                message,
+            } => {
+                if self.attached == Some((worktree_path, None)) {
+                    self.attached = None;
+                }
+                self.set_status(message);
+            }
         }
     }
 
@@ -1407,8 +1855,447 @@ impl App {
     // Helpers
     // -----------------------------------------------------------------------
 
+    /// A frame for another session arrived while attached: the daemon's view
+    /// and ours disagree (e.g. a stale screen was taken as a create reply).
+    /// Drop the attachment so `sync_attachment` re-sends `Attach`; frames for
+    /// that attach match, so this settles once in-flight frames drain.
+    fn desynced(&mut self) {
+        self.attached = None;
+        self.term = None;
+    }
+
     fn enter_grid_view(&mut self) {
         self.view = View::Grid;
         tracing::info!("entered grid view ({} worktrees)", self.worktrees.len());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
+
+    /// Route `k` with the prefix already pending.
+    fn after_prefix(focus: Focus, k: KeyEvent) -> KeyAction {
+        route_key(focus, &mut true, k, 'a')
+    }
+
+    fn grid_app() -> (App, mpsc::Receiver<ClientMsg>) {
+        let (client, rx) = SupervisorClient::test_pair();
+        let (_tx, event_rx) = mpsc::channel(1);
+        let mut app = App::new(event_rx, Config::default(), client);
+        app.view = View::Grid;
+        (app, rx)
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_forwarded_when_term_focused() {
+        let mut pending = false;
+        assert_eq!(
+            route_key(Focus::Term, &mut pending, ctrl('c'), 'a'),
+            KeyAction::Pty(ctrl('c'))
+        );
+
+        let (mut app, _rx) = grid_app();
+        app.focus = Focus::Term;
+        app.handle_crossterm_event(Event::Key(ctrl('c'))).await;
+        assert!(
+            app.running,
+            "Ctrl-C must not quit while the terminal is focused"
+        );
+    }
+
+    #[test]
+    fn prefix_prefix_literal_only_in_term() {
+        assert_eq!(after_prefix(Focus::Term, ctrl('a')), KeyAction::PtyPrefix);
+        assert_eq!(after_prefix(Focus::Nav, ctrl('a')), KeyAction::Swallow);
+    }
+
+    #[test]
+    fn prefix_h_focuses_nav() {
+        let h = key(KeyCode::Char('h'));
+        assert_eq!(after_prefix(Focus::Term, h), KeyAction::FocusNav);
+        assert_eq!(after_prefix(Focus::Nav, h), KeyAction::Swallow);
+        let l = key(KeyCode::Char('l'));
+        assert_eq!(after_prefix(Focus::Term, l), KeyAction::FocusTerm);
+        assert_eq!(after_prefix(Focus::Nav, l), KeyAction::FocusTerm);
+        let c = key(KeyCode::Char('c'));
+        assert_eq!(after_prefix(Focus::Term, c), KeyAction::Create);
+        assert_eq!(after_prefix(Focus::Nav, c), KeyAction::Create);
+        let three = key(KeyCode::Char('3'));
+        assert_eq!(after_prefix(Focus::Term, three), KeyAction::Select(3));
+        assert_eq!(after_prefix(Focus::Nav, three), KeyAction::Select(3));
+    }
+
+    #[test]
+    fn prefix_x_ignored_in_nav() {
+        let x = key(KeyCode::Char('x'));
+        assert_eq!(after_prefix(Focus::Nav, x), KeyAction::Swallow);
+        assert_eq!(after_prefix(Focus::Term, x), KeyAction::Kill);
+    }
+
+    #[test]
+    fn unknown_prefix_key_swallowed() {
+        for focus in [Focus::Nav, Focus::Term] {
+            for k in [key(KeyCode::Char('z')), key(KeyCode::Char('0')), ctrl('c')] {
+                assert_eq!(
+                    after_prefix(focus, k),
+                    KeyAction::Swallow,
+                    "{focus:?} {k:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pending_cleared_after_any_key() {
+        for focus in [Focus::Nav, Focus::Term] {
+            let mut pending = false;
+            assert_eq!(
+                route_key(focus, &mut pending, ctrl('a'), 'a'),
+                KeyAction::Swallow
+            );
+            assert!(pending);
+            for k in [
+                key(KeyCode::Char('z')),
+                key(KeyCode::Char('c')),
+                ctrl('a'),
+                key(KeyCode::Enter),
+            ] {
+                pending = true;
+                route_key(focus, &mut pending, k, 'a');
+                assert!(!pending, "{focus:?} {k:?}");
+            }
+        }
+        // Without a pending prefix, plain keys pass straight through.
+        let mut pending = false;
+        let j = key(KeyCode::Char('j'));
+        assert_eq!(
+            route_key(Focus::Nav, &mut pending, j, 'a'),
+            KeyAction::Nav(j)
+        );
+        assert_eq!(
+            route_key(Focus::Term, &mut pending, j, 'a'),
+            KeyAction::Pty(j)
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_without_session_stays_nav_with_hint() {
+        let (mut app, mut rx) = grid_app();
+        app.handle_crossterm_event(Event::Key(key(KeyCode::Enter)))
+            .await;
+        assert_eq!(app.focus, Focus::Nav);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("no session — press ^a c to create one")
+        );
+        assert!(rx.try_recv().is_err(), "nothing is sent to the daemon");
+    }
+
+    /// A Grid app with one selected worktree at `/wt/p/a`.
+    fn app_with_worktree() -> (App, mpsc::Receiver<ClientMsg>, PathBuf) {
+        let (mut app, rx) = grid_app();
+        let wt = crate::ui::grid::tests::wv("p", "a");
+        let path = wt.path.clone();
+        app.worktrees = vec![wt];
+        (app, rx, path)
+    }
+
+    fn sessions(path: &Path, slots: &[u8]) -> AppEvent {
+        AppEvent::TermSessions {
+            worktree_path: path.to_path_buf(),
+            slots: slots.to_vec(),
+            attention: false,
+        }
+    }
+
+    fn screen(path: &Path, slot: u8) -> AppEvent {
+        AppEvent::TermScreen {
+            worktree_path: path.to_path_buf(),
+            slot,
+            rows: 24,
+            cols: 80,
+            bytes: b"hi".to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prefix_c_sends_create_then_focuses_on_reply() {
+        let (mut app, mut rx, path) = app_with_worktree();
+        app.handle_crossterm_event(Event::Key(ctrl('a'))).await;
+        app.handle_crossterm_event(Event::Key(key(KeyCode::Char('c'))))
+            .await;
+        match rx.try_recv() {
+            Ok(ClientMsg::Term(TermCmd::Attach {
+                worktree_path,
+                slot: None,
+                ..
+            })) => assert_eq!(worktree_path, path),
+            other => panic!("expected a create Attach, got {other:?}"),
+        }
+        assert_eq!(app.focus, Focus::Nav, "focus waits for the reply");
+
+        app.handle_app_event(screen(&path, 1));
+        assert_eq!(app.focus, Focus::Term);
+        assert_eq!(app.attached, Some((path.clone(), Some(1))));
+        assert_eq!(app.last_slot.get(&path), Some(&1));
+        assert!(app
+            .term
+            .as_ref()
+            .unwrap()
+            .screen()
+            .contents()
+            .starts_with("hi"));
+    }
+
+    #[tokio::test]
+    async fn pending_create_not_detached_by_sync() {
+        let (mut app, mut rx, path) = app_with_worktree();
+        app.handle_key_action(KeyAction::Create).await;
+        rx.try_recv().unwrap();
+        // The daemon broadcasts the new slot before the first frame.
+        app.handle_app_event(sessions(&path, &[1]));
+        app.sync_attachment().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "sync must not touch a pending create"
+        );
+        assert_eq!(app.attached, Some((path.clone(), None)));
+
+        app.handle_app_event(screen(&path, 1));
+        app.sync_attachment().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "already attached to the desired slot"
+        );
+        assert_eq!(app.attached, Some((path, Some(1))));
+    }
+
+    /// Attach `app` to `slot` of `path` the way the daemon flow does.
+    async fn attach(app: &mut App, rx: &mut mpsc::Receiver<ClientMsg>, path: &Path, slots: &[u8]) {
+        app.handle_app_event(sessions(path, slots));
+        app.sync_attachment().await;
+        while rx.try_recv().is_ok() {}
+        let slot = app.attached.as_ref().unwrap().1.unwrap();
+        app.handle_app_event(screen(path, slot));
+        app.focus = Focus::Term;
+    }
+
+    #[tokio::test]
+    async fn next_attachment_after_exit_picks_lowest() {
+        let (mut app, mut rx, path) = app_with_worktree();
+        attach(&mut app, &mut rx, &path, &[1, 2, 3]).await;
+        app.handle_key_action(KeyAction::Select(2)).await;
+        app.sync_attachment().await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::Term(TermCmd::Attach { slot: Some(2), .. }))
+        ));
+        app.handle_app_event(screen(&path, 2));
+
+        // Slot 2 exits: the pane falls back to the lowest remaining slot.
+        app.handle_app_event(sessions(&path, &[1, 3]));
+        assert_eq!(app.attached, None);
+        app.sync_attachment().await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::Term(TermCmd::Attach { slot: Some(1), .. }))
+        ));
+        assert_eq!(app.focus, Focus::Term);
+
+        app.handle_key_action(KeyAction::Select(7)).await;
+        assert_eq!(app.status_message.as_deref(), Some("no session 7"));
+    }
+
+    #[tokio::test]
+    async fn exit_of_last_session_returns_focus_to_nav() {
+        let (mut app, mut rx, path) = app_with_worktree();
+        attach(&mut app, &mut rx, &path, &[1]).await;
+        app.handle_key_action(KeyAction::Kill).await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::Term(TermCmd::Kill { slot: 1, .. }))
+        ));
+        app.handle_app_event(sessions(&path, &[]));
+        app.sync_attachment().await;
+        assert_eq!(app.attached, None);
+        assert!(app.term.is_none());
+        assert_eq!(app.focus, Focus::Nav);
+        assert!(
+            rx.try_recv().is_err(),
+            "the daemon already dropped the view"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_disconnect_clears_term_state() {
+        let (mut app, mut rx, path) = app_with_worktree();
+        attach(&mut app, &mut rx, &path, &[1]).await;
+        app.attention.insert(path.clone());
+        app.handle_app_event(AppEvent::DaemonDisconnected);
+        app.sync_attachment().await;
+        assert!(app.term_slots.is_empty());
+        assert!(app.attention.is_empty());
+        assert_eq!(app.attached, None);
+        assert!(app.term.is_none());
+        assert_eq!(app.focus, Focus::Nav);
+        assert!(rx.try_recv().is_err(), "nothing is sent to a dead daemon");
+    }
+
+    fn diff(path: &Path, slot: u8) -> AppEvent {
+        AppEvent::TermDiff {
+            worktree_path: path.to_path_buf(),
+            slot,
+            bytes: b"x".to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn mismatched_frame_resyncs_without_looping() {
+        let (mut app, mut rx, path) = app_with_worktree();
+        attach(&mut app, &mut rx, &path, &[1, 2]).await;
+        app.handle_app_event(diff(&path, 2));
+        assert_eq!(app.attached, None, "a frame for slot 2 while on slot 1");
+        app.sync_attachment().await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::Term(TermCmd::Attach { slot: Some(1), .. }))
+        ));
+        app.handle_app_event(screen(&path, 1));
+        app.handle_app_event(diff(&path, 1));
+        app.sync_attachment().await;
+        assert!(rx.try_recv().is_err(), "the re-attach reply matches");
+        assert_eq!(app.attached, Some((path, Some(1))));
+        assert_eq!(app.focus, Focus::Term);
+    }
+
+    #[tokio::test]
+    async fn stale_screen_taken_as_create_reply_is_corrected() {
+        let (mut app, mut rx, path) = app_with_worktree();
+        attach(&mut app, &mut rx, &path, &[1]).await;
+        app.handle_key_action(KeyAction::Create).await;
+        rx.try_recv().unwrap();
+        app.handle_app_event(diff(&path, 1));
+        assert_eq!(
+            app.attached,
+            Some((path.clone(), None)),
+            "stale diff dropped"
+        );
+        // A stale slot-1 screen is taken as the reply, then slot 2's frame
+        // exposes it; the pane re-attaches and agrees with the daemon again.
+        app.handle_app_event(screen(&path, 1));
+        app.handle_app_event(diff(&path, 2));
+        app.handle_app_event(sessions(&path, &[1, 2]));
+        app.sync_attachment().await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::Term(TermCmd::Attach { slot: Some(_), .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_whose_shell_exited_settles_back_to_nav() {
+        let (mut app, mut rx, path) = app_with_worktree();
+        app.handle_key_action(KeyAction::Create).await;
+        rx.try_recv().unwrap();
+        // The shell exited before its first frame: the slot is already gone
+        // when the daemon's final screen arrives.
+        app.handle_app_event(sessions(&path, &[1]));
+        app.handle_app_event(sessions(&path, &[]));
+        app.handle_app_event(screen(&path, 1));
+        app.sync_attachment().await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::Term(TermCmd::Detach))
+        ));
+        assert_eq!(app.attached, None);
+        assert_eq!(app.focus, Focus::Nav);
+    }
+
+    #[tokio::test]
+    async fn create_reply_does_not_steal_focus_from_an_overlay() {
+        let (mut app, mut rx, path) = app_with_worktree();
+        app.handle_key_action(KeyAction::Create).await;
+        rx.try_recv().unwrap();
+        app.show_help = true;
+        app.handle_app_event(screen(&path, 1));
+        assert_eq!(app.attached, Some((path, Some(1))));
+        assert_eq!(app.focus, Focus::Nav);
+    }
+
+    #[tokio::test]
+    async fn paste_replays_into_key_inputs_and_stops_when_they_close() {
+        let (mut app, mut rx) = grid_app();
+        app.add_project_input = Some(String::new());
+        app.handle_crossterm_event(Event::Paste("/a b\nQ".into()))
+            .await;
+        match rx.try_recv() {
+            Ok(ClientMsg::AddProject { path }) => assert_eq!(path, PathBuf::from("/a b")),
+            other => panic!("expected AddProject, got {other:?}"),
+        }
+        assert!(app.add_project_input.is_none());
+        assert!(
+            app.running,
+            "the Q after Enter is not replayed into the grid"
+        );
+        assert!(rx.try_recv().is_err());
+
+        // Grid navigation never runs pasted text as commands.
+        app.handle_crossterm_event(Event::Paste("Q".into())).await;
+        assert!(app.running);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn pane_resize_keys_step_and_clamp() {
+        let (mut app, _rx) = grid_app();
+        let press = |ch, mods| Event::Key(KeyEvent::new(KeyCode::Char(ch), mods));
+        let none = KeyModifiers::NONE;
+        let ctrl = KeyModifiers::CONTROL;
+        assert_eq!(app.pane_pct, 60);
+        app.handle_crossterm_event(press('<', none)).await;
+        assert_eq!(app.pane_pct, 65);
+        app.handle_crossterm_event(press('>', none)).await;
+        assert_eq!(app.pane_pct, 60);
+        app.handle_crossterm_event(press('<', ctrl)).await;
+        assert_eq!(app.pane_pct, 61);
+        app.handle_crossterm_event(press('>', ctrl)).await;
+        assert_eq!(app.pane_pct, 60);
+        app.pane_pct = 78;
+        app.handle_crossterm_event(press('<', none)).await;
+        assert_eq!(app.pane_pct, 80);
+        app.pane_pct = 12;
+        app.handle_crossterm_event(press('>', none)).await;
+        assert_eq!(app.pane_pct, 10);
+        assert_eq!(app.status_message.as_deref(), Some("pane width: 10%"));
+    }
+
+    #[tokio::test]
+    async fn enter_with_live_session_focuses_term() {
+        let (mut app, mut rx, path) = app_with_worktree();
+        attach(&mut app, &mut rx, &path, &[1]).await;
+        app.focus = Focus::Nav;
+        app.handle_crossterm_event(Event::Key(key(KeyCode::Enter)))
+            .await;
+        assert_eq!(app.focus, Focus::Term);
+    }
+
+    #[tokio::test]
+    async fn help_key_clears_prefix_pending() {
+        let (mut app, _rx) = grid_app();
+        app.handle_crossterm_event(Event::Key(ctrl('a'))).await;
+        assert!(app.prefix_pending);
+        app.handle_crossterm_event(Event::Key(key(KeyCode::Char('?'))))
+            .await;
+        assert!(app.show_help);
+        assert!(!app.prefix_pending);
     }
 }

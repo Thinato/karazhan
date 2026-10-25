@@ -73,9 +73,9 @@ pub enum CommandId {
     /// Copy a shell command that `cd`s into the worktree and resumes its agent
     /// session, so the user can debug it in their own terminal (Grid; same as `s`).
     CopyResumeCommand,
-    /// Widen the worktree-detail pane by 5 columns (Grid; same as `<`).
+    /// Widen the terminal pane by 5 percentage points (Grid; same as `<`).
     WidenDetail,
-    /// Narrow the worktree-detail pane by 5 columns (Grid; same as `>`).
+    /// Narrow the terminal pane by 5 percentage points (Grid; same as `>`).
     NarrowDetail,
 }
 
@@ -272,15 +272,15 @@ pub const ALL_COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: CommandId::WidenDetail,
-        title: "Widen detail pane",
-        description: "widen the worktree-detail pane by 5 cols (Ctrl-< for 1)",
+        title: "Widen terminal pane",
+        description: "widen the terminal pane by 5% (Ctrl-< for 1%)",
         keybind: "<",
         context: CommandContext::Grid,
     },
     CommandSpec {
         id: CommandId::NarrowDetail,
-        title: "Narrow detail pane",
-        description: "narrow the worktree-detail pane by 5 cols (Ctrl-> for 1)",
+        title: "Narrow terminal pane",
+        description: "narrow the terminal pane by 5% (Ctrl-> for 1%)",
         keybind: ">",
         context: CommandContext::Grid,
     },
