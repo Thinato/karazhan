@@ -102,6 +102,8 @@ pub enum AppEvent {
         worktree_path: PathBuf,
         message: String,
     },
+    /// A newer release tag exists on GitHub (startup check).
+    UpdateAvailable(String),
 }
 
 /// Top-level view the application is currently showing.
@@ -237,6 +239,8 @@ pub struct App {
     /// Transient status message shown in the status line.
     /// Persists until replaced or explicitly cleared.
     status_message: Option<String>,
+    /// Newer release tag, shown in the idle status line until restart.
+    update_available: Option<String>,
     /// Thin-client handle to the supervisor daemon.
     client: SupervisorClient,
     /// Loaded application config (prompt_dir + colors).
@@ -314,6 +318,7 @@ impl App {
             worktrees: Vec::new(),
             projects: Vec::new(),
             status_message: None,
+            update_available: None,
             client,
             config,
             show_help: false,
@@ -566,7 +571,12 @@ impl App {
         if let Some(ref msg) = self.status_message {
             return format!("[daemon]  {msg}");
         }
-        "[daemon]  Tab: switch view  ?: help  q: quit".to_string()
+        match &self.update_available {
+            Some(tag) => {
+                format!("[daemon]  Tab: switch view  ?: help  q: quit  ·  karazhan {tag} available")
+            }
+            None => "[daemon]  Tab: switch view  ?: help  q: quit".to_string(),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1848,6 +1858,7 @@ impl App {
                 }
                 self.set_status(message);
             }
+            AppEvent::UpdateAvailable(tag) => self.update_available = Some(tag),
         }
     }
 

@@ -9,6 +9,7 @@ mod pr_status_store;
 mod project_config;
 mod projects;
 mod pty;
+mod update;
 mod watcher;
 mod watcher_proc;
 
@@ -217,6 +218,14 @@ async fn run_client() -> Result<()> {
                 // Receiver (App) has been dropped — stop ticking.
                 break;
             }
+        }
+    });
+
+    // One background check for a newer release; silent when it fails.
+    let update_tx = event_tx.clone();
+    tokio::spawn(async move {
+        if let Some(tag) = update::newer_release().await {
+            let _ = update_tx.send(AppEvent::UpdateAvailable(tag)).await;
         }
     });
 
