@@ -4363,7 +4363,9 @@ mod tests {
                 name: Some("env".to_string()),
                 status: Some("needs_review".to_string()),
                 pr_status: None,
-                run: "printenv | grep ^KARAZHAN_ | sort > \"$KARAZHAN_WORKTREE/env\"".to_string(),
+                // Written via mv so `env` only appears complete: `>` alone
+                // creates it empty and wait_for_file can read it too early.
+                run: "printenv | grep ^KARAZHAN_ | sort > \"$KARAZHAN_WORKTREE/env.tmp\" && mv \"$KARAZHAN_WORKTREE/env.tmp\" \"$KARAZHAN_WORKTREE/env\"".to_string(),
                 timeout_seconds: Some(5),
             }],
             ..Config::default()
